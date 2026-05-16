@@ -1,0 +1,31 @@
+# Rust
+/target
+/crates/*/target
+Cargo.lock.bak
+**/*.rs.bk
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Build output
+*.pdb
+
+# Local data / test artifacts
+/tmp/
+/.anamnesis/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log

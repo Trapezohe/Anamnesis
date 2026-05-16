@@ -1,0 +1,23 @@
+[package]
+name = "anamnesis-cli"
+description = "Command-line interface for Anamnesis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "anamnesis"
+path = "src/main.rs"
+
+[dependencies]
+anamnesis-core = { workspace = true }
+anamnesis-store = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

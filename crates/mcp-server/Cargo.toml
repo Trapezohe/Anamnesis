@@ -1,0 +1,28 @@
+[package]
+name = "anamnesis-mcp-server"
+description = "MCP server exposing Anamnesis to any MCP-aware agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "anamnesis-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anamnesis-core = { workspace = true }
+anamnesis-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# rmcp (official MCP Rust SDK) — pinned in Phase 1 when we implement the
+# tool/resource handlers. Phase 0 keeps this crate as a stub binary so the
+# workspace structure and CI are exercised end-to-end.

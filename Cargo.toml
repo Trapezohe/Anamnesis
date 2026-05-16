@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/store",
+    "crates/cli",
+    "crates/mcp-server",
+    "crates/adapter-claude-code",
+    "crates/adapter-mem0",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+authors = ["The Anamnesis Authors"]
+repository = "https://github.com/Trapezohe/Anamnesis"
+homepage = "https://github.com/Trapezohe/Anamnesis"
+readme = "README.md"
+
+[workspace.dependencies]
+# Internal crates
+anamnesis-core = { path = "crates/core", version = "0.0.1" }
+anamnesis-store = { path = "crates/store", version = "0.0.1" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Hashing / IDs
+blake3 = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
