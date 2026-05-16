@@ -9,12 +9,12 @@
 //!   Authorization: Bearer <token>   — required when the server demands it
 //!
 //! Behaviour:
-//!   - `detect`  hits `{url}/healthz` (no auth) to verify reachability.
-//!   - `scan`    calls `resources/list`, then `resources/read` for each
-//!               URI. Each resource payload becomes one `RawRecord`.
+//!   - `detect` hits `{url}/healthz` (no auth) to verify reachability.
+//!   - `scan` calls `resources/list`, then `resources/read` for each
+//!     URI. Each resource payload becomes one `RawRecord`.
 //!   - `normalize` maps payload → `AnamnesisRecord` with
-//!                 `Kind::Unknown` + `Scope::Ephemeral` as conservative
-//!                 defaults. Downstream packing can re-tag.
+//!     `Kind::Unknown` + `Scope::Ephemeral` as conservative defaults.
+//!     Downstream packing can re-tag.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
