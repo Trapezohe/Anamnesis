@@ -9,12 +9,15 @@
 pub mod adapter;
 pub mod chunk;
 pub mod chunker;
+pub mod config;
 pub mod contract;
 pub mod discovery;
 pub mod embedding;
 pub mod error;
 pub mod model;
 pub mod query;
+
+pub use config::{Config, ConfigError, EmbeddingConfig, ServerConfig, SourceEntry};
 
 pub use adapter::{HealthStatus, MemoryAdapter, RawDelta, RawRecord, ScanOpts, WatchOpts};
 pub use chunk::{Chunk, ContentHash};

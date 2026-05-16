@@ -29,6 +29,11 @@ struct Cli {
     #[arg(long, global = true, env = "ANAMNESIS_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
+    /// Override config file path (defaults to
+    /// XDG_CONFIG_HOME/anamnesis/config.toml).
+    #[arg(long, global = true, env = "ANAMNESIS_CONFIG")]
+    config: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, global = true, env = "ANAMNESIS_LOG", default_value = "info")]
     log_level: String,
@@ -228,14 +233,33 @@ fn models_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("models")
 }
 
+fn resolve_config_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
+        return Ok(p);
+    }
+    let home = dirs_home()?;
+    Ok(anamnesis_core::Config::default_path(&home))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_level);
     let data_dir = resolve_data_dir(cli.data_dir)?;
+    let config_path = resolve_config_path(cli.config)?;
+    let config = anamnesis_core::Config::load(&config_path)
+        .with_context(|| format!("load {}", config_path.display()))?;
+    tracing::debug!(path = %config_path.display(), "loaded config");
 
     match cli.command {
-        Command::Init { model } => cmd_init(&data_dir, model.as_deref()),
+        Command::Init { model } => {
+            // Precedence: --model > config.embedding.model > registry default.
+            let chosen = model
+                .clone()
+                .or_else(|| Some(config.embedding.model.clone()))
+                .filter(|m| !m.is_empty());
+            cmd_init(&data_dir, chosen.as_deref())
+        }
         Command::Status { json } => cmd_status(&data_dir, json),
         Command::Discover => cmd_discover().await,
         Command::Source(sub) => cmd_source(&data_dir, sub),

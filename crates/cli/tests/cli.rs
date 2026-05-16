@@ -463,6 +463,36 @@ fn discover_lists_mem0_when_db_exists() {
 }
 
 #[test]
+fn config_file_overrides_default_model_on_init() {
+    let dir = tmp_dir();
+    let config_dir = tmp_dir();
+    let cfg_path = config_dir.path().join("config.toml");
+    std::fs::write(&cfg_path, "[embedding]\nmodel = \"en\"\nbatch_size = 16\n").unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .env("ANAMNESIS_CONFIG", &cfg_path)
+        .args(["init"])
+        .assert()
+        .success()
+        .stdout(contains("local:en:1"));
+}
+
+#[test]
+fn cli_flag_beats_config_file_model() {
+    let dir = tmp_dir();
+    let config_dir = tmp_dir();
+    let cfg_path = config_dir.path().join("config.toml");
+    std::fs::write(&cfg_path, "[embedding]\nmodel = \"en\"\n").unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .env("ANAMNESIS_CONFIG", &cfg_path)
+        .args(["init", "--model", "tiny"])
+        .assert()
+        .success()
+        .stdout(contains("local:tiny:1"));
+}
+
+#[test]
 fn search_with_empty_db_prints_no_results() {
     let dir = tmp_dir();
     cli()
