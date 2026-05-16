@@ -283,10 +283,7 @@ mod tests {
             &[("a", "alpha"), ("b", "beta")],
         );
 
-        let summary = EmbeddingWorker::new(&provider)
-            .drain(&store)
-            .await
-            .unwrap();
+        let summary = EmbeddingWorker::new(&provider).drain(&store).await.unwrap();
         assert_eq!(summary.processed, 0);
         assert_eq!(summary.failed, 2);
 
@@ -306,10 +303,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::wrong_dim("fake", 4);
         seed(&store, &provider.model_id().0, &[("a", "alpha")]);
-        let summary = EmbeddingWorker::new(&provider)
-            .drain(&store)
-            .await
-            .unwrap();
+        let summary = EmbeddingWorker::new(&provider).drain(&store).await.unwrap();
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.processed, 0);
     }
@@ -318,10 +312,7 @@ mod tests {
     async fn empty_queue_is_no_op() {
         let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::new("fake", 4);
-        let summary = EmbeddingWorker::new(&provider)
-            .drain(&store)
-            .await
-            .unwrap();
+        let summary = EmbeddingWorker::new(&provider).drain(&store).await.unwrap();
         assert_eq!(summary.processed, 0);
         assert_eq!(summary.failed, 0);
     }
@@ -346,10 +337,7 @@ mod tests {
             &provider.model_id().0,
             &[("a", "alpha"), ("b", "beta")],
         );
-        EmbeddingWorker::new(&provider)
-            .drain(&store)
-            .await
-            .unwrap();
+        EmbeddingWorker::new(&provider).drain(&store).await.unwrap();
         // Query with same vector that "alpha" produced — it must be the
         // top-1 hit.
         let alpha_vec = provider

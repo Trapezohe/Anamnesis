@@ -80,6 +80,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-adapter-generic-mcp"
+version = "0.0.1"
+dependencies = [
+ "anamnesis-core",
+ "anamnesis-mcp-server",
+ "anamnesis-store",
+ "async-trait",
+ "axum",
+ "blake3",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-adapter-mem0"
 version = "0.0.1"
 dependencies = [

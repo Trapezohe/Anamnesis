@@ -1,0 +1,29 @@
+[package]
+name = "anamnesis-adapter-generic-mcp"
+description = "Generic MCP adapter — import memory from any MCP-aware server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anamnesis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+anamnesis-mcp-server = { workspace = true, features = ["sse"] }
+anamnesis-store = { workspace = true }
+tempfile = "3"
+axum = "0.7"
+futures = { workspace = true }

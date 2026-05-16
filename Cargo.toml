@@ -10,6 +10,7 @@ members = [
     "crates/mcp-server",
     "crates/adapter-claude-code",
     "crates/adapter-codex",
+    "crates/adapter-generic-mcp",
     "crates/adapter-mem0",
 ]
 
@@ -32,6 +33,7 @@ anamnesis-search = { path = "crates/search", version = "0.0.1" }
 anamnesis-importer = { path = "crates/importer", version = "0.0.1" }
 anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.1" }
 anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.1" }
+anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.1" }
 anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.1" }
 anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.1", default-features = false }
 
