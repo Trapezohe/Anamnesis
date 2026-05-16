@@ -1,10 +1,16 @@
 //! SQLite-backed storage for Anamnesis records.
 //!
-//! Phase-0 scope: schema bootstrap + migration runner. Read/write APIs land
-//! in Phase 1 alongside the first adapter.
+//! The crate exposes `Store::open` / `Store::open_in_memory` plus a typed
+//! API in `api` for records, chunks, embeddings, jobs, and sources. The
+//! raw `Connection` is intentionally kept private to callers outside this
+//! crate; only tests use `conn()` directly.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod api;
+
+pub use api::{ChunkHit, PendingEmbeddingJob, StoreStats};
 
 use std::path::Path;
 
