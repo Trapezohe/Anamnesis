@@ -1,0 +1,40 @@
+[package]
+name = "anamnesis-embedder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Embedding providers (local + cloud) for Anamnesis. Local default: fastembed-rs."
+
+[features]
+default = ["local-fastembed"]
+# `local-fastembed` pulls in fastembed + ONNX runtime (~5-10 min first compile).
+# CI and the CLI binary turn this on; pure-data crates that only need the
+# registry / trait can opt out with `default-features = false`.
+local-fastembed = ["dep:fastembed", "dep:tokio"]
+# `cloud-voyage` pulls in reqwest for the Voyage AI cloud embedding API.
+# Off by default — users opt in via this feature *and* set VOYAGE_API_KEY.
+cloud-voyage = ["dep:reqwest"]
+
+[dependencies]
+anamnesis-core = { workspace = true }
+anamnesis-store = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Optional — gated behind the `local-fastembed` feature.
+fastembed = { version = "4", optional = true }
+tokio = { workspace = true, optional = true }
+
+# Optional — gated behind the `cloud-voyage` feature.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }

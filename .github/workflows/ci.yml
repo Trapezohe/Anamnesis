@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Skip the fastembed download-gated tests by default in CI. Set to 1
+  # manually (workflow_dispatch / repository_dispatch) to run the full
+  # vector E2E suite.
+  FASTEMBED_DOWNLOAD: "0"
 
 jobs:
   fmt:
@@ -29,6 +33,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Lint with the heavy feature set too — clippy is cheap once cached.
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -38,9 +44,48 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Fast path: build + test without fastembed/ONNX. Covers the
+      # core, store, search, importer, all adapters, plus the MCP
+      # server's stdio path. About 1k tests in <2 min after cache warm.
+      - name: build (no-default-features)
+        run: cargo build --workspace --all-targets --no-default-features
+      - name: test (no-default-features)
+        run: cargo test --workspace --all-targets --no-default-features -- --test-threads=2
+
+  # Separate job: build + test with the `sse` feature so the HTTP
+  # transport (axum) + generic-mcp loopback are exercised. Still skips
+  # fastembed.
+  test-sse:
+    name: test (sse, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (sse only)
+        run: |
+          cargo test -p anamnesis-mcp-server --no-default-features --features sse -- --test-threads=2
+          cargo test -p anamnesis-adapter-generic-mcp -- --test-threads=2
+
+  # Verify the heavy default-feature build still compiles (no test
+  # execution). Catches breakage in the fastembed code path without
+  # paying the ONNX-runtime test tax.
+  build-default:
+    name: build (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace --all-targets

@@ -3,16 +3,21 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/store",
+    "crates/embedder",
+    "crates/search",
+    "crates/importer",
     "crates/cli",
     "crates/mcp-server",
     "crates/adapter-claude-code",
+    "crates/adapter-codex",
+    "crates/adapter-generic-mcp",
     "crates/adapter-mem0",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["The Anamnesis Authors"]
 repository = "https://github.com/Trapezohe/Anamnesis"
@@ -23,6 +28,14 @@ readme = "README.md"
 # Internal crates
 anamnesis-core = { path = "crates/core", version = "0.0.1" }
 anamnesis-store = { path = "crates/store", version = "0.0.1" }
+anamnesis-embedder = { path = "crates/embedder", version = "0.0.1", default-features = false }
+anamnesis-search = { path = "crates/search", version = "0.0.1" }
+anamnesis-importer = { path = "crates/importer", version = "0.0.1" }
+anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.1" }
+anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.1" }
+anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.1" }
+anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.1" }
+anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.1", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

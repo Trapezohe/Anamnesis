@@ -1,0 +1,21 @@
+[package]
+name = "anamnesis-search"
+description = "Hybrid retrieval (FTS5 + vector + RRF) and context packing over the Anamnesis store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anamnesis-core = { workspace = true }
+anamnesis-store = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }

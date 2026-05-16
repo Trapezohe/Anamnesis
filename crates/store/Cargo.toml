@@ -17,3 +17,4 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { workspace = true }
+parking_lot = "0.12"

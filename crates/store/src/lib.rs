@@ -1,10 +1,16 @@
 //! SQLite-backed storage for Anamnesis records.
 //!
-//! Phase-0 scope: schema bootstrap + migration runner. Read/write APIs land
-//! in Phase 1 alongside the first adapter.
+//! The crate exposes `Store::open` / `Store::open_in_memory` plus a typed
+//! API in `api` for records, chunks, embeddings, jobs, and sources. The
+//! raw `Connection` is intentionally kept private to callers outside this
+//! crate; only tests use `conn()` directly.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod api;
+
+pub use api::{ChunkHit, PendingEmbeddingJob, StoreStats};
 
 use std::path::Path;
 
@@ -13,7 +19,10 @@ use thiserror::Error;
 
 /// Embedded SQL migrations. Add new files in `migrations/` and list them here
 /// in order.
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("migrations/0001_init.sql")),
+    ("0002_phase1", include_str!("migrations/0002_phase1.sql")),
+];
 
 /// Store-layer errors.
 #[derive(Debug, Error)]
@@ -33,9 +42,13 @@ pub enum StoreError {
 /// Crate result.
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Anamnesis storage handle. Owns a single SQLite connection.
+/// Anamnesis storage handle. The underlying SQLite connection is wrapped
+/// in a `parking_lot::Mutex` so the type is `Send + Sync` and can be
+/// shared across async tasks (the MCP server holds an `Arc<Store>`).
+/// All methods take `&self`; the mutex enforces serialised access to the
+/// connection.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: parking_lot::Mutex<Connection>,
 }
 
 impl Store {
@@ -45,7 +58,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let mut store = Self { conn };
+        let store = Self {
+            conn: parking_lot::Mutex::new(conn),
+        };
         store.run_migrations()?;
         Ok(store)
     }
@@ -53,14 +68,17 @@ impl Store {
     /// Open an in-memory store (useful for tests).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let mut store = Self { conn };
+        let store = Self {
+            conn: parking_lot::Mutex::new(conn),
+        };
         store.run_migrations()?;
         Ok(store)
     }
 
-    fn run_migrations(&mut self) -> Result<()> {
+    fn run_migrations(&self) -> Result<()> {
+        let mut conn = self.conn.lock();
         // Tiny home-grown runner: keep applied migration ids in a meta table.
-        self.conn.execute_batch(
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _migrations (
                 id    TEXT PRIMARY KEY,
                 applied_at INTEGER NOT NULL
@@ -68,13 +86,13 @@ impl Store {
         )?;
 
         for (id, sql) in MIGRATIONS {
-            let already: i64 = self.conn.query_row(
+            let already: i64 = conn.query_row(
                 "SELECT COUNT(1) FROM _migrations WHERE id = ?1",
                 [id],
                 |r| r.get(0),
             )?;
             if already == 0 {
-                let tx = self.conn.transaction()?;
+                let tx = conn.transaction()?;
                 tx.execute_batch(sql)?;
                 tx.execute(
                     "INSERT INTO _migrations(id, applied_at) VALUES (?1, strftime('%s','now'))",
@@ -87,9 +105,11 @@ impl Store {
         Ok(())
     }
 
-    /// Borrow the inner connection. Internal use; expect a richer API in Phase 1.
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    /// Borrow the inner connection. Intended for tests and ad-hoc reads;
+    /// production code should call the typed methods in `api`. The
+    /// returned guard holds the mutex — drop it before any `.await`.
+    pub fn conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 }
 
@@ -114,6 +134,167 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, "2");
+    }
+
+    #[test]
+    fn phase1_tables_exist() {
+        let store = Store::open_in_memory().unwrap();
+        for table in [
+            "sources",
+            "raw_artifacts",
+            "record_chunks",
+            "chunks_fts",
+            "chunk_embeddings",
+            "embedding_jobs",
+            "import_errors",
+        ] {
+            let n: i64 = store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| panic!("query failed for {table}"));
+            assert_eq!(n, 1, "expected table/view {table} to exist");
+        }
+    }
+
+    #[test]
+    fn record_level_fts_was_dropped() {
+        let store = Store::open_in_memory().unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE name = 'records_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "records_fts should not exist after 0002");
+    }
+
+    #[test]
+    fn chunks_fts_is_maintained_by_triggers() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+
+        // Insert a parent record so the FK on record_chunks is satisfied.
+        conn.execute(
+            "INSERT INTO records(id, adapter, instance, content, scope, kind, \
+             created_at, native_id, captured_at, raw_hash) \
+             VALUES('r1','claude-code',NULL,'parent','user','fact',0,'n1',0,'h')",
+            [],
+        )
+        .unwrap();
+
+        // Insert a chunk → AFTER INSERT trigger should populate FTS.
+        conn.execute(
+            "INSERT INTO record_chunks(id, record_id, seq, content, content_hash, token_estimate) \
+             VALUES('r1:0','r1',0,'hello world','h0',2)",
+            [],
+        )
+        .unwrap();
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM chunks_fts WHERE chunks_fts MATCH 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "FTS should index inserted chunk content");
+
+        // Delete the chunk → AFTER DELETE trigger should clean FTS.
+        conn.execute("DELETE FROM record_chunks WHERE id = 'r1:0'", [])
+            .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM chunks_fts WHERE chunks_fts MATCH 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "FTS should drop entry on chunk delete");
+    }
+
+    #[test]
+    fn embedding_jobs_unique_per_chunk_and_model() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO records(id, adapter, instance, content, scope, kind, \
+             created_at, native_id, captured_at, raw_hash) \
+             VALUES('r1','claude-code',NULL,'p','user','fact',0,'n1',0,'h')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO record_chunks(id, record_id, seq, content, content_hash, token_estimate) \
+             VALUES('r1:0','r1',0,'x','h0',1)",
+            [],
+        )
+        .unwrap();
+
+        let ok = conn.execute(
+            "INSERT INTO embedding_jobs(chunk_id, content_hash, model_id, status, enqueued_at) \
+             VALUES('r1:0','h0','local:e5:1','pending',0)",
+            [],
+        );
+        assert!(ok.is_ok());
+
+        // Same (chunk_id, model_id) should violate UNIQUE.
+        let dup = conn.execute(
+            "INSERT INTO embedding_jobs(chunk_id, content_hash, model_id, status, enqueued_at) \
+             VALUES('r1:0','h0','local:e5:1','pending',1)",
+            [],
+        );
+        assert!(dup.is_err());
+
+        // Different model_id → fresh job is allowed.
+        let other = conn.execute(
+            "INSERT INTO embedding_jobs(chunk_id, content_hash, model_id, status, enqueued_at) \
+             VALUES('r1:0','h0','local:bge-m3:1','pending',2)",
+            [],
+        );
+        assert!(other.is_ok());
+    }
+
+    #[test]
+    fn cascade_delete_record_clears_chunks_and_artifacts() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO records(id, adapter, instance, content, scope, kind, \
+             created_at, native_id, captured_at, raw_hash) \
+             VALUES('r1','claude-code',NULL,'p','user','fact',0,'n1',0,'h')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_artifacts(record_id, payload_json, captured_at) \
+             VALUES('r1','{}',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO record_chunks(id, record_id, seq, content, content_hash, token_estimate) \
+             VALUES('r1:0','r1',0,'x','h0',1)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM records WHERE id = 'r1'", [])
+            .unwrap();
+
+        let c: i64 = conn
+            .query_row("SELECT COUNT(1) FROM record_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(c, 0, "chunks should cascade-delete with parent record");
+        let a: i64 = conn
+            .query_row("SELECT COUNT(1) FROM raw_artifacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a, 0, "artifacts should cascade-delete with parent record");
     }
 }

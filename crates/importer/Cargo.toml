@@ -1,0 +1,23 @@
+[package]
+name = "anamnesis-importer"
+description = "Importer pipeline: scan → normalize → chunk → upsert. Glues an adapter to the store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anamnesis-core = { workspace = true }
+anamnesis-store = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

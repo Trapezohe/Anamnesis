@@ -17,6 +17,9 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

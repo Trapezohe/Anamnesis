@@ -17,3 +17,8 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 blake3 = { workspace = true }
+tracing = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true }
