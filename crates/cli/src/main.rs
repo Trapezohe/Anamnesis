@@ -646,21 +646,28 @@ fn cmd_export(
     source: Option<&str>,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
-    let conn = store.conn();
-    let (where_clause, params): (String, Vec<rusqlite::types::Value>) = match source {
-        Some(s) => (
-            "WHERE adapter = ?1".to_string(),
-            vec![rusqlite::types::Value::Text(s.to_string())],
-        ),
-        None => (String::new(), vec![]),
-    };
-    let sql = format!("SELECT id FROM records {where_clause} ORDER BY created_at ASC");
-    let mut stmt = conn.prepare(&sql)?;
-    let ids: Vec<String> = stmt
-        .query_map(rusqlite::params_from_iter(params), |r| {
-            r.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // IMPORTANT: drop the connection guard BEFORE calling store.get_record
+    // below. Store wraps Connection in parking_lot::Mutex internally; both
+    // store.conn() and store.get_record() lock the same mutex, and
+    // parking_lot is not re-entrant → would deadlock under load.
+    let ids: Vec<String> = {
+        let (where_clause, params): (String, Vec<rusqlite::types::Value>) = match source {
+            Some(s) => (
+                "WHERE adapter = ?1".to_string(),
+                vec![rusqlite::types::Value::Text(s.to_string())],
+            ),
+            None => (String::new(), vec![]),
+        };
+        let sql = format!("SELECT id FROM records {where_clause} ORDER BY created_at ASC");
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let collected: rusqlite::Result<Vec<String>> = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect();
+        collected?
+    }; // stmt + conn dropped here, mutex released before get_record below
 
     let mut writer: Box<dyn std::io::Write> = match out {
         Some(p) => Box::new(std::fs::File::create(p)?),
@@ -735,11 +742,17 @@ fn csv_field(s: &str) -> String {
 
 fn cmd_verify(data_dir: &std::path::Path, repair: bool) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
-    let conn = store.conn();
     let mut problems = 0u64;
 
+    // All raw-conn diagnostic queries are scoped tightly so the
+    // parking_lot Mutex guard never overlaps with calls back into Store
+    // (active_model / rebuild_embedding_jobs would otherwise deadlock).
+
     // 1. SQLite integrity_check.
-    let integrity: String = conn.query_row("PRAGMA integrity_check(1)", [], |r| r.get(0))?;
+    let integrity: String = {
+        let conn = store.conn();
+        conn.query_row("PRAGMA integrity_check(1)", [], |r| r.get(0))?
+    };
     if integrity == "ok" {
         println!("integrity_check : ok");
     } else {
@@ -748,12 +761,16 @@ fn cmd_verify(data_dir: &std::path::Path, repair: bool) -> Result<()> {
     }
 
     // 2. records → record_chunks consistency.
-    let records_count: i64 = conn.query_row("SELECT COUNT(1) FROM records", [], |r| r.get(0))?;
-    let records_with_chunks: i64 = conn.query_row(
-        "SELECT COUNT(1) FROM records r WHERE EXISTS (SELECT 1 FROM record_chunks c WHERE c.record_id = r.id)",
-        [],
-        |r| r.get(0),
-    )?;
+    let (records_count, records_with_chunks): (i64, i64) = {
+        let conn = store.conn();
+        let rc: i64 = conn.query_row("SELECT COUNT(1) FROM records", [], |r| r.get(0))?;
+        let rwc: i64 = conn.query_row(
+            "SELECT COUNT(1) FROM records r WHERE EXISTS (SELECT 1 FROM record_chunks c WHERE c.record_id = r.id)",
+            [],
+            |r| r.get(0),
+        )?;
+        (rc, rwc)
+    };
     let orphan_records = records_count - records_with_chunks;
     if orphan_records == 0 {
         println!("orphan records  : 0");
@@ -763,9 +780,12 @@ fn cmd_verify(data_dir: &std::path::Path, repair: bool) -> Result<()> {
     }
 
     // 3. FTS index vs record_chunks row count.
-    let chunks_count: i64 =
-        conn.query_row("SELECT COUNT(1) FROM record_chunks", [], |r| r.get(0))?;
-    let fts_count: i64 = conn.query_row("SELECT COUNT(1) FROM chunks_fts", [], |r| r.get(0))?;
+    let (chunks_count, fts_count): (i64, i64) = {
+        let conn = store.conn();
+        let cc: i64 = conn.query_row("SELECT COUNT(1) FROM record_chunks", [], |r| r.get(0))?;
+        let fc: i64 = conn.query_row("SELECT COUNT(1) FROM chunks_fts", [], |r| r.get(0))?;
+        (cc, fc)
+    };
     if chunks_count == fts_count {
         println!("FTS index       : ok ({chunks_count} rows)");
     } else {
@@ -773,6 +793,7 @@ fn cmd_verify(data_dir: &std::path::Path, repair: bool) -> Result<()> {
         problems += 1;
         if repair {
             println!("FTS index       : rebuilding…");
+            let conn = store.conn();
             conn.execute("DELETE FROM chunks_fts", [])?;
             conn.execute(
                 "INSERT INTO chunks_fts(rowid, content) SELECT rowid, content FROM record_chunks",
@@ -785,13 +806,16 @@ fn cmd_verify(data_dir: &std::path::Path, repair: bool) -> Result<()> {
     // 4. embeddings vs active model — count chunks that lack an embedding
     //    under the current model.
     if let Some(active) = store.active_model()? {
-        let missing: i64 = conn.query_row(
-            "SELECT COUNT(1) FROM record_chunks c \
-             WHERE NOT EXISTS (SELECT 1 FROM chunk_embeddings e \
-                WHERE e.chunk_id = c.id AND e.model_id = ?1)",
-            [&active],
-            |r| r.get(0),
-        )?;
+        let missing: i64 = {
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT COUNT(1) FROM record_chunks c \
+                 WHERE NOT EXISTS (SELECT 1 FROM chunk_embeddings e \
+                    WHERE e.chunk_id = c.id AND e.model_id = ?1)",
+                [&active],
+                |r| r.get(0),
+            )?
+        };
         println!("missing embeds  : {missing} (model: {active})");
         if missing > 0 && repair {
             let n = store.rebuild_embedding_jobs(&active)?;
