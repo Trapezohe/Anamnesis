@@ -20,6 +20,7 @@ anamnesis-embedder = { workspace = true, default-features = false }
 anamnesis-importer = { workspace = true }
 anamnesis-search = { workspace = true }
 anamnesis-adapter-claude-code = { workspace = true }
+anamnesis-adapter-mem0 = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -37,3 +38,4 @@ local-fastembed = ["anamnesis-embedder/local-fastembed"]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+rusqlite = { workspace = true }

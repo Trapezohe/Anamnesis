@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
+use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
 use anamnesis_core::discovery::{DetectOpts, Discovery};
 use anamnesis_embedder::registry;
 use anamnesis_importer::ImportRunner;
@@ -68,6 +69,10 @@ enum Command {
         /// Skip running the embedding worker after the import.
         #[arg(long)]
         no_embed: bool,
+        /// Optional path override (e.g. mem0 SQLite file when the default
+        /// `~/.mem0/db.sqlite` is wrong).
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 
     /// Search across all imported records.
@@ -219,7 +224,8 @@ async fn main() -> Result<()> {
             full,
             dry_run,
             no_embed,
-        } => cmd_import(&data_dir, &target, full, dry_run, no_embed).await,
+            path,
+        } => cmd_import(&data_dir, &target, full, dry_run, no_embed, path.as_deref()).await,
         Command::Search {
             query,
             source,
@@ -293,7 +299,9 @@ fn cmd_status(data_dir: &std::path::Path) -> Result<()> {
 }
 
 async fn cmd_discover() -> Result<()> {
-    let discovery = Discovery::new().register(Box::new(ClaudeCodeDetector::new()));
+    let discovery = Discovery::new()
+        .register(Box::new(ClaudeCodeDetector::new()))
+        .register(Box::new(Mem0SqliteDetector::new()));
     let found = discovery.detect_all(&DetectOpts::default()).await;
     if found.is_empty() {
         println!("no known memory sources found at default locations");
@@ -382,22 +390,41 @@ async fn cmd_import(
     _full: bool,
     dry_run: bool,
     no_embed: bool,
+    path_override: Option<&std::path::Path>,
 ) -> Result<()> {
     let (adapter_id, instance) = split_target(target);
-    if adapter_id != anamnesis_adapter_claude_code::ADAPTER_ID {
-        return Err(anyhow!(
-            "adapter {adapter_id:?} not wired in Phase 1; supported: claude-code"
-        ));
+    match adapter_id {
+        anamnesis_adapter_claude_code::ADAPTER_ID => {
+            let projects_root = path_override
+                .map(PathBuf::from)
+                .map_or_else(|| home_join(&[".claude", "projects"]), Ok)?;
+            let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
+                projects_root,
+                instance: instance.map(str::to_owned),
+            });
+            run_import(data_dir, &adapter, dry_run, no_embed).await
+        }
+        anamnesis_adapter_mem0::ADAPTER_ID => {
+            let db_path_for_mem0 = path_override
+                .map(PathBuf::from)
+                .map_or_else(|| home_join(&[".mem0", "db.sqlite"]), Ok)?;
+            let adapter = mem0_sqlite_adapter(db_path_for_mem0, instance);
+            run_import(data_dir, &adapter, dry_run, no_embed).await
+        }
+        other => Err(anyhow!(
+            "adapter {other:?} not wired; supported: claude-code, mem0"
+        )),
     }
-    let projects_root = home_join(&[".claude", "projects"])?;
-    let cfg = ClaudeCodeConfig {
-        projects_root,
-        instance: instance.map(str::to_owned),
-    };
-    let adapter = ClaudeCodeAdapter::new(cfg);
+}
 
+async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
+    data_dir: &std::path::Path,
+    adapter: &A,
+    dry_run: bool,
+    no_embed: bool,
+) -> Result<()> {
     if dry_run {
-        use anamnesis_core::adapter::{MemoryAdapter, ScanOpts};
+        use anamnesis_core::adapter::ScanOpts;
         use futures::StreamExt;
         let mut stream = adapter.scan(ScanOpts::default());
         let mut seen = 0usize;
@@ -411,7 +438,7 @@ async fn cmd_import(
     }
 
     let mut store = Store::open(db_path(data_dir))?;
-    let summary = ImportRunner::new(&adapter).run(&mut store).await?;
+    let summary = ImportRunner::new(adapter).run(&mut store).await?;
     println!(
         "import done: {} raw, {} upserted, {} chunks, {} errors",
         summary.raw_seen, summary.records_upserted, summary.chunks_written, summary.errors

@@ -194,6 +194,79 @@ fn import_rejects_unknown_adapter() {
 }
 
 #[test]
+fn import_supports_mem0_via_path_override() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let db = dir.path().join("mem0-test.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL, user_id TEXT);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories(id, memory, user_id) VALUES('a', 'imported via cli mem0 path', 'u1')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            db.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("import done").and(contains("1 upserted")));
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "imported via cli mem0", "--mode", "fulltext"])
+        .assert()
+        .success()
+        .stdout(contains("imported via cli mem0").or(contains("mem0")));
+}
+
+#[test]
+fn discover_lists_mem0_when_db_exists() {
+    use rusqlite::Connection;
+    let home = tmp_dir();
+    let data = tmp_dir();
+    let mem0_dir = home.path().join(".mem0");
+    std::fs::create_dir_all(&mem0_dir).unwrap();
+    let db = mem0_dir.join("db.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL);")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO memories(id, memory) VALUES('x','one'),('y','two')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["discover"])
+        .assert()
+        .success()
+        .stdout(
+            contains("mem0")
+                .and(contains("high"))
+                .and(contains("2 row")),
+        );
+}
+
+#[test]
 fn search_with_empty_db_prints_no_results() {
     let dir = tmp_dir();
     cli()

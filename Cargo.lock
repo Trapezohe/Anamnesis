@@ -86,6 +86,7 @@ name = "anamnesis-cli"
 version = "0.0.1"
 dependencies = [
  "anamnesis-adapter-claude-code",
+ "anamnesis-adapter-mem0",
  "anamnesis-core",
  "anamnesis-embedder",
  "anamnesis-importer",
@@ -97,6 +98,7 @@ dependencies = [
  "clap",
  "futures",
  "predicates",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",
