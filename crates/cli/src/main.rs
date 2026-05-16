@@ -221,9 +221,14 @@ fn resolve_data_dir(override_path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn dirs_home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME not set")
+    if let Some(h) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(h));
+    }
+    // Windows: HOME isn't set by default, but USERPROFILE is.
+    if let Some(h) = std::env::var_os("USERPROFILE") {
+        return Ok(PathBuf::from(h));
+    }
+    Err(anyhow!("neither HOME nor USERPROFILE is set"))
 }
 
 fn db_path(data_dir: &std::path::Path) -> PathBuf {
