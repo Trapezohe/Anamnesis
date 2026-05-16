@@ -20,6 +20,7 @@ anamnesis-search = { workspace = true }
 anamnesis-embedder = { workspace = true, default-features = false }
 anamnesis-importer = { workspace = true }
 anamnesis-adapter-claude-code = { workspace = true }
+anamnesis-adapter-codex = { workspace = true }
 anamnesis-adapter-mem0 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

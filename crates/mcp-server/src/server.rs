@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
+use anamnesis_adapter_codex::codex_adapter;
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
 use anamnesis_core::embedding::EmbeddingProvider;
 use anamnesis_core::model::RecordId;
@@ -309,6 +310,16 @@ impl AnamnesisServer {
                 let db_path =
                     path_override.unwrap_or_else(|| self.home().join(".mem0").join("db.sqlite"));
                 let adapter = mem0_sqlite_adapter(db_path, instance);
+                let mut store = self.store.lock().await;
+                let summary = ImportRunner::new(&adapter)
+                    .run(&mut store)
+                    .await
+                    .map_err(|e| format!("import: {e}"))?;
+                Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
+            }
+            anamnesis_adapter_codex::ADAPTER_ID => {
+                let root = path_override.unwrap_or_else(|| self.home().join(".codex"));
+                let adapter = codex_adapter(root, instance);
                 let mut store = self.store.lock().await;
                 let summary = ImportRunner::new(&adapter)
                     .run(&mut store)

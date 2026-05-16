@@ -65,6 +65,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-adapter-codex"
+version = "0.0.1"
+dependencies = [
+ "anamnesis-core",
+ "async-trait",
+ "blake3",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-adapter-mem0"
 version = "0.0.1"
 dependencies = [
@@ -86,6 +101,7 @@ name = "anamnesis-cli"
 version = "0.0.1"
 dependencies = [
  "anamnesis-adapter-claude-code",
+ "anamnesis-adapter-codex",
  "anamnesis-adapter-mem0",
  "anamnesis-core",
  "anamnesis-embedder",
@@ -162,6 +178,7 @@ name = "anamnesis-mcp-server"
 version = "0.0.1"
 dependencies = [
  "anamnesis-adapter-claude-code",
+ "anamnesis-adapter-codex",
  "anamnesis-adapter-mem0",
  "anamnesis-core",
  "anamnesis-embedder",

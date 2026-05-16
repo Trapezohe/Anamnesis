@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
+use anamnesis_adapter_codex::{codex_adapter, CodexDetector};
 use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
 use anamnesis_core::discovery::{DetectOpts, Discovery};
 use anamnesis_embedder::registry;
@@ -455,7 +456,8 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
 async fn cmd_discover() -> Result<()> {
     let discovery = Discovery::new()
         .register(Box::new(ClaudeCodeDetector::new()))
-        .register(Box::new(Mem0SqliteDetector::new()));
+        .register(Box::new(Mem0SqliteDetector::new()))
+        .register(Box::new(CodexDetector::new()));
     let found = discovery.detect_all(&DetectOpts::default()).await;
     if found.is_empty() {
         println!("no known memory sources found at default locations");
@@ -565,8 +567,15 @@ async fn cmd_import(
             let adapter = mem0_sqlite_adapter(db_path_for_mem0, instance);
             run_import(data_dir, &adapter, dry_run, no_embed).await
         }
+        anamnesis_adapter_codex::ADAPTER_ID => {
+            let root = path_override
+                .map(PathBuf::from)
+                .map_or_else(|| home_join(&[".codex"]), Ok)?;
+            let adapter = codex_adapter(root, instance);
+            run_import(data_dir, &adapter, dry_run, no_embed).await
+        }
         other => Err(anyhow!(
-            "adapter {other:?} not wired; supported: claude-code, mem0"
+            "adapter {other:?} not wired; supported: claude-code, codex, mem0"
         )),
     }
 }
