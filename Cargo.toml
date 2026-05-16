@@ -26,9 +26,10 @@ readme = "README.md"
 # Internal crates
 anamnesis-core = { path = "crates/core", version = "0.0.1" }
 anamnesis-store = { path = "crates/store", version = "0.0.1" }
-anamnesis-embedder = { path = "crates/embedder", version = "0.0.1" }
+anamnesis-embedder = { path = "crates/embedder", version = "0.0.1", default-features = false }
 anamnesis-search = { path = "crates/search", version = "0.0.1" }
 anamnesis-importer = { path = "crates/importer", version = "0.0.1" }
+anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.1" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

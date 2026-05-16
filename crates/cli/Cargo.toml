@@ -16,8 +16,24 @@ path = "src/main.rs"
 [dependencies]
 anamnesis-core = { workspace = true }
 anamnesis-store = { workspace = true }
+anamnesis-embedder = { workspace = true, default-features = false }
+anamnesis-importer = { workspace = true }
+anamnesis-search = { workspace = true }
+anamnesis-adapter-claude-code = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+[features]
+default = ["local-fastembed"]
+local-fastembed = ["anamnesis-embedder/local-fastembed"]
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
