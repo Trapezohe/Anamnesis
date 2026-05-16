@@ -1,21 +1,23 @@
 //! Anamnesis embedding providers.
 //!
 //! Phase-1 scope:
-//!   - `EmbeddingProvider` trait (added in Task #2 via `anamnesis-core`,
-//!     re-exported here in Task #4)
+//!   - `EmbeddingProvider` trait re-export from `anamnesis-core`
+//!   - Curated 5-model `registry` — `default` / `tiny` / `en` /
+//!     `multi-strong` / `cloud-voyage` (data only, zero ML deps)
 //!   - Local provider via `fastembed-rs` (Task #4)
-//!   - Curated 5-model registry — `default` / `tiny` / `en` / `multi-strong` /
-//!     `cloud-voyage` (Task #3)
-//!   - Model cache lives under `$XDG_DATA_HOME/anamnesis/models/`; binary stays
-//!     small. See `docs/BLUEPRINT.md §16.7`.
+//!   - Model cache lives under `$XDG_DATA_HOME/anamnesis/models/`; binary
+//!     stays small. See `docs/BLUEPRINT.md §16.7`.
 //!
-//! The cloud provider (`voyage`) implementation lands in Phase 2 alongside the
-//! mem0 adapter.
+//! The cloud provider (`voyage`) implementation lands in Phase 2 alongside
+//! the mem0 adapter.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod registry;
+
 pub use anamnesis_core::embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
+pub use registry::{available, by_key, default_model, local_only, CuratedModel, REGISTRY};
 
 /// Crate version, exposed for diagnostics and `anamnesis status` output.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

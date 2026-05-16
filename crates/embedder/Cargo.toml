@@ -12,5 +12,6 @@ description = "Embedding providers (local + cloud) for Anamnesis. Local default:
 anamnesis-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

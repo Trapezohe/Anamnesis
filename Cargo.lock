@@ -87,6 +87,7 @@ dependencies = [
  "anamnesis-core",
  "async-trait",
  "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
