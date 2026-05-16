@@ -3,17 +3,20 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anamnesis_adapter_mem0::{sqlite_adapter, Mem0Adapter};
 use anamnesis_core::contract::AdapterContract;
 use rusqlite::Connection;
 
+static NONCE: AtomicU64 = AtomicU64::new(0);
+
 fn fixture_db() -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("anamnesis-mem0-contract-{nonce}"));
+    // Atomic counter + pid avoids same-nanosecond collisions between
+    // parallel test threads in this binary.
+    let n = NONCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("anamnesis-mem0-contract-{pid}-{n}"));
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
     let conn = Connection::open(&path).unwrap();
