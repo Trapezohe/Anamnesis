@@ -168,13 +168,12 @@ mod tests {
     use futures::StreamExt;
     use std::fs;
 
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn tmp_dir() -> std::path::PathBuf {
-        let base = std::env::temp_dir();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = base.join(format!("anamnesis-adapter-{nonce}"));
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let p = std::env::temp_dir().join(format!("anamnesis-adapter-{pid}-{n}"));
         fs::create_dir_all(&p).unwrap();
         p
     }

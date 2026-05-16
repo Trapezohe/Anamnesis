@@ -225,15 +225,16 @@ mod tempdir_lite {
 
     pub struct TempDir(PathBuf);
 
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     impl TempDir {
         pub fn new(prefix: &str) -> Self {
             let base = std::env::temp_dir();
             let pid = std::process::id();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = base.join(format!("{prefix}-{pid}-{nonce}"));
+            // Atomic counter avoids same-nanosecond collisions on
+            // platforms with coarse timer resolution (Windows).
+            let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = base.join(format!("{prefix}-{pid}-{n}"));
             std::fs::create_dir_all(&dir).expect("create tempdir");
             Self(dir)
         }
