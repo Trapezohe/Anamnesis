@@ -236,6 +236,202 @@ fn import_supports_mem0_via_path_override() {
 }
 
 #[test]
+fn status_json_emits_structured_output() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["initialized"], true);
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["active_model"], "local:default:1");
+    assert!(payload["stats"]["records"].as_u64() == Some(0));
+}
+
+#[test]
+fn export_jsonl_round_trips_records() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    // Seed via mem0 import so we have known records.
+    let mem0_db = dir.path().join("mem0.sqlite");
+    let conn = Connection::open(&mem0_db).unwrap();
+    conn.execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL);")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO memories(id, memory) VALUES('a','exported alpha'),('b','exported beta')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out_path = dir.path().join("out.jsonl");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "jsonl",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let body = std::fs::read_to_string(&out_path).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(rec["source"]["adapter"], "mem0");
+    }
+}
+
+#[test]
+fn export_csv_includes_header_and_rows() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("mem0.sqlite");
+    let conn = Connection::open(&mem0_db).unwrap();
+    conn.execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL);")
+        .unwrap();
+    conn.execute("INSERT INTO memories VALUES('a','tea, and, biscuits')", [])
+        .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["export", "--format", "csv"])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let body = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = body.lines().collect();
+    assert!(lines[0].starts_with("id,adapter,instance,kind,scope"));
+    assert!(lines.len() >= 2);
+    // Comma in content must be quoted.
+    assert!(body.contains("\"tea, and, biscuits\""));
+}
+
+#[test]
+fn verify_reports_healthy_on_fresh_db() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["verify"])
+        .assert()
+        .success()
+        .stdout(
+            contains("integrity_check : ok")
+                .and(contains("status          : healthy"))
+                .and(contains("missing embeds")),
+        );
+}
+
+#[test]
+fn search_kind_filter_restricts_to_kind() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("mem0.sqlite");
+    let conn = Connection::open(&mem0_db).unwrap();
+    conn.execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL);")
+        .unwrap();
+    conn.execute("INSERT INTO memories VALUES('a','filter target')", [])
+        .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // mem0 normalizes to Kind::Fact, so --kind fact hits, --kind episode misses.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search",
+            "filter target",
+            "--mode",
+            "fulltext",
+            "--kind",
+            "fact",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("filter target").or(contains("mem0")));
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search",
+            "filter target",
+            "--mode",
+            "fulltext",
+            "--kind",
+            "episode",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("no results"));
+}
+
+#[test]
 fn discover_lists_mem0_when_db_exists() {
     use rusqlite::Connection;
     let home = tmp_dir();

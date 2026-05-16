@@ -31,6 +31,7 @@ anamnesis-search = { path = "crates/search", version = "0.0.1" }
 anamnesis-importer = { path = "crates/importer", version = "0.0.1" }
 anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.1" }
 anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.1" }
+anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.1", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

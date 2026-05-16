@@ -10,5 +10,6 @@
 
 pub mod protocol;
 pub mod server;
+pub mod stdio;
 
 pub use server::AnamnesisServer;

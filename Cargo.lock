@@ -90,6 +90,7 @@ dependencies = [
  "anamnesis-core",
  "anamnesis-embedder",
  "anamnesis-importer",
+ "anamnesis-mcp-server",
  "anamnesis-search",
  "anamnesis-store",
  "anyhow",

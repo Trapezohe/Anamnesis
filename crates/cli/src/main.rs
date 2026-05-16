@@ -47,7 +47,11 @@ enum Command {
     },
 
     /// Show database stats and active model.
-    Status,
+    Status {
+        /// Emit JSON instead of the human-friendly table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Scan default paths for known memory sources (read-only).
     Discover,
@@ -79,9 +83,15 @@ enum Command {
     Search {
         /// Free-text query.
         query: String,
-        /// Restrict to one source.
+        /// Restrict to one source (adapter id).
         #[arg(long)]
         source: Option<String>,
+        /// Restrict to one Kind: fact | preference | feedback | reference | episode | skill | unknown.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Restrict to one Scope: user | project | session | ephemeral.
+        #[arg(long)]
+        scope: Option<String>,
         /// Result limit.
         #[arg(long, default_value_t = 10)]
         limit: u32,
@@ -97,22 +107,32 @@ enum Command {
     #[command(subcommand)]
     Model(ModelCmd),
 
-    /// Export records as JSONL or CSV (not yet implemented).
+    /// Export records as JSONL or CSV.
     Export {
+        /// Output file path (default: stdout).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Format: `jsonl` (one AnamnesisRecord per line) or `csv`.
         #[arg(long, default_value = "jsonl")]
         format: String,
+        /// Restrict to one source (adapter id).
+        #[arg(long)]
+        source: Option<String>,
     },
 
-    /// Run as an MCP server (not yet implemented).
+    /// Run as an MCP server. Default mode = stdio; future flag --sse for
+    /// the network transport (Phase 4).
     Serve {
+        /// Reserved for the SSE transport (not yet wired in this CLI;
+        /// use the anamnesis-mcp binary's --sse flag instead).
         #[arg(long)]
         sse: Option<u16>,
     },
 
-    /// Verify database integrity and rebuild indexes (not yet implemented).
+    /// Verify database integrity. With --repair, rebuild the FTS index and
+    /// re-queue any chunks that have no embeddings under the active model.
     Verify {
+        /// Try to fix issues that are auto-repairable.
         #[arg(long)]
         repair: bool,
     },
@@ -216,7 +236,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Init { model } => cmd_init(&data_dir, model.as_deref()),
-        Command::Status => cmd_status(&data_dir),
+        Command::Status { json } => cmd_status(&data_dir, json),
         Command::Discover => cmd_discover().await,
         Command::Source(sub) => cmd_source(&data_dir, sub),
         Command::Import {
@@ -229,21 +249,91 @@ async fn main() -> Result<()> {
         Command::Search {
             query,
             source,
+            kind,
+            scope,
             limit,
             mode,
             json,
-        } => cmd_search(&data_dir, &query, source.as_deref(), limit, &mode, json).await,
-        Command::Model(sub) => cmd_model(&data_dir, sub).await,
-        Command::Export { .. } | Command::Serve { .. } | Command::Verify { .. } => {
-            eprintln!("not yet implemented in Phase 1 — coming in Phase 2+");
-            std::process::exit(2);
+        } => {
+            cmd_search(
+                &data_dir,
+                &query,
+                source.as_deref(),
+                kind.as_deref(),
+                scope.as_deref(),
+                limit,
+                &mode,
+                json,
+            )
+            .await
         }
+        Command::Model(sub) => cmd_model(&data_dir, sub).await,
+        Command::Serve { sse } => cmd_serve(&data_dir, sse).await,
+        Command::Export {
+            out,
+            format,
+            source,
+        } => cmd_export(&data_dir, out.as_deref(), &format, source.as_deref()),
+        Command::Verify { repair } => cmd_verify(&data_dir, repair),
         Command::Migrate => {
             let _ = Store::open(db_path(&data_dir))?;
             println!("migrations applied");
             Ok(())
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// serve — embed the MCP server in the CLI process (same code as the
+// dedicated `anamnesis-mcp` binary, but one less binary for users to wire up).
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn cmd_serve(data_dir: &std::path::Path, sse: Option<u16>) -> Result<()> {
+    if sse.is_some() {
+        return Err(anyhow!(
+            "SSE transport is not yet wired into `anamnesis serve` — see Phase 4. \
+             Use the dedicated `anamnesis-mcp --sse` binary in the meantime."
+        ));
+    }
+    let store = Store::open(db_path(data_dir))?;
+    let active_model = store.active_model().ok().flatten();
+    let provider = open_active_provider_optional(data_dir, &store, active_model.as_deref());
+    let server =
+        anamnesis_mcp_server::AnamnesisServer::new(store, provider, data_dir.to_path_buf());
+    eprintln!(
+        "anamnesis serve (stdio) — active model: {}",
+        active_model.as_deref().unwrap_or("<unset>")
+    );
+    anamnesis_mcp_server::stdio::run(server).await
+}
+
+#[cfg(feature = "local-fastembed")]
+fn open_active_provider_optional(
+    data_dir: &std::path::Path,
+    _store: &Store,
+    active_model: Option<&str>,
+) -> Option<Box<dyn anamnesis_core::EmbeddingProvider>> {
+    let key = active_model?.split(':').nth(1)?;
+    match anamnesis_embedder::LocalFastembedProvider::new(key, models_dir(data_dir)) {
+        Ok(p) => Some(Box::new(p)),
+        Err(e) => {
+            tracing::warn!(
+                model = key,
+                error = %e,
+                "failed to open active embedding model; serve will degrade to FTS-only"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "local-fastembed"))]
+fn open_active_provider_optional(
+    _data_dir: &std::path::Path,
+    _store: &Store,
+    _active_model: Option<&str>,
+) -> Option<Box<dyn anamnesis_core::EmbeddingProvider>> {
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -271,18 +361,51 @@ fn cmd_init(data_dir: &std::path::Path, model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(data_dir: &std::path::Path) -> Result<()> {
+fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     let db = db_path(data_dir);
     if !db.exists() {
-        println!(
-            "no database found at {} — run `anamnesis init`",
-            db.display()
-        );
+        if json {
+            let payload = serde_json::json!({
+                "initialized": false,
+                "data_dir": data_dir.display().to_string(),
+                "db_path": db.display().to_string(),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!(
+                "no database found at {} — run `anamnesis init`",
+                db.display()
+            );
+        }
         return Ok(());
     }
     let store = Store::open(&db)?;
     let stats = store.stats()?;
     let active = store.active_model()?;
+    let sources = store.list_sources()?;
+    if json {
+        let payload = serde_json::json!({
+            "initialized": true,
+            "data_dir": data_dir.display().to_string(),
+            "models_dir": models_dir(data_dir).display().to_string(),
+            "schema_version": anamnesis_core::SCHEMA_VERSION,
+            "active_model": active,
+            "stats": {
+                "sources": stats.sources,
+                "records": stats.records,
+                "chunks": stats.chunks,
+                "jobs_pending": stats.jobs_pending,
+                "jobs_failed": stats.jobs_failed,
+            },
+            "sources": sources.iter().map(|(a, i, loc)| serde_json::json!({
+                "adapter": a,
+                "instance": if i.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(i.clone()) },
+                "location": loc,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
     println!("data_dir        : {}", data_dir.display());
     println!("models dir      : {}", models_dir(data_dir).display());
     println!("schema          : v{}", anamnesis_core::SCHEMA_VERSION);
@@ -450,6 +573,202 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// export
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_export(
+    data_dir: &std::path::Path,
+    out: Option<&std::path::Path>,
+    format: &str,
+    source: Option<&str>,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let conn = store.conn();
+    let (where_clause, params): (String, Vec<rusqlite::types::Value>) = match source {
+        Some(s) => (
+            "WHERE adapter = ?1".to_string(),
+            vec![rusqlite::types::Value::Text(s.to_string())],
+        ),
+        None => (String::new(), vec![]),
+    };
+    let sql = format!("SELECT id FROM records {where_clause} ORDER BY created_at ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut writer: Box<dyn std::io::Write> = match out {
+        Some(p) => Box::new(std::fs::File::create(p)?),
+        None => Box::new(std::io::stdout()),
+    };
+
+    match format {
+        "jsonl" => export_jsonl(&store, &ids, &mut writer)?,
+        "csv" => export_csv(&store, &ids, &mut writer)?,
+        other => return Err(anyhow!("unsupported format: {other} (try jsonl or csv)")),
+    }
+    eprintln!("exported {} record(s)", ids.len());
+    Ok(())
+}
+
+fn export_jsonl(store: &Store, ids: &[String], writer: &mut dyn std::io::Write) -> Result<()> {
+    for id in ids {
+        if let Some(rec) = store.get_record(&anamnesis_core::RecordId(id.clone()))? {
+            let line = serde_json::to_string(&rec)?;
+            writeln!(writer, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
+fn export_csv(store: &Store, ids: &[String], writer: &mut dyn std::io::Write) -> Result<()> {
+    writeln!(
+        writer,
+        "id,adapter,instance,kind,scope,created_at,native_id,native_path,content"
+    )?;
+    for id in ids {
+        if let Some(rec) = store.get_record(&anamnesis_core::RecordId(id.clone()))? {
+            let row = format!(
+                "{id},{adapter},{instance},{kind},{scope},{created},{nid},{npath},{content}",
+                id = csv_field(&rec.id.0),
+                adapter = csv_field(&rec.source.adapter),
+                instance = csv_field(rec.source.instance.as_deref().unwrap_or("")),
+                kind = csv_field(&format!("{:?}", rec.kind).to_lowercase()),
+                scope = csv_field(&format!("{:?}", rec.scope).to_lowercase()),
+                created = rec.created_at.timestamp(),
+                nid = csv_field(&rec.provenance.native_id),
+                npath = csv_field(rec.provenance.native_path.as_deref().unwrap_or("")),
+                content = csv_field(&rec.content),
+            );
+            writeln!(writer, "{row}")?;
+        }
+    }
+    Ok(())
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// verify
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_verify(data_dir: &std::path::Path, repair: bool) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let conn = store.conn();
+    let mut problems = 0u64;
+
+    // 1. SQLite integrity_check.
+    let integrity: String = conn.query_row("PRAGMA integrity_check(1)", [], |r| r.get(0))?;
+    if integrity == "ok" {
+        println!("integrity_check : ok");
+    } else {
+        println!("integrity_check : {integrity}");
+        problems += 1;
+    }
+
+    // 2. records → record_chunks consistency.
+    let records_count: i64 = conn.query_row("SELECT COUNT(1) FROM records", [], |r| r.get(0))?;
+    let records_with_chunks: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM records r WHERE EXISTS (SELECT 1 FROM record_chunks c WHERE c.record_id = r.id)",
+        [],
+        |r| r.get(0),
+    )?;
+    let orphan_records = records_count - records_with_chunks;
+    if orphan_records == 0 {
+        println!("orphan records  : 0");
+    } else {
+        println!("orphan records  : {orphan_records} (no chunks)");
+        problems += 1;
+    }
+
+    // 3. FTS index vs record_chunks row count.
+    let chunks_count: i64 =
+        conn.query_row("SELECT COUNT(1) FROM record_chunks", [], |r| r.get(0))?;
+    let fts_count: i64 = conn.query_row("SELECT COUNT(1) FROM chunks_fts", [], |r| r.get(0))?;
+    if chunks_count == fts_count {
+        println!("FTS index       : ok ({chunks_count} rows)");
+    } else {
+        println!("FTS index       : drift ({chunks_count} chunks vs {fts_count} FTS rows)");
+        problems += 1;
+        if repair {
+            println!("FTS index       : rebuilding…");
+            conn.execute("DELETE FROM chunks_fts", [])?;
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, content) SELECT rowid, content FROM record_chunks",
+                [],
+            )?;
+            println!("FTS index       : rebuilt");
+        }
+    }
+
+    // 4. embeddings vs active model — count chunks that lack an embedding
+    //    under the current model.
+    if let Some(active) = store.active_model()? {
+        let missing: i64 = conn.query_row(
+            "SELECT COUNT(1) FROM record_chunks c \
+             WHERE NOT EXISTS (SELECT 1 FROM chunk_embeddings e \
+                WHERE e.chunk_id = c.id AND e.model_id = ?1)",
+            [&active],
+            |r| r.get(0),
+        )?;
+        println!("missing embeds  : {missing} (model: {active})");
+        if missing > 0 && repair {
+            let n = store.rebuild_embedding_jobs(&active)?;
+            println!("missing embeds  : re-queued {n} embedding job(s)");
+        }
+    } else {
+        println!("missing embeds  : skipped (no active model)");
+    }
+
+    if problems == 0 {
+        println!("status          : healthy");
+    } else if repair {
+        println!("status          : repair attempted on {problems} issue(s)");
+    } else {
+        println!("status          : {problems} issue(s) found (run with --repair)");
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kind / Scope parsers (shared by search filters)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn parse_kind(s: &str) -> Result<anamnesis_core::Kind> {
+    use anamnesis_core::Kind;
+    Ok(match s {
+        "fact" => Kind::Fact,
+        "preference" => Kind::Preference,
+        "feedback" => Kind::Feedback,
+        "reference" => Kind::Reference,
+        "episode" => Kind::Episode,
+        "skill" => Kind::Skill,
+        "unknown" => Kind::Unknown,
+        other => return Err(anyhow!("unknown kind: {other}")),
+    })
+}
+
+fn parse_scope(s: &str) -> Result<anamnesis_core::Scope> {
+    use anamnesis_core::Scope;
+    Ok(match s {
+        "user" => Scope::User,
+        "project" => Scope::Project,
+        "session" => Scope::Session,
+        "ephemeral" => Scope::Ephemeral,
+        other => return Err(anyhow!("unknown scope: {other}")),
+    })
+}
+
 fn home_join(parts: &[&str]) -> Result<PathBuf> {
     let mut p = dirs_home()?;
     for part in parts {
@@ -462,10 +781,13 @@ fn home_join(parts: &[&str]) -> Result<PathBuf> {
 // search
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_search(
     data_dir: &std::path::Path,
     query: &str,
     source: Option<&str>,
+    kind: Option<&str>,
+    scope: Option<&str>,
     limit: u32,
     mode_str: &str,
     json: bool,
@@ -475,6 +797,14 @@ async fn cmd_search(
         "fulltext" => SearchMode::Fulltext,
         "vector" => SearchMode::Vector,
         _ => SearchMode::Hybrid,
+    };
+    let kind_filter = match kind {
+        Some(k) => Some(parse_kind(k)?),
+        None => None,
+    };
+    let scope_filter = match scope {
+        Some(s) => Some(parse_scope(s)?),
+        None => None,
     };
 
     // Embedding provider needed for Vector/Hybrid modes.
@@ -494,14 +824,12 @@ async fn cmd_search(
         },
     )?;
 
-    let filtered: Vec<_> = if let Some(src) = source {
-        packed
-            .into_iter()
-            .filter(|p| p.record.source.adapter == src)
-            .collect()
-    } else {
-        packed
-    };
+    let filtered: Vec<_> = packed
+        .into_iter()
+        .filter(|p| source.is_none_or(|src| p.record.source.adapter == src))
+        .filter(|p| kind_filter.is_none_or(|k| p.record.kind == k))
+        .filter(|p| scope_filter.is_none_or(|s| p.record.scope == s))
+        .collect();
 
     if json {
         let payload = serde_json::json!({

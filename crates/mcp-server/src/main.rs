@@ -1,19 +1,16 @@
 //! Anamnesis MCP server binary — stdio mode.
 //!
-//! Reads one JSON-RPC message per line from stdin, dispatches it to
-//! `AnamnesisServer::handle`, writes the response to stdout. Designed to
-//! be launched as a subprocess by an MCP client (Claude Desktop,
-//! Claude Code, ghast, …).
+//! Thin shell around `anamnesis_mcp_server::stdio::run`. The actual loop
+//! and server logic live in the library so `anamnesis serve` and any
+//! other harness can reuse them.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
-use anamnesis_mcp_server::protocol::{JsonRpcRequest, JsonRpcResponse};
 use anamnesis_mcp_server::AnamnesisServer;
 use anamnesis_store::Store;
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn resolve_data_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("ANAMNESIS_DATA_DIR") {
@@ -68,7 +65,6 @@ fn try_open_provider(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log to stderr; stdout is reserved for JSON-RPC frames.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -91,31 +87,5 @@ async fn main() -> Result<()> {
         "anamnesis-mcp stdio server ready",
     );
 
-    let mut stdout = tokio::io::stdout();
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(req) => {
-                let is_note = req.is_notification();
-                let resp = server.handle(req).await;
-                if is_note {
-                    // Notifications expect no reply.
-                    continue;
-                }
-                resp
-            }
-            Err(e) => {
-                JsonRpcResponse::err(serde_json::Value::Null, -32700, format!("parse error: {e}"))
-            }
-        };
-        let line_out = serde_json::to_string(&response)? + "\n";
-        stdout.write_all(line_out.as_bytes()).await?;
-        stdout.flush().await?;
-    }
-    Ok(())
+    anamnesis_mcp_server::stdio::run(server).await
 }
