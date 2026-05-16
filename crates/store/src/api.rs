@@ -167,7 +167,7 @@ impl Store {
         config_json: Option<&str>,
     ) -> Result<()> {
         let inst = instance.unwrap_or("");
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO sources(adapter, instance, location, config_json, added_at) \
              VALUES(?1, ?2, ?3, ?4, strftime('%s','now')) \
              ON CONFLICT(adapter, instance) DO UPDATE SET \
@@ -182,7 +182,7 @@ impl Store {
     /// own provenance and can be inspected even after the source is gone).
     pub fn deregister_source(&self, adapter: &str, instance: Option<&str>) -> Result<()> {
         let inst = instance.unwrap_or("");
-        self.conn.execute(
+        self.conn.lock().execute(
             "DELETE FROM sources WHERE adapter = ?1 AND instance = ?2",
             params![adapter, inst],
         )?;
@@ -191,7 +191,8 @@ impl Store {
 
     /// List configured sources as `(adapter, instance, location)` triples.
     pub fn list_sources(&self) -> Result<Vec<(String, String, Option<String>)>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT adapter, instance, location FROM sources ORDER BY adapter, instance",
         )?;
         let rows = stmt
@@ -211,7 +212,7 @@ impl Store {
     /// embeddings; callers (the CLI `model use` command) decide whether to
     /// also call `rebuild_embedding_jobs`.
     pub fn set_active_model(&self, model_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO meta(key, value) VALUES('active_embedding_model', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![model_id],
@@ -223,6 +224,7 @@ impl Store {
     pub fn active_model(&self) -> Result<Option<String>> {
         let v: Option<String> = self
             .conn
+            .lock()
             .query_row(
                 "SELECT value FROM meta WHERE key = 'active_embedding_model'",
                 [],
@@ -246,13 +248,14 @@ impl Store {
     /// Returns `(records_added_or_updated, chunks_written)`. Both counts
     /// are 1/N — meaningful for tests and import job summaries.
     pub fn upsert_record(
-        &mut self,
+        &self,
         record: &AnamnesisRecord,
         chunks: &[Chunk],
         raw_payload_json: Option<&str>,
     ) -> Result<(u64, u64)> {
         let active = self.active_model()?;
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
         write_record(&tx, record)?;
         write_raw_artifact(&tx, record, raw_payload_json, now)?;
@@ -268,7 +271,7 @@ impl Store {
     /// Used by `anamnesis model use <other>` to trigger a full re-embed.
     pub fn rebuild_embedding_jobs(&self, model_id: &str) -> Result<u64> {
         let now = chrono::Utc::now().timestamp();
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "INSERT INTO embedding_jobs(chunk_id, content_hash, model_id, status, enqueued_at) \
              SELECT id, content_hash, ?1, 'pending', ?2 FROM record_chunks \
              WHERE TRUE ON CONFLICT(chunk_id, model_id) DO NOTHING",
@@ -406,7 +409,8 @@ fn enqueue_jobs(tx: &Transaction<'_>, chunks: &[Chunk], model_id: &str, now: i64
 impl Store {
     /// Fetch a record by id.
     pub fn get_record(&self, id: &RecordId) -> Result<Option<AnamnesisRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, adapter, instance, content, scope, kind, \
                     created_at, updated_at, tags, metadata, \
                     native_id, native_path, captured_at, raw_hash, schema_version \
@@ -463,7 +467,8 @@ impl Store {
     /// FTS5 chunk search. Returns hits ordered by BM25 (lower rank = better);
     /// `score` is the bm25() value (negated so larger = more relevant).
     pub fn search_chunks_fts(&self, query: &str, limit: u32) -> Result<Vec<ChunkHit>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT rc.id, rc.record_id, rc.seq, rc.content, bm25(chunks_fts) AS score \
              FROM chunks_fts \
              JOIN record_chunks rc ON rc.rowid = chunks_fts.rowid \
@@ -495,7 +500,8 @@ impl Store {
         model_id: &str,
         limit: u32,
     ) -> Result<Vec<ChunkHit>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT e.chunk_id, e.embedding, rc.record_id, rc.seq, rc.content \
              FROM chunk_embeddings e \
              JOIN record_chunks rc ON rc.id = e.chunk_id \
@@ -540,8 +546,9 @@ impl Store {
 impl Store {
     /// Atomically claim one pending job (pending → in_progress).
     /// Returns `None` when the queue is empty.
-    pub fn claim_next_job(&mut self, model_id: &str) -> Result<Option<PendingEmbeddingJob>> {
-        let tx = self.conn.transaction()?;
+    pub fn claim_next_job(&self, model_id: &str) -> Result<Option<PendingEmbeddingJob>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
         let row: Option<(i64, String, String)> = tx
             .query_row(
@@ -576,10 +583,11 @@ impl Store {
     }
 
     /// Mark a job done and persist its embedding.
-    pub fn complete_job(&mut self, job: &PendingEmbeddingJob, vector: &[f32]) -> Result<()> {
+    pub fn complete_job(&self, job: &PendingEmbeddingJob, vector: &[f32]) -> Result<()> {
         let dim = vector.len() as i64;
         let blob = f32_to_blob(vector);
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
         tx.execute(
             "INSERT INTO chunk_embeddings(chunk_id, model_id, content_hash, dim, embedding, created_at) \
@@ -609,7 +617,7 @@ impl Store {
     /// Mark a job failed; the embedder may retry by re-enqueueing later.
     pub fn fail_job(&self, job_id: i64, error: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
+        self.conn.lock().execute(
             "UPDATE embedding_jobs SET status = 'failed', finished_at = ?1, error = ?2 WHERE id = ?3",
             params![now, error, job_id],
         )?;
@@ -633,7 +641,7 @@ impl Store {
         error: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO import_errors(adapter, instance, native_id, native_path, phase, error, occurred_at) \
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![adapter, instance.unwrap_or(""), native_id, native_path, phase, error, now],
@@ -643,25 +651,20 @@ impl Store {
 
     /// Coarse counters for `anamnesis status`.
     pub fn stats(&self) -> Result<StoreStats> {
-        let records: i64 = self
-            .conn
-            .query_row("SELECT COUNT(1) FROM records", [], |r| r.get(0))?;
-        let chunks: i64 = self
-            .conn
-            .query_row("SELECT COUNT(1) FROM record_chunks", [], |r| r.get(0))?;
-        let pending: i64 = self.conn.query_row(
+        let conn = self.conn.lock();
+        let records: i64 = conn.query_row("SELECT COUNT(1) FROM records", [], |r| r.get(0))?;
+        let chunks: i64 = conn.query_row("SELECT COUNT(1) FROM record_chunks", [], |r| r.get(0))?;
+        let pending: i64 = conn.query_row(
             "SELECT COUNT(1) FROM embedding_jobs WHERE status IN ('pending','in_progress')",
             [],
             |r| r.get(0),
         )?;
-        let failed: i64 = self.conn.query_row(
+        let failed: i64 = conn.query_row(
             "SELECT COUNT(1) FROM embedding_jobs WHERE status = 'failed'",
             [],
             |r| r.get(0),
         )?;
-        let sources: i64 = self
-            .conn
-            .query_row("SELECT COUNT(1) FROM sources", [], |r| r.get(0))?;
+        let sources: i64 = conn.query_row("SELECT COUNT(1) FROM sources", [], |r| r.get(0))?;
         Ok(StoreStats {
             records: records as u64,
             chunks: chunks as u64,
@@ -755,7 +758,7 @@ mod tests {
 
     #[test]
     fn upsert_round_trips_record() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let r = make_record("claude-code", "n1", "alpha beta gamma", Kind::Preference);
         let chunks = Chunker::default().chunk(&r.id, &r.content);
         let (added, n_chunks) = store.upsert_record(&r, &chunks, Some("{}")).unwrap();
@@ -773,7 +776,7 @@ mod tests {
 
     #[test]
     fn upsert_replaces_chunks_on_recall() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let r = make_record("a", "x", "v1", Kind::Fact);
         let c1 = Chunker::default().chunk(&r.id, &r.content);
         store.upsert_record(&r, &c1, None).unwrap();
@@ -801,7 +804,7 @@ mod tests {
 
     #[test]
     fn fts_search_returns_chunks() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let r = make_record(
             "a",
             "x",
@@ -831,7 +834,7 @@ mod tests {
 
     #[test]
     fn upsert_enqueues_jobs_under_active_model() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.set_active_model("local:e5:1").unwrap();
         let r = make_record("a", "x", "hello world", Kind::Fact);
         let c = Chunker::default().chunk(&r.id, &r.content);
@@ -849,7 +852,7 @@ mod tests {
 
     #[test]
     fn no_active_model_means_no_jobs() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let r = make_record("a", "x", "hi", Kind::Fact);
         let c = Chunker::default().chunk(&r.id, &r.content);
         store.upsert_record(&r, &c, None).unwrap();
@@ -862,7 +865,7 @@ mod tests {
 
     #[test]
     fn claim_and_complete_job_cycle() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.set_active_model("local:fake:1").unwrap();
         let r = make_record("a", "x", "alpha", Kind::Fact);
         let c = Chunker::default().chunk(&r.id, &r.content);
@@ -898,7 +901,7 @@ mod tests {
 
     #[test]
     fn fail_job_marks_failed_and_unblocks_next() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.set_active_model("local:fake:1").unwrap();
         let r1 = make_record("a", "x", "one", Kind::Fact);
         let r2 = make_record("a", "y", "two", Kind::Fact);
@@ -916,7 +919,7 @@ mod tests {
 
     #[test]
     fn rebuild_jobs_targets_a_new_model() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.set_active_model("local:a:1").unwrap();
         let r = make_record("a", "x", "hi", Kind::Fact);
         let c = Chunker::default().chunk(&r.id, &r.content);
@@ -926,8 +929,8 @@ mod tests {
         assert_eq!(n, c.len() as u64);
 
         let by_model: Vec<(String, i64)> = {
-            let mut stmt = store
-                .conn()
+            let conn = store.conn();
+            let mut stmt = conn
                 .prepare(
                     "SELECT model_id, COUNT(1) FROM embedding_jobs GROUP BY model_id ORDER BY model_id",
                 )
@@ -948,7 +951,7 @@ mod tests {
 
     #[test]
     fn stats_reports_counts() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.set_active_model("local:fake:1").unwrap();
         store
             .register_source("claude-code", None, None, None)
@@ -979,7 +982,7 @@ mod tests {
 
     #[test]
     fn source_vector_is_persisted_to_raw_artifacts() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let mut r = make_record("mem0", "x", "hi", Kind::Fact);
         r.embedding = Some(Embedding {
             vector: vec![0.1, 0.2, 0.3],

@@ -86,7 +86,7 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
     }
 
     /// Drain `adapter.scan()` into `store`. Returns the run summary.
-    pub async fn run(&self, store: &mut Store) -> std::result::Result<ImportSummary, ImportError> {
+    pub async fn run(&self, store: &Store) -> std::result::Result<ImportSummary, ImportError> {
         let descriptor = self.adapter.descriptor();
         let mut summary = ImportSummary::empty(&descriptor.adapter, descriptor.instance.as_deref());
         let mut stream = self.adapter.scan(Default::default());
@@ -121,7 +121,7 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
     fn process_one(
         &self,
         raw: RawRecord,
-        store: &mut Store,
+        store: &Store,
         descriptor: &anamnesis_core::SourceDescriptor,
         summary: &mut ImportSummary,
     ) {
@@ -284,13 +284,13 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_upserts_all_records() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let adapter = FakeAdapter::new(vec![
             pair("a", "alpha"),
             pair("b", "beta gamma"),
             pair("c", "delta epsilon zeta"),
         ]);
-        let summary = ImportRunner::new(&adapter).run(&mut store).await.unwrap();
+        let summary = ImportRunner::new(&adapter).run(&store).await.unwrap();
         assert_eq!(summary.adapter, "fake");
         assert_eq!(summary.instance.as_deref(), Some("default"));
         assert_eq!(summary.raw_seen, 3);
@@ -305,14 +305,14 @@ mod tests {
 
     #[tokio::test]
     async fn normalize_failure_logs_error_and_continues() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let adapter = FakeAdapter::new(vec![
             pair("good1", "x"),
             pair("bad", "y"),
             pair("good2", "z"),
         ])
         .with_normalize_failure("bad");
-        let summary = ImportRunner::new(&adapter).run(&mut store).await.unwrap();
+        let summary = ImportRunner::new(&adapter).run(&store).await.unwrap();
         assert_eq!(summary.raw_seen, 3);
         assert_eq!(summary.records_upserted, 2);
         assert_eq!(summary.errors, 1);
@@ -331,10 +331,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_is_idempotent() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let adapter = FakeAdapter::new(vec![pair("a", "alpha"), pair("b", "beta")]);
-        let s1 = ImportRunner::new(&adapter).run(&mut store).await.unwrap();
-        let s2 = ImportRunner::new(&adapter).run(&mut store).await.unwrap();
+        let s1 = ImportRunner::new(&adapter).run(&store).await.unwrap();
+        let s2 = ImportRunner::new(&adapter).run(&store).await.unwrap();
         assert_eq!(s1, s2);
         // Two runs should not double the row count.
         let stats = store.stats().unwrap();
@@ -343,9 +343,9 @@ mod tests {
 
     #[tokio::test]
     async fn raw_payload_persisted_for_provenance() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let adapter = FakeAdapter::new(vec![pair("a", "alpha")]);
-        ImportRunner::new(&adapter).run(&mut store).await.unwrap();
+        ImportRunner::new(&adapter).run(&store).await.unwrap();
         let payload: String = store
             .conn()
             .query_row("SELECT payload_json FROM raw_artifacts LIMIT 1", [], |r| {
@@ -357,10 +357,10 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_jobs_enqueued_when_active_model_set() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.set_active_model("local:fake:1").unwrap();
         let adapter = FakeAdapter::new(vec![pair("a", "alpha"), pair("b", "beta")]);
-        ImportRunner::new(&adapter).run(&mut store).await.unwrap();
+        ImportRunner::new(&adapter).run(&store).await.unwrap();
         let pending: i64 = store
             .conn()
             .query_row(
@@ -374,9 +374,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_jobs_when_no_active_model() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let adapter = FakeAdapter::new(vec![pair("a", "alpha")]);
-        ImportRunner::new(&adapter).run(&mut store).await.unwrap();
+        ImportRunner::new(&adapter).run(&store).await.unwrap();
         let n: i64 = store
             .conn()
             .query_row("SELECT COUNT(1) FROM embedding_jobs", [], |r| r.get(0))
@@ -387,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn custom_chunker_takes_effect() {
         use anamnesis_core::chunker::{Chunker as Ck, ChunkerConfig};
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let long = "para one ".repeat(80) + "\n\n" + &"para two ".repeat(80);
         let adapter = FakeAdapter::new(vec![pair("a", &long)]);
         let tiny = Ck::new(ChunkerConfig {
@@ -396,7 +396,7 @@ mod tests {
         });
         let summary = ImportRunner::new(&adapter)
             .with_chunker(tiny)
-            .run(&mut store)
+            .run(&store)
             .await
             .unwrap();
         assert_eq!(summary.records_upserted, 1);

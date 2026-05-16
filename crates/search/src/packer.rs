@@ -208,7 +208,7 @@ mod tests {
     }
 
     fn seed_store_with(records: &[AnamnesisRecord]) -> Store {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         for r in records {
             let chunks = Chunker::default().chunk(&r.id, &r.content);
             store.upsert_record(r, &chunks, None).unwrap();

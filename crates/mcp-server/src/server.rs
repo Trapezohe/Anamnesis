@@ -16,8 +16,6 @@
 
 use std::path::PathBuf;
 
-use tokio::sync::Mutex;
-
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use anamnesis_adapter_codex::codex_adapter;
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
@@ -35,10 +33,11 @@ pub const SERVER_NAME: &str = "anamnesis";
 /// Spec version we target — clients should validate compatibility.
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Server state. The store is wrapped in a Mutex because some handler
-/// paths need `&mut Store` (claim_next_job, upsert_record).
+/// Server state. `Store` is `Send + Sync` (its connection sits behind an
+/// internal Mutex), so we can hold it directly and pass `&Store` to
+/// every handler without an extra wrapper.
 pub struct AnamnesisServer {
-    store: Mutex<Store>,
+    store: Store,
     provider: Option<Box<dyn EmbeddingProvider>>,
     /// Data directory — handlers like trace_provenance and import_source
     /// need it to resolve relative paths.
@@ -55,7 +54,7 @@ impl AnamnesisServer {
         data_dir: PathBuf,
     ) -> Self {
         Self {
-            store: Mutex::new(store),
+            store,
             provider,
             data_dir,
             home_override: None,
@@ -201,7 +200,7 @@ impl AnamnesisServer {
             _ => SearchMode::Hybrid,
         };
 
-        let store = self.store.lock().await;
+        let store = &self.store;
         let opts = HybridOpts {
             limit,
             candidate_pool: (limit * 4).max(limit),
@@ -209,16 +208,16 @@ impl AnamnesisServer {
         };
         let hits = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
-                .search(&store, query, &opts)
+                .search(store, query, &opts)
                 .await
                 .map_err(|e| format!("search: {e}"))?,
             None => HybridSearcher::<NoProvider>::fulltext_only()
-                .search(&store, query, &opts.fulltext_fallback())
+                .search(store, query, &opts.fulltext_fallback())
                 .await
                 .map_err(|e| format!("search: {e}"))?,
         };
         let packed = pack(
-            &store,
+            store,
             &hits,
             &ContextBudget {
                 max_records: limit as usize,
@@ -253,7 +252,7 @@ impl AnamnesisServer {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "get_record.id is required".to_string())?;
-        let store = self.store.lock().await;
+        let store = &self.store;
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?;
@@ -264,7 +263,7 @@ impl AnamnesisServer {
     }
 
     async fn tool_list_sources(&self) -> Result<Value, String> {
-        let store = self.store.lock().await;
+        let store = &self.store;
         let stats = store.stats().map_err(|e| format!("stats: {e}"))?;
         let rows = store.list_sources().map_err(|e| format!("list: {e}"))?;
         Ok(json!({
@@ -299,9 +298,9 @@ impl AnamnesisServer {
                     projects_root,
                     instance: instance.map(str::to_owned),
                 });
-                let mut store = self.store.lock().await;
+                let store = &self.store;
                 let summary = ImportRunner::new(&adapter)
-                    .run(&mut store)
+                    .run(store)
                     .await
                     .map_err(|e| format!("import: {e}"))?;
                 Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
@@ -310,9 +309,9 @@ impl AnamnesisServer {
                 let db_path =
                     path_override.unwrap_or_else(|| self.home().join(".mem0").join("db.sqlite"));
                 let adapter = mem0_sqlite_adapter(db_path, instance);
-                let mut store = self.store.lock().await;
+                let store = &self.store;
                 let summary = ImportRunner::new(&adapter)
-                    .run(&mut store)
+                    .run(store)
                     .await
                     .map_err(|e| format!("import: {e}"))?;
                 Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
@@ -320,9 +319,9 @@ impl AnamnesisServer {
             anamnesis_adapter_codex::ADAPTER_ID => {
                 let root = path_override.unwrap_or_else(|| self.home().join(".codex"));
                 let adapter = codex_adapter(root, instance);
-                let mut store = self.store.lock().await;
+                let store = &self.store;
                 let summary = ImportRunner::new(&adapter)
-                    .run(&mut store)
+                    .run(store)
                     .await
                     .map_err(|e| format!("import: {e}"))?;
                 Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
@@ -336,7 +335,7 @@ impl AnamnesisServer {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "trace_provenance.id is required".to_string())?;
-        let store = self.store.lock().await;
+        let store = &self.store;
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?
@@ -364,7 +363,7 @@ impl AnamnesisServer {
             .and_then(|v| v.as_u64())
             .map(|n| n as i64)
             .unwrap_or(20);
-        let store = self.store.lock().await;
+        let store = &self.store;
         let conn = store.conn();
         let mut stmt = conn
             .prepare(
@@ -427,7 +426,7 @@ impl AnamnesisServer {
             .map(|n| n as u32)
             .unwrap_or(5);
 
-        let store = self.store.lock().await;
+        let store = &self.store;
         let opts = HybridOpts {
             limit,
             candidate_pool: (limit * 4).max(limit),
@@ -435,16 +434,16 @@ impl AnamnesisServer {
         };
         let hits = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
-                .search(&store, text, &opts)
+                .search(store, text, &opts)
                 .await
                 .map_err(|e| format!("search: {e}"))?,
             None => HybridSearcher::<NoProvider>::fulltext_only()
-                .search(&store, text, &opts.fulltext_fallback())
+                .search(store, text, &opts.fulltext_fallback())
                 .await
                 .map_err(|e| format!("search: {e}"))?,
         };
         let packed = pack(
-            &store,
+            store,
             &hits,
             &ContextBudget {
                 max_records: limit as usize,
@@ -539,7 +538,7 @@ impl AnamnesisServer {
     }
 
     async fn read_record_resource(&self, id: &str) -> Result<Value, String> {
-        let store = self.store.lock().await;
+        let store = &self.store;
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?
@@ -552,7 +551,7 @@ impl AnamnesisServer {
             Some((a, i)) => (a, Some(i)),
             None => (spec, None),
         };
-        let store = self.store.lock().await;
+        let store = &self.store;
         let rows = store.list_sources().map_err(|e| format!("list: {e}"))?;
         let matching: Vec<_> = rows
             .into_iter()
@@ -604,7 +603,7 @@ impl AnamnesisServer {
             .map_err(|e| format!("invalid date {date}: {e}"))?;
         let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         let end = start + 24 * 3600;
-        let store = self.store.lock().await;
+        let store = &self.store;
         let conn = store.conn();
         let mut stmt = conn
             .prepare(
@@ -800,7 +799,7 @@ mod tests {
     }
 
     fn server_with_records(records: &[AnamnesisRecord]) -> AnamnesisServer {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         for r in records {
             let chunks = Chunker::default().chunk(&r.id, &r.content);
             store.upsert_record(r, &chunks, None).unwrap();

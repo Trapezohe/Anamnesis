@@ -600,9 +600,9 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
         return Ok(());
     }
 
-    let mut store = Store::open(db_path(data_dir))?;
+    let store = Store::open(db_path(data_dir))?;
     let descriptor = adapter.descriptor();
-    let summary = ImportRunner::new(adapter).run(&mut store).await?;
+    let summary = ImportRunner::new(adapter).run(&store).await?;
     println!(
         "import done: {} raw, {} upserted, {} chunks, {} errors",
         summary.raw_seen, summary.records_upserted, summary.chunks_written, summary.errors
@@ -621,7 +621,7 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     ));
 
     if !no_embed {
-        run_embed_worker(&mut store).await?;
+        run_embed_worker(&store).await?;
     }
     Ok(())
 }
@@ -1043,7 +1043,7 @@ fn parse_model_key(model_id: &str) -> Result<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "local-fastembed")]
-async fn run_embed_worker(store: &mut Store) -> Result<()> {
+async fn run_embed_worker(store: &Store) -> Result<()> {
     let Some(active) = store.active_model()? else {
         return Ok(());
     };
@@ -1068,7 +1068,7 @@ async fn run_embed_worker(store: &mut Store) -> Result<()> {
 }
 
 #[cfg(not(feature = "local-fastembed"))]
-async fn run_embed_worker(_store: &mut Store) -> Result<()> {
+async fn run_embed_worker(_store: &Store) -> Result<()> {
     println!("local-fastembed feature disabled; skipping embedding worker");
     Ok(())
 }
@@ -1125,8 +1125,8 @@ async fn cmd_model(data_dir: &std::path::Path, sub: ModelCmd) -> Result<()> {
             let n = store.rebuild_embedding_jobs(&new_id)?;
             println!("active model now: {new_id} ({n} chunks re-queued)");
             if !no_embed && n > 0 {
-                let mut store = Store::open(db_path(data_dir))?;
-                run_embed_worker(&mut store).await?;
+                let store = Store::open(db_path(data_dir))?;
+                run_embed_worker(&store).await?;
             }
             Ok(())
         }
@@ -1151,8 +1151,8 @@ async fn cmd_model(data_dir: &std::path::Path, sub: ModelCmd) -> Result<()> {
             let n = store.rebuild_embedding_jobs(&active)?;
             println!("re-queued {n} chunks under {active}");
             if !no_embed && n > 0 {
-                let mut store = Store::open(db_path(data_dir))?;
-                run_embed_worker(&mut store).await?;
+                let store = Store::open(db_path(data_dir))?;
+                run_embed_worker(&store).await?;
             }
             Ok(())
         }

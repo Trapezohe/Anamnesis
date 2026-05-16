@@ -361,7 +361,7 @@ mod tests {
         }
     }
 
-    async fn seed_with_embeddings(store: &mut Store, provider: &ToyProvider) {
+    async fn seed_with_embeddings(store: &Store, provider: &ToyProvider) {
         store.set_active_model(&provider.model_id().0).unwrap();
         for (id, content) in [
             ("a", "alpha bright morning"),
@@ -386,9 +386,9 @@ mod tests {
 
     #[tokio::test]
     async fn fulltext_only_returns_fts_hits() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = ToyProvider::new();
-        seed_with_embeddings(&mut store, &provider).await;
+        seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::<ToyProvider>::fulltext_only();
         let opts = HybridOpts::fulltext_only(10);
         let hits = searcher.search(&store, "alpha", &opts).await.unwrap();
@@ -399,9 +399,9 @@ mod tests {
 
     #[tokio::test]
     async fn vector_only_returns_vec_hits() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = ToyProvider::new();
-        seed_with_embeddings(&mut store, &provider).await;
+        seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::new(&provider);
         let opts = HybridOpts {
             mode: SearchMode::Vector,
@@ -420,9 +420,9 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_combines_both_modalities() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = ToyProvider::new();
-        seed_with_embeddings(&mut store, &provider).await;
+        seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::new(&provider);
         let opts = HybridOpts::default();
         let hits = searcher
@@ -439,9 +439,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_query_returns_no_hits_in_fulltext() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = ToyProvider::new();
-        seed_with_embeddings(&mut store, &provider).await;
+        seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::new(&provider);
         let opts = HybridOpts::fulltext_only(10);
         // FTS5 MATCH with an empty query is invalid; the search call should
@@ -452,9 +452,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_provider_forces_fulltext_mode() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = ToyProvider::new();
-        seed_with_embeddings(&mut store, &provider).await;
+        seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::<ToyProvider>::fulltext_only();
         // Caller asked for Hybrid but no provider → effective Fulltext.
         let opts = HybridOpts {
@@ -467,9 +467,9 @@ mod tests {
 
     #[tokio::test]
     async fn limit_caps_results() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = ToyProvider::new();
-        seed_with_embeddings(&mut store, &provider).await;
+        seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::new(&provider);
         let opts = HybridOpts {
             limit: 1,

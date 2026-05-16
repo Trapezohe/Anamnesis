@@ -43,7 +43,7 @@ impl<'a, P: EmbeddingProvider> EmbeddingWorker<'a, P> {
     ///   - `Some(true)`  job claimed and completed
     ///   - `Some(false)` job claimed but embedding failed (marked failed)
     ///   - `None`        queue was empty for this model
-    pub async fn run_once(&self, store: &mut Store) -> Result<Option<bool>> {
+    pub async fn run_once(&self, store: &Store) -> Result<Option<bool>> {
         let model_id = self.provider.model_id().0;
         let job = match store.claim_next_job(&model_id).map_err(s2c)? {
             Some(j) => j,
@@ -83,7 +83,7 @@ impl<'a, P: EmbeddingProvider> EmbeddingWorker<'a, P> {
     }
 
     /// Run until the queue for this model is empty. Returns aggregate counts.
-    pub async fn drain(&self, store: &mut Store) -> Result<DrainSummary> {
+    pub async fn drain(&self, store: &Store) -> Result<DrainSummary> {
         let mut summary = DrainSummary {
             model_id: self.provider.model_id().0,
             processed: 0,
@@ -204,7 +204,7 @@ mod tests {
         }
     }
 
-    fn seed(store: &mut Store, model_id: &str, records: &[(&str, &str)]) {
+    fn seed(store: &Store, model_id: &str, records: &[(&str, &str)]) {
         store.set_active_model(model_id).unwrap();
         for (id, content) in records {
             let r = record("a", id, content);
@@ -215,16 +215,16 @@ mod tests {
 
     #[tokio::test]
     async fn drain_processes_all_pending_jobs() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::new("fake", 4);
         seed(
-            &mut store,
+            &store,
             &provider.model_id().0,
             &[("a", "alpha"), ("b", "beta")],
         );
 
         let worker = EmbeddingWorker::new(&provider);
-        let summary = worker.drain(&mut store).await.unwrap();
+        let summary = worker.drain(&store).await.unwrap();
 
         assert_eq!(summary.model_id, provider.model_id().0);
         assert_eq!(summary.processed, 2);
@@ -249,16 +249,16 @@ mod tests {
 
     #[tokio::test]
     async fn drain_only_touches_matching_model() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider_a = FakeProvider::new("model-a", 4);
         let provider_b = FakeProvider::new("model-b", 4);
-        seed(&mut store, &provider_a.model_id().0, &[("x", "x")]);
+        seed(&store, &provider_a.model_id().0, &[("x", "x")]);
         store
             .rebuild_embedding_jobs(&provider_b.model_id().0)
             .unwrap();
 
         let summary = EmbeddingWorker::new(&provider_a)
-            .drain(&mut store)
+            .drain(&store)
             .await
             .unwrap();
         assert_eq!(summary.processed, 1);
@@ -275,16 +275,16 @@ mod tests {
 
     #[tokio::test]
     async fn provider_errors_mark_jobs_failed() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::failing("fake", 4);
         seed(
-            &mut store,
+            &store,
             &provider.model_id().0,
             &[("a", "alpha"), ("b", "beta")],
         );
 
         let summary = EmbeddingWorker::new(&provider)
-            .drain(&mut store)
+            .drain(&store)
             .await
             .unwrap();
         assert_eq!(summary.processed, 0);
@@ -303,11 +303,11 @@ mod tests {
 
     #[tokio::test]
     async fn dim_mismatch_marks_failed_not_completed() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::wrong_dim("fake", 4);
-        seed(&mut store, &provider.model_id().0, &[("a", "alpha")]);
+        seed(&store, &provider.model_id().0, &[("a", "alpha")]);
         let summary = EmbeddingWorker::new(&provider)
-            .drain(&mut store)
+            .drain(&store)
             .await
             .unwrap();
         assert_eq!(summary.failed, 1);
@@ -316,10 +316,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_queue_is_no_op() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::new("fake", 4);
         let summary = EmbeddingWorker::new(&provider)
-            .drain(&mut store)
+            .drain(&store)
             .await
             .unwrap();
         assert_eq!(summary.processed, 0);
@@ -328,10 +328,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_returns_none_when_empty() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::new("fake", 4);
         assert!(EmbeddingWorker::new(&provider)
-            .run_once(&mut store)
+            .run_once(&store)
             .await
             .unwrap()
             .is_none());
@@ -339,15 +339,15 @@ mod tests {
 
     #[tokio::test]
     async fn completed_embeddings_are_searchable_via_vec() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let provider = FakeProvider::new("fake", 4);
         seed(
-            &mut store,
+            &store,
             &provider.model_id().0,
             &[("a", "alpha"), ("b", "beta")],
         );
         EmbeddingWorker::new(&provider)
-            .drain(&mut store)
+            .drain(&store)
             .await
             .unwrap();
         // Query with same vector that "alpha" produced — it must be the

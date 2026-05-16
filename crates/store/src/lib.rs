@@ -42,9 +42,13 @@ pub enum StoreError {
 /// Crate result.
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Anamnesis storage handle. Owns a single SQLite connection.
+/// Anamnesis storage handle. The underlying SQLite connection is wrapped
+/// in a `parking_lot::Mutex` so the type is `Send + Sync` and can be
+/// shared across async tasks (the MCP server holds an `Arc<Store>`).
+/// All methods take `&self`; the mutex enforces serialised access to the
+/// connection.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: parking_lot::Mutex<Connection>,
 }
 
 impl Store {
@@ -54,7 +58,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let mut store = Self { conn };
+        let store = Self {
+            conn: parking_lot::Mutex::new(conn),
+        };
         store.run_migrations()?;
         Ok(store)
     }
@@ -62,14 +68,17 @@ impl Store {
     /// Open an in-memory store (useful for tests).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let mut store = Self { conn };
+        let store = Self {
+            conn: parking_lot::Mutex::new(conn),
+        };
         store.run_migrations()?;
         Ok(store)
     }
 
-    fn run_migrations(&mut self) -> Result<()> {
+    fn run_migrations(&self) -> Result<()> {
+        let mut conn = self.conn.lock();
         // Tiny home-grown runner: keep applied migration ids in a meta table.
-        self.conn.execute_batch(
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _migrations (
                 id    TEXT PRIMARY KEY,
                 applied_at INTEGER NOT NULL
@@ -77,13 +86,13 @@ impl Store {
         )?;
 
         for (id, sql) in MIGRATIONS {
-            let already: i64 = self.conn.query_row(
+            let already: i64 = conn.query_row(
                 "SELECT COUNT(1) FROM _migrations WHERE id = ?1",
                 [id],
                 |r| r.get(0),
             )?;
             if already == 0 {
-                let tx = self.conn.transaction()?;
+                let tx = conn.transaction()?;
                 tx.execute_batch(sql)?;
                 tx.execute(
                     "INSERT INTO _migrations(id, applied_at) VALUES (?1, strftime('%s','now'))",
@@ -96,9 +105,11 @@ impl Store {
         Ok(())
     }
 
-    /// Borrow the inner connection. Internal use; expect a richer API in Phase 1.
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    /// Borrow the inner connection. Intended for tests and ad-hoc reads;
+    /// production code should call the typed methods in `api`. The
+    /// returned guard holds the mutex — drop it before any `.await`.
+    pub fn conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 }
 

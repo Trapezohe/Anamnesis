@@ -1,8 +1,4 @@
-//! Anamnesis MCP server binary — stdio mode.
-//!
-//! Thin shell around `anamnesis_mcp_server::stdio::run`. The actual loop
-//! and server logic live in the library so `anamnesis serve` and any
-//! other harness can reuse them.
+//! Anamnesis MCP server binary — stdio + (optional) HTTP transports.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +7,7 @@ use std::path::PathBuf;
 use anamnesis_mcp_server::AnamnesisServer;
 use anamnesis_store::Store;
 use anyhow::{Context, Result};
+use clap::Parser;
 
 fn resolve_data_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("ANAMNESIS_DATA_DIR") {
@@ -63,6 +60,23 @@ fn try_open_provider(
     None
 }
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "anamnesis-mcp",
+    version,
+    about = "Anamnesis MCP server (stdio default, --sse for HTTP)"
+)]
+struct Cli {
+    /// Bind an HTTP transport on the given TCP port (loopback only).
+    /// Requires the `sse` cargo feature (on by default).
+    #[arg(long)]
+    sse: Option<u16>,
+    /// Pre-shared bearer token for HTTP mode. If omitted a fresh 64-byte
+    /// token is generated and printed to stderr on startup.
+    #[arg(long, env = "ANAMNESIS_MCP_TOKEN")]
+    token: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -73,19 +87,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let cli = Cli::parse();
     let data_dir = resolve_data_dir()?;
     let db_path = data_dir.join("anamnesis.sqlite");
     let store = Store::open(&db_path).with_context(|| format!("open {}", db_path.display()))?;
     let active_model = store.active_model().ok().flatten();
     let provider = try_open_provider(&data_dir, active_model.as_deref());
-
     let server = AnamnesisServer::new(store, provider, data_dir.clone());
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        data_dir = %data_dir.display(),
-        active_model = active_model.as_deref().unwrap_or("<unset>"),
-        "anamnesis-mcp stdio server ready",
-    );
 
-    anamnesis_mcp_server::stdio::run(server).await
+    if let Some(port) = cli.sse {
+        run_http(server, port, cli.token).await
+    } else {
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            data_dir = %data_dir.display(),
+            active_model = active_model.as_deref().unwrap_or("<unset>"),
+            "anamnesis-mcp stdio server ready",
+        );
+        anamnesis_mcp_server::stdio::run(server).await
+    }
+}
+
+#[cfg(feature = "sse")]
+async fn run_http(server: AnamnesisServer, port: u16, token: Option<String>) -> Result<()> {
+    let config = anamnesis_mcp_server::sse::HttpServerConfig { port, token };
+    anamnesis_mcp_server::sse::run(server, config).await
+}
+
+#[cfg(not(feature = "sse"))]
+async fn run_http(_server: AnamnesisServer, _port: u16, _token: Option<String>) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "this anamnesis-mcp build lacks the `sse` feature; rebuild with `--features sse`"
+    ))
 }
