@@ -20,8 +20,14 @@ pub mod worker;
 #[cfg(feature = "local-fastembed")]
 pub mod local;
 
+#[cfg(feature = "cloud-voyage")]
+pub mod voyage;
+
 #[cfg(feature = "local-fastembed")]
 pub use local::LocalFastembedProvider;
+
+#[cfg(feature = "cloud-voyage")]
+pub use voyage::VoyageProvider;
 
 pub use anamnesis_core::embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
 pub use registry::{available, by_key, default_model, local_only, CuratedModel, REGISTRY};
