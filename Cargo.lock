@@ -70,10 +70,13 @@ version = "0.0.1"
 dependencies = [
  "anamnesis-core",
  "async-trait",
+ "blake3",
  "chrono",
  "futures",
+ "rusqlite",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
