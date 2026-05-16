@@ -86,6 +86,8 @@ impl AnamnesisServer {
             "tools/call" => self.handle_tools_call(id, req.params).await,
             "resources/list" => JsonRpcResponse::ok(id, resources_list_payload()),
             "resources/read" => self.handle_resources_read(id, req.params).await,
+            "prompts/list" => JsonRpcResponse::ok(id, prompts_list_payload()),
+            "prompts/get" => self.handle_prompts_get(id, req.params).await,
             other => JsonRpcResponse::err(id, -32601, format!("method not found: {other}")),
         }
     }
@@ -100,6 +102,7 @@ impl AnamnesisServer {
             "capabilities": {
                 "tools": {},
                 "resources": {},
+                "prompts": {},
             },
         })
     }
@@ -126,6 +129,23 @@ impl AnamnesisServer {
                     "structuredContent": payload,
                 }),
             ),
+            Err(msg) => JsonRpcResponse::err(id, -32603, msg),
+        }
+    }
+
+    async fn handle_prompts_get(&self, id: Value, params: Value) -> JsonRpcResponse {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => return JsonRpcResponse::err(id, -32602, "missing prompts/get.name"),
+        };
+        let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+        let result = match name.as_str() {
+            "summarize_my_preferences" => self.prompt_summarize_preferences(args).await,
+            "find_related" => self.prompt_find_related(args).await,
+            other => return JsonRpcResponse::err(id, -32602, format!("unknown prompt: {other}")),
+        };
+        match result {
+            Ok(payload) => JsonRpcResponse::ok(id, payload),
             Err(msg) => JsonRpcResponse::err(id, -32603, msg),
         }
     }
@@ -320,6 +340,171 @@ impl AnamnesisServer {
             "raw_hash": rec.provenance.raw_hash,
         }))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Prompt implementations (BLUEPRINT §6.3 — convenience prompts)
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl AnamnesisServer {
+    async fn prompt_summarize_preferences(&self, args: Value) -> Result<Value, String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as i64)
+            .unwrap_or(20);
+        let store = self.store.lock().await;
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, kind, native_path, created_at FROM records \
+                 WHERE scope = 'user' ORDER BY created_at DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("prepare: {e}"))?;
+        let rows: Vec<(String, String, String, Option<String>, i64)> = stmt
+            .query_map([limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| format!("query: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut bullets = String::new();
+        for (id, content, kind, path, _) in &rows {
+            bullets.push_str(&format!(
+                "- [{kind}] {content_short}  (id={id_short}, source={src})\n",
+                content_short = trim_for_prompt(content, 240),
+                id_short = &id[..id.len().min(12)],
+                src = path.as_deref().unwrap_or("?"),
+            ));
+        }
+        if bullets.is_empty() {
+            bullets.push_str("(no user-scope records yet)\n");
+        }
+
+        let user_text = format!(
+            "Below are the user's stable preferences and personal facts that we have on file. \
+             Summarize them into 5–8 concise bullet points capturing what an AI assistant \
+             should consistently keep in mind when collaborating with this user. Group related \
+             items, preserve any explicit dos/don'ts, and surface contradictions if any.\n\n\
+             ---\n{bullets}",
+        );
+
+        Ok(json!({
+            "description": "Summarize the user's stable preferences from Anamnesis records.",
+            "messages": [{
+                "role": "user",
+                "content": {"type": "text", "text": user_text}
+            }]
+        }))
+    }
+
+    async fn prompt_find_related(&self, args: Value) -> Result<Value, String> {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "find_related.text is required".to_string())?;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(5);
+
+        let store = self.store.lock().await;
+        let opts = HybridOpts {
+            limit,
+            candidate_pool: (limit * 4).max(limit),
+            mode: SearchMode::Hybrid,
+        };
+        let hits = match self.provider.as_ref() {
+            Some(p) => HybridSearcher::new(p.as_ref())
+                .search(&store, text, &opts)
+                .await
+                .map_err(|e| format!("search: {e}"))?,
+            None => HybridSearcher::<NoProvider>::fulltext_only()
+                .search(&store, text, &opts.fulltext_fallback())
+                .await
+                .map_err(|e| format!("search: {e}"))?,
+        };
+        let packed = pack(
+            &store,
+            &hits,
+            &ContextBudget {
+                max_records: limit as usize,
+                ..ContextBudget::default()
+            },
+        )
+        .map_err(|e| format!("pack: {e}"))?;
+
+        let mut bullets = String::new();
+        for p in &packed {
+            let snippet = p
+                .matched_chunks
+                .first()
+                .map(|c| trim_for_prompt(&c.content, 240))
+                .unwrap_or_default();
+            bullets.push_str(&format!(
+                "- [{adapter}] {snippet}  (score={score:.3})\n",
+                adapter = p.record.source.adapter,
+                score = p.score,
+            ));
+        }
+        if bullets.is_empty() {
+            bullets.push_str("(no related memories found)\n");
+        }
+
+        let user_text = format!(
+            "The user is currently working on / discussing the following:\n\n{text}\n\n\
+             Here are the most relevant memories Anamnesis has on file. Cite them when they \
+             contradict or reinforce what the user is asking. Don't repeat verbatim; weave them \
+             into your reply where useful.\n\n---\n{bullets}",
+        );
+        Ok(json!({
+            "description": "Inject the top-N related Anamnesis memories into the LLM's context.",
+            "messages": [{
+                "role": "user",
+                "content": {"type": "text", "text": user_text}
+            }]
+        }))
+    }
+}
+
+fn trim_for_prompt(s: &str, max_chars: usize) -> String {
+    let collapsed: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if collapsed.chars().count() > max_chars {
+        let cut: String = collapsed.chars().take(max_chars).collect();
+        format!("{cut}…")
+    } else {
+        collapsed
+    }
+}
+
+fn prompts_list_payload() -> Value {
+    json!({
+        "prompts": [
+            {
+                "name": "summarize_my_preferences",
+                "description": "Summarize the user's stable preferences from Anamnesis user-scope records.",
+                "arguments": [
+                    {"name": "limit", "description": "Max records to include (default 20)", "required": false}
+                ]
+            },
+            {
+                "name": "find_related",
+                "description": "Inject the top-N Anamnesis memories related to a free-text description.",
+                "arguments": [
+                    {"name": "text", "description": "What the user is working on or asking about", "required": true},
+                    {"name": "limit", "description": "Max related memories to include (default 5)", "required": false}
+                ]
+            }
+        ]
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -813,6 +998,90 @@ mod tests {
         // Two records fall in the same UTC day; the third belongs to
         // another day.
         assert_eq!(parsed["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn prompts_list_includes_both_prompts() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("prompts/list", Value::Null)).await;
+        let payload = resp.result.unwrap();
+        let names: Vec<&str> = payload["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"summarize_my_preferences"));
+        assert!(names.contains(&"find_related"));
+    }
+
+    #[tokio::test]
+    async fn prompt_summarize_preferences_renders_user_scope_records() {
+        let r1 = make_record(
+            "claude-code",
+            "p1",
+            "User prefers thorough error handling",
+            1700000000,
+        );
+        let r2 = make_record(
+            "mem0",
+            "p2",
+            "User likes integration tests against real DB",
+            1700001000,
+        );
+        let s = server_with_records(&[r1, r2]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "summarize_my_preferences", "arguments": {"limit": 10}}),
+            ))
+            .await;
+        let result = resp.result.unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("Summarize"));
+        assert!(text.contains("thorough error handling"));
+        assert!(text.contains("real DB"));
+    }
+
+    #[tokio::test]
+    async fn prompt_find_related_returns_top_n_with_text_arg() {
+        let r = make_record("claude-code", "x", "alpha bright morning", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "find_related", "arguments": {"text": "alpha", "limit": 3}}),
+            ))
+            .await;
+        let result = resp.result.unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("most relevant memories"));
+        assert!(text.contains("alpha bright morning"));
+    }
+
+    #[tokio::test]
+    async fn prompt_find_related_requires_text_arg() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "find_related", "arguments": {}}),
+            ))
+            .await;
+        assert!(resp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_prompt_errors() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "nonsense", "arguments": {}}),
+            ))
+            .await;
+        assert!(resp.error.is_some());
     }
 
     #[tokio::test]
