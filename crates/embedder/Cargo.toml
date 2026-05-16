@@ -1,0 +1,16 @@
+[package]
+name = "anamnesis-embedder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Embedding providers (local + cloud) for Anamnesis. Local default: fastembed-rs."
+
+[dependencies]
+anamnesis-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

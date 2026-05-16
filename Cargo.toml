@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/store",
+    "crates/embedder",
     "crates/cli",
     "crates/mcp-server",
     "crates/adapter-claude-code",
@@ -23,6 +24,7 @@ readme = "README.md"
 # Internal crates
 anamnesis-core = { path = "crates/core", version = "0.0.1" }
 anamnesis-store = { path = "crates/store", version = "0.0.1" }
+anamnesis-embedder = { path = "crates/embedder", version = "0.0.1" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

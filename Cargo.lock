@@ -79,6 +79,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-embedder"
+version = "0.0.1"
+dependencies = [
+ "anamnesis-core",
+ "async-trait",
+ "serde",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-mcp-server"
 version = "0.0.1"
 dependencies = [
