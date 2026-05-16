@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod chunk;
+pub mod chunker;
 pub mod discovery;
 pub mod embedding;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod query;
 
 pub use adapter::{HealthStatus, MemoryAdapter, RawDelta, RawRecord, ScanOpts, WatchOpts};
 pub use chunk::{Chunk, ContentHash};
+pub use chunker::{estimate_tokens, Chunker, ChunkerConfig};
 pub use discovery::{Confidence, DetectedSource};
 pub use embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
 pub use error::{Error, Result};
