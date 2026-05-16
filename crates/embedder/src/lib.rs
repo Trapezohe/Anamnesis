@@ -15,6 +15,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub use anamnesis_core::embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
+
 /// Crate version, exposed for diagnostics and `anamnesis status` output.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 

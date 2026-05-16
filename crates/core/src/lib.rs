@@ -7,11 +7,13 @@
 #![warn(missing_docs)]
 
 pub mod adapter;
+pub mod embedding;
 pub mod error;
 pub mod model;
 pub mod query;
 
 pub use adapter::{HealthStatus, MemoryAdapter, RawDelta, RawRecord, ScanOpts, WatchOpts};
+pub use embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
 pub use error::{Error, Result};
 pub use model::{
     AnamnesisRecord, Embedding, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
