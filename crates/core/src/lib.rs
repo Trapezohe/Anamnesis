@@ -18,7 +18,7 @@ pub mod query;
 pub use adapter::{HealthStatus, MemoryAdapter, RawDelta, RawRecord, ScanOpts, WatchOpts};
 pub use chunk::{Chunk, ContentHash};
 pub use chunker::{estimate_tokens, Chunker, ChunkerConfig};
-pub use discovery::{Confidence, DetectedSource};
+pub use discovery::{Confidence, DetectOpts, DetectedSource, Discovery, SourceDetector};
 pub use embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
 pub use error::{Error, Result};
 pub use model::{
