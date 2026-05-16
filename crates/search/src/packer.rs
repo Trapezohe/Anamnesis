@@ -137,10 +137,9 @@ pub fn pack(
             let mut kept: Vec<RankedChunk> = Vec::new();
             for chunk in p.matched_chunks.drain(..) {
                 let cost = estimate_tokens(&chunk.content);
-                if kept.is_empty() {
-                    kept.push(chunk);
-                    used = used.saturating_add(cost);
-                } else if used.saturating_add(cost) <= max_tokens {
+                let first_chunk = kept.is_empty();
+                let fits = used.saturating_add(cost) <= max_tokens;
+                if first_chunk || fits {
                     kept.push(chunk);
                     used = used.saturating_add(cost);
                 } else {
@@ -227,7 +226,7 @@ mod tests {
     #[test]
     fn single_record_aggregates_multiple_chunks() {
         let r = rec("a", None, "x", "alpha alpha alpha");
-        let store = seed_store_with(&[r.clone()]);
+        let store = seed_store_with(std::slice::from_ref(&r));
         let hits = vec![
             hit(&r.id, 0, "alpha part one", 0.9),
             hit(&r.id, 1, "alpha part two", 0.5),
@@ -245,7 +244,7 @@ mod tests {
     #[test]
     fn record_score_is_max_of_chunk_scores() {
         let r = rec("a", None, "x", "x");
-        let store = seed_store_with(&[r.clone()]);
+        let store = seed_store_with(std::slice::from_ref(&r));
         let hits = vec![hit(&r.id, 0, "x", 0.3), hit(&r.id, 1, "y", 0.8)];
         let out = pack(&store, &hits, &ContextBudget::default()).unwrap();
         assert_eq!(out[0].score, 0.8);
@@ -270,7 +269,7 @@ mod tests {
     #[test]
     fn vanished_records_silently_skipped() {
         let r1 = rec("a", None, "1", "alpha");
-        let store = seed_store_with(&[r1.clone()]);
+        let store = seed_store_with(std::slice::from_ref(&r1));
         let missing_id = RecordId::from_parts("a", None, "gone");
         let hits = vec![
             hit(&r1.id, 0, "alpha", 0.9),
@@ -361,7 +360,7 @@ mod tests {
     #[test]
     fn provenance_preserved() {
         let r = rec("claude-code", Some("default"), "fbid", "fb");
-        let store = seed_store_with(&[r.clone()]);
+        let store = seed_store_with(std::slice::from_ref(&r));
         let hits = vec![hit(&r.id, 0, "fb", 0.9)];
         let out = pack(&store, &hits, &ContextBudget::default()).unwrap();
         let p = &out[0];
