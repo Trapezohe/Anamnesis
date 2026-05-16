@@ -16,6 +16,12 @@
 
 pub mod registry;
 
+#[cfg(feature = "local-fastembed")]
+pub mod local;
+
+#[cfg(feature = "local-fastembed")]
+pub use local::LocalFastembedProvider;
+
 pub use anamnesis_core::embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
 pub use registry::{available, by_key, default_model, local_only, CuratedModel, REGISTRY};
 
