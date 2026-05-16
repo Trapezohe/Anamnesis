@@ -328,6 +328,13 @@ async fn cmd_serve(data_dir: &std::path::Path, sse: Option<u16>) -> Result<()> {
         "anamnesis serve (stdio) — active model: {}",
         active_model.as_deref().unwrap_or("<unset>")
     );
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "serve.start",
+        serde_json::json!({
+            "transport": "stdio",
+            "active_model": active_model,
+        }),
+    ));
     anamnesis_mcp_server::stdio::run(server).await
 }
 
@@ -585,16 +592,33 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     }
 
     let mut store = Store::open(db_path(data_dir))?;
+    let descriptor = adapter.descriptor();
     let summary = ImportRunner::new(adapter).run(&mut store).await?;
     println!(
         "import done: {} raw, {} upserted, {} chunks, {} errors",
         summary.raw_seen, summary.records_upserted, summary.chunks_written, summary.errors
     );
 
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "import",
+        serde_json::json!({
+            "adapter": descriptor.adapter,
+            "instance": descriptor.instance,
+            "raw_seen": summary.raw_seen,
+            "records_upserted": summary.records_upserted,
+            "chunks_written": summary.chunks_written,
+            "errors": summary.errors,
+        }),
+    ));
+
     if !no_embed {
         run_embed_worker(&mut store).await?;
     }
     Ok(())
+}
+
+fn audit(data_dir: &std::path::Path) -> anamnesis_core::Audit {
+    anamnesis_core::Audit::new(data_dir)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -635,6 +659,15 @@ fn cmd_export(
         other => return Err(anyhow!("unsupported format: {other} (try jsonl or csv)")),
     }
     eprintln!("exported {} record(s)", ids.len());
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "export",
+        serde_json::json!({
+            "format": format,
+            "source": source,
+            "out": out.map(|p| p.display().to_string()),
+            "records": ids.len(),
+        }),
+    ));
     Ok(())
 }
 
@@ -854,6 +887,19 @@ async fn cmd_search(
         .filter(|p| kind_filter.is_none_or(|k| p.record.kind == k))
         .filter(|p| scope_filter.is_none_or(|s| p.record.scope == s))
         .collect();
+
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "search",
+        serde_json::json!({
+            "query": query,
+            "source": source,
+            "kind": kind,
+            "scope": scope,
+            "mode": mode_str,
+            "limit": limit,
+            "hits": filtered.len(),
+        }),
+    ));
 
     if json {
         let payload = serde_json::json!({

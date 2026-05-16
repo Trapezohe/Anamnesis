@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod adapter;
+pub mod audit;
 pub mod chunk;
 pub mod chunker;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod error;
 pub mod model;
 pub mod query;
 
+pub use audit::{Audit, AuditEntry};
 pub use config::{Config, ConfigError, EmbeddingConfig, ServerConfig, SourceEntry};
 
 pub use adapter::{HealthStatus, MemoryAdapter, RawDelta, RawRecord, ScanOpts, WatchOpts};

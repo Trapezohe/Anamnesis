@@ -493,6 +493,57 @@ fn cli_flag_beats_config_file_model() {
 }
 
 #[test]
+fn import_writes_audit_log_entry() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("mem0.sqlite");
+    let conn = Connection::open(&mem0_db).unwrap();
+    conn.execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL);")
+        .unwrap();
+    conn.execute("INSERT INTO memories VALUES('a','audited memory')", [])
+        .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "audited", "--mode", "fulltext"])
+        .assert()
+        .success();
+
+    let audit_log = dir.path().join("audit.log");
+    assert!(
+        audit_log.exists(),
+        "audit.log should exist after import + search"
+    );
+    let body = std::fs::read_to_string(&audit_log).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert!(!lines.is_empty());
+    let actions: Vec<String> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["action"].as_str().map(str::to_owned))
+        .collect();
+    assert!(actions.iter().any(|a| a == "import"));
+    assert!(actions.iter().any(|a| a == "search"));
+}
+
+#[test]
 fn search_with_empty_db_prints_no_results() {
     let dir = tmp_dir();
     cli()
