@@ -47,7 +47,6 @@ pub fn read_all(path: &Path) -> rusqlite::Result<Vec<Mem0Row>> {
     }
     let select = format!("SELECT {} FROM memories", cols.join(", "));
     let mut stmt = conn.prepare(&select)?;
-    let count = cols.len();
     let rows = stmt
         .query_map([], |r| {
             let mut row = Mem0Row {
@@ -61,8 +60,7 @@ pub fn read_all(path: &Path) -> rusqlite::Result<Vec<Mem0Row>> {
                 updated_at: None,
                 extra: serde_json::Map::new(),
             };
-            for i in 0..count {
-                let name = &cols[i];
+            for (i, name) in cols.iter().enumerate() {
                 match name.as_str() {
                     "id" => row.id = read_text(r, i)?,
                     "memory" => row.memory = read_text(r, i)?,
