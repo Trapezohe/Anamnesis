@@ -10,5 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod hybrid;
+pub mod packer;
 
 pub use hybrid::{HybridOpts, HybridSearcher, RankedChunk, SearchMode};
+pub use packer::{pack, ContextBudget, PackedRecord};
