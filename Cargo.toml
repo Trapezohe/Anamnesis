@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/store",
     "crates/embedder",
+    "crates/search",
     "crates/importer",
     "crates/cli",
     "crates/mcp-server",
@@ -26,6 +27,7 @@ readme = "README.md"
 anamnesis-core = { path = "crates/core", version = "0.0.1" }
 anamnesis-store = { path = "crates/store", version = "0.0.1" }
 anamnesis-embedder = { path = "crates/embedder", version = "0.0.1" }
+anamnesis-search = { path = "crates/search", version = "0.0.1" }
 anamnesis-importer = { path = "crates/importer", version = "0.0.1" }
 
 # Serialization

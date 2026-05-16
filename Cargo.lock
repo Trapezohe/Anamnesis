@@ -154,6 +154,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-search"
+version = "0.0.1"
+dependencies = [
+ "anamnesis-core",
+ "anamnesis-store",
+ "async-trait",
+ "chrono",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-store"
 version = "0.0.1"
 dependencies = [
