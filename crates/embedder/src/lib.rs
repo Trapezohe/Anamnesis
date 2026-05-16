@@ -15,6 +15,7 @@
 #![warn(missing_docs)]
 
 pub mod registry;
+pub mod worker;
 
 #[cfg(feature = "local-fastembed")]
 pub mod local;
@@ -24,6 +25,7 @@ pub use local::LocalFastembedProvider;
 
 pub use anamnesis_core::embedding::{EmbeddingProvider, EmbeddingTask, ModelId};
 pub use registry::{available, by_key, default_model, local_only, CuratedModel, REGISTRY};
+pub use worker::{DrainSummary, EmbeddingWorker};
 
 /// Crate version, exposed for diagnostics and `anamnesis status` output.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

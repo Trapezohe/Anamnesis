@@ -111,7 +111,10 @@ name = "anamnesis-embedder"
 version = "0.0.1"
 dependencies = [
  "anamnesis-core",
+ "anamnesis-store",
  "async-trait",
+ "blake3",
+ "chrono",
  "fastembed",
  "serde",
  "serde_json",

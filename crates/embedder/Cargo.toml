@@ -17,6 +17,7 @@ local-fastembed = ["dep:fastembed", "dep:tokio"]
 
 [dependencies]
 anamnesis-core = { workspace = true }
+anamnesis-store = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,3 +30,5 @@ tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }
