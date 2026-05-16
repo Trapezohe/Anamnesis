@@ -16,13 +16,25 @@ path = "src/main.rs"
 [dependencies]
 anamnesis-core = { workspace = true }
 anamnesis-store = { workspace = true }
+anamnesis-search = { workspace = true }
+anamnesis-embedder = { workspace = true, default-features = false }
+anamnesis-importer = { workspace = true }
+anamnesis-adapter-claude-code = { workspace = true }
+anamnesis-adapter-mem0 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
 
-# rmcp (official MCP Rust SDK) — pinned in Phase 1 when we implement the
-# tool/resource handlers. Phase 0 keeps this crate as a stub binary so the
-# workspace structure and CI are exercised end-to-end.
+[features]
+default = ["local-fastembed"]
+local-fastembed = ["anamnesis-embedder/local-fastembed"]
+
+[dev-dependencies]
+tempfile = "3"
+chrono = { workspace = true }

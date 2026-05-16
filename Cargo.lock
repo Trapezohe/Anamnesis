@@ -158,11 +158,20 @@ dependencies = [
 name = "anamnesis-mcp-server"
 version = "0.0.1"
 dependencies = [
+ "anamnesis-adapter-claude-code",
+ "anamnesis-adapter-mem0",
  "anamnesis-core",
+ "anamnesis-embedder",
+ "anamnesis-importer",
+ "anamnesis-search",
  "anamnesis-store",
  "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

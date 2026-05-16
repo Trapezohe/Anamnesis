@@ -86,13 +86,17 @@ pub struct RankedChunk {
 }
 
 /// The composer.
-pub struct HybridSearcher<'a, P: EmbeddingProvider> {
+///
+/// `P: ?Sized` lets callers pass either a concrete provider (`&MyProvider`)
+/// or a trait object (`&dyn EmbeddingProvider`) for cases like the MCP
+/// server where the provider is chosen at runtime behind a `Box<dyn …>`.
+pub struct HybridSearcher<'a, P: EmbeddingProvider + ?Sized> {
     /// Provider used for embedding the query in `Vector`/`Hybrid` modes.
     /// `None` forces `Fulltext` regardless of `HybridOpts::mode`.
     pub provider: Option<&'a P>,
 }
 
-impl<'a, P: EmbeddingProvider> HybridSearcher<'a, P> {
+impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
     /// Build a searcher that uses `provider` for the vector side.
     pub fn new(provider: &'a P) -> Self {
         Self {
