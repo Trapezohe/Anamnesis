@@ -15,7 +15,8 @@
 //!   anamnesis://timeline/{YYYY-MM-DD}
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+
+use tokio::sync::Mutex;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
@@ -111,10 +112,10 @@ impl AnamnesisServer {
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
         let result = match name.as_str() {
             "search_memories" => self.tool_search_memories(args).await,
-            "get_record" => self.tool_get_record(args),
-            "list_sources" => self.tool_list_sources(),
+            "get_record" => self.tool_get_record(args).await,
+            "list_sources" => self.tool_list_sources().await,
             "import_source" => self.tool_import_source(args).await,
-            "trace_provenance" => self.tool_trace_provenance(args),
+            "trace_provenance" => self.tool_trace_provenance(args).await,
             other => return JsonRpcResponse::err(id, -32602, format!("unknown tool: {other}")),
         };
         match result {
@@ -134,7 +135,7 @@ impl AnamnesisServer {
             Some(u) => u.to_string(),
             None => return JsonRpcResponse::err(id, -32602, "missing resources/read.uri"),
         };
-        match self.read_resource(&uri) {
+        match self.read_resource(&uri).await {
             Ok(payload) => JsonRpcResponse::ok(
                 id,
                 json!({
@@ -179,7 +180,7 @@ impl AnamnesisServer {
             _ => SearchMode::Hybrid,
         };
 
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+        let store = self.store.lock().await;
         let opts = HybridOpts {
             limit,
             candidate_pool: (limit * 4).max(limit),
@@ -226,12 +227,12 @@ impl AnamnesisServer {
         }))
     }
 
-    fn tool_get_record(&self, args: Value) -> Result<Value, String> {
+    async fn tool_get_record(&self, args: Value) -> Result<Value, String> {
         let id = args
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "get_record.id is required".to_string())?;
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+        let store = self.store.lock().await;
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?;
@@ -241,8 +242,8 @@ impl AnamnesisServer {
         }
     }
 
-    fn tool_list_sources(&self) -> Result<Value, String> {
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+    async fn tool_list_sources(&self) -> Result<Value, String> {
+        let store = self.store.lock().await;
         let stats = store.stats().map_err(|e| format!("stats: {e}"))?;
         let rows = store.list_sources().map_err(|e| format!("list: {e}"))?;
         Ok(json!({
@@ -277,7 +278,7 @@ impl AnamnesisServer {
                     projects_root,
                     instance: instance.map(str::to_owned),
                 });
-                let mut store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+                let mut store = self.store.lock().await;
                 let summary = ImportRunner::new(&adapter)
                     .run(&mut store)
                     .await
@@ -288,7 +289,7 @@ impl AnamnesisServer {
                 let db_path =
                     path_override.unwrap_or_else(|| self.home().join(".mem0").join("db.sqlite"));
                 let adapter = mem0_sqlite_adapter(db_path, instance);
-                let mut store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+                let mut store = self.store.lock().await;
                 let summary = ImportRunner::new(&adapter)
                     .run(&mut store)
                     .await
@@ -299,12 +300,12 @@ impl AnamnesisServer {
         }
     }
 
-    fn tool_trace_provenance(&self, args: Value) -> Result<Value, String> {
+    async fn tool_trace_provenance(&self, args: Value) -> Result<Value, String> {
         let id = args
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "trace_provenance.id is required".to_string())?;
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+        let store = self.store.lock().await;
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?
@@ -326,7 +327,7 @@ impl AnamnesisServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl AnamnesisServer {
-    fn read_resource(&self, uri: &str) -> Result<Value, String> {
+    async fn read_resource(&self, uri: &str) -> Result<Value, String> {
         let stripped = uri
             .strip_prefix("anamnesis://")
             .ok_or_else(|| format!("uri must start with anamnesis://: {uri}"))?;
@@ -334,15 +335,15 @@ impl AnamnesisServer {
             .split_once('/')
             .ok_or_else(|| format!("uri missing path: {uri}"))?;
         match kind {
-            "record" => self.read_record_resource(rest),
-            "source" => self.read_source_resource(rest),
-            "timeline" => self.read_timeline_resource(rest),
+            "record" => self.read_record_resource(rest).await,
+            "source" => self.read_source_resource(rest).await,
+            "timeline" => self.read_timeline_resource(rest).await,
             other => Err(format!("unknown resource kind: {other}")),
         }
     }
 
-    fn read_record_resource(&self, id: &str) -> Result<Value, String> {
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+    async fn read_record_resource(&self, id: &str) -> Result<Value, String> {
+        let store = self.store.lock().await;
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?
@@ -350,12 +351,12 @@ impl AnamnesisServer {
         serde_json::to_value(&rec).map_err(|e| format!("serialize: {e}"))
     }
 
-    fn read_source_resource(&self, spec: &str) -> Result<Value, String> {
+    async fn read_source_resource(&self, spec: &str) -> Result<Value, String> {
         let (adapter, instance) = match spec.split_once(':') {
             Some((a, i)) => (a, Some(i)),
             None => (spec, None),
         };
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+        let store = self.store.lock().await;
         let rows = store.list_sources().map_err(|e| format!("list: {e}"))?;
         let matching: Vec<_> = rows
             .into_iter()
@@ -400,14 +401,14 @@ impl AnamnesisServer {
         }))
     }
 
-    fn read_timeline_resource(&self, date: &str) -> Result<Value, String> {
+    async fn read_timeline_resource(&self, date: &str) -> Result<Value, String> {
         // Accept YYYY-MM-DD; return records whose created_at falls in that
         // UTC day.
         let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .map_err(|e| format!("invalid date {date}: {e}"))?;
         let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         let end = start + 24 * 3600;
-        let store = self.store.lock().map_err(|e| format!("store lock: {e}"))?;
+        let store = self.store.lock().await;
         let conn = store.conn();
         let mut stmt = conn
             .prepare(

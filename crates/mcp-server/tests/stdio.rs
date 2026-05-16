@@ -19,7 +19,7 @@ fn binary() -> PathBuf {
 
 fn seed_store(data_dir: &std::path::Path) {
     use anamnesis_store::Store;
-    let mut store = Store::open(data_dir.join("anamnesis.sqlite")).unwrap();
+    let store = Store::open(data_dir.join("anamnesis.sqlite")).unwrap();
     store
         .register_source("claude-code", None, Some("/tmp/x"), None)
         .unwrap();
