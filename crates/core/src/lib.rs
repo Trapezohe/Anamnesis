@@ -9,6 +9,7 @@
 pub mod adapter;
 pub mod chunk;
 pub mod chunker;
+pub mod contract;
 pub mod discovery;
 pub mod embedding;
 pub mod error;
