@@ -237,6 +237,12 @@ pub struct SourceWithCounts {
     pub chunk_count: u64,
 }
 
+/// Maximum `limit` accepted by `list_record_ids_paged` and the MCP
+/// `resources/list` handler. Sized so a single page fits comfortably
+/// in a JSON-RPC response (~ a few hundred KB at most). Round-21
+/// (§-1.5 PR-2).
+pub const MAX_LIST_LIMIT: u32 = 1000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source registry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,6 +680,64 @@ impl Store {
             .query_map(params![limit], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Paged listing of record ids for **complete migration**.
+    ///
+    /// Round-21 (§-1.5 PR-2): the original `list_recent_record_ids` is
+    /// a "what's recent" window; this is "give me everything, page by
+    /// page" so a downstream generic-mcp client can pull the entire
+    /// catalogue without dropping records past the 100-row cap.
+    ///
+    /// Ordering: lexicographic ascending by id. Record ids are
+    /// content-derived (blake3 of provenance triple), so the order is
+    /// stable across calls and across hosts — making cursor-based
+    /// pagination an opaque string the client just round-trips.
+    ///
+    /// Contract:
+    ///   * `cursor = None` → return the first `limit` ids.
+    ///   * `cursor = Some(last_id)` → return the next `limit` ids
+    ///     STRICTLY AFTER `last_id` in ascending order.
+    ///   * `limit` is clamped to `[1, MAX_LIST_LIMIT]`.
+    ///   * Returns `(ids, next_cursor)`. `next_cursor` is `Some(last)`
+    ///     when the page hit the limit (i.e. another page may exist),
+    ///     `None` when the page returned fewer than `limit` rows (= end
+    ///     of catalogue).
+    pub fn list_record_ids_paged(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        let conn = self.conn.lock();
+        // `stmt` must outlive the iterator from `query_map`; bind it
+        // explicitly in each branch to give the iterator a stable
+        // borrow for the duration of the `collect`.
+        let rows: Vec<String> = match cursor {
+            Some(c) => {
+                let mut stmt =
+                    conn.prepare("SELECT id FROM records WHERE id > ?1 ORDER BY id ASC LIMIT ?2")?;
+                let out = stmt
+                    .query_map(params![c, limit], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                out
+            }
+            None => {
+                let mut stmt = conn.prepare("SELECT id FROM records ORDER BY id ASC LIMIT ?1")?;
+                let out = stmt
+                    .query_map(params![limit], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                out
+            }
+        };
+        // `next_cursor` is the last row's id IFF we hit the limit —
+        // otherwise we're at the end and signal that to the caller.
+        let next = if rows.len() as u32 == limit {
+            rows.last().cloned()
+        } else {
+            None
+        };
+        Ok((rows, next))
     }
 
     /// Fetch a record by id.
@@ -2121,5 +2185,81 @@ mod tests {
         assert_eq!(model, "openai:text-embedding-3-small");
         assert_eq!(dim, 3);
         assert_eq!(blob_to_f32(&blob).unwrap(), vec![0.1, 0.2, 0.3]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Round-21 (§-1.5 PR-2): list_record_ids_paged cursor contract.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn seed_n_records(store: &Store, n: usize) {
+        for i in 0..n {
+            let r = make_record(
+                "claude-code",
+                &format!("seed-{i:04}"),
+                &format!("content {i}"),
+                Kind::Fact,
+            );
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn paged_listing_walks_through_full_catalogue_via_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        seed_n_records(&store, 25);
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            // Outer cap; we expect to terminate in ≤ 3 iterations.
+            let (page, next) = store.list_record_ids_paged(cursor.as_deref(), 10).unwrap();
+            // Pages are non-empty until we exit.
+            assert!(!page.is_empty(), "non-final page must have rows");
+            collected.extend(page);
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(
+            collected.len(),
+            25,
+            "pagination must yield every record exactly once"
+        );
+
+        // Lexicographic ascending order is the documented contract.
+        let mut sorted = collected.clone();
+        sorted.sort();
+        assert_eq!(collected, sorted);
+
+        // No duplicates.
+        let unique: std::collections::HashSet<&String> = collected.iter().collect();
+        assert_eq!(unique.len(), collected.len());
+    }
+
+    #[test]
+    fn paged_listing_signals_end_with_none_cursor() {
+        // When the page returns fewer than `limit` rows, `next_cursor`
+        // must be `None` — that's the "end of catalogue" signal.
+        let store = Store::open_in_memory().unwrap();
+        seed_n_records(&store, 3);
+        let (page, next) = store.list_record_ids_paged(None, 10).unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(next.is_none(), "page < limit must clear nextCursor");
+    }
+
+    #[test]
+    fn paged_listing_clamps_limit() {
+        // limit=0 must clamp to 1; limit>MAX must clamp to MAX. The
+        // store should never refuse a malformed limit — it should be
+        // permissive at the edge and let the caller see useful data.
+        let store = Store::open_in_memory().unwrap();
+        seed_n_records(&store, 5);
+        let (page, _) = store.list_record_ids_paged(None, 0).unwrap();
+        assert_eq!(page.len(), 1, "limit=0 must clamp to 1");
+        let (page, _) = store.list_record_ids_paged(None, u32::MAX).unwrap();
+        assert!(page.len() <= MAX_LIST_LIMIT as usize);
+        assert_eq!(page.len(), 5);
     }
 }

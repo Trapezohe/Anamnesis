@@ -143,7 +143,7 @@ impl AnamnesisServer {
             "ping" => JsonRpcResponse::ok(id, json!({})),
             "tools/list" => JsonRpcResponse::ok(id, self.tools_list_payload()),
             "tools/call" => self.handle_tools_call(id, req.params).await,
-            "resources/list" => JsonRpcResponse::ok(id, self.resources_list_payload()),
+            "resources/list" => self.handle_resources_list(id, req.params).await,
             "resources/read" => self.handle_resources_read(id, req.params).await,
             "prompts/list" => JsonRpcResponse::ok(id, prompts_list_payload()),
             "prompts/get" => self.handle_prompts_get(id, req.params).await,
@@ -1083,62 +1083,97 @@ fn tools_list_payload_all() -> Value {
 }
 
 impl AnamnesisServer {
-    /// Build the MCP `resources/list` payload.
+    /// MCP `resources/list` with cursor-based pagination (round-21,
+    /// §-1.5 PR-2).
     ///
-    /// Round-13: the previous static catalogue only emitted the three
-    /// template URIs (`anamnesis://record/{id}`, etc.). A consuming MCP
-    /// client — including the loopback case where Anamnesis itself is
-    /// the consumer via `generic-mcp` — has no way to resolve `{id}` and
-    /// the adapter correctly drops template URIs (see
-    /// `crates/adapter-generic-mcp/src/lib.rs::scan`). The result was
-    /// always zero records on the wire even though the upstream server
-    /// had data.
+    /// Wire shape (per MCP spec):
+    ///   * request: `{ "cursor"?: string }` (`limit` is non-standard
+    ///     but accepted; defaults to `RESOURCES_LIST_PAGE` and is
+    ///     clamped to `[1, MAX_LIST_LIMIT]`).
+    ///   * response: `{ "resources": [...], "resourceTemplates": [...],
+    ///     "nextCursor"?: string }`
     ///
-    /// Fix: emit concrete URIs for the `RESOURCES_LIST_RECENT_LIMIT`
-    /// most recent records under `resources`, and move the templates
-    /// into `resourceTemplates` (the MCP spec's dedicated slot for
-    /// URI templates with `{}` placeholders). Existing clients that
-    /// only read `resources` now see real records to fetch; new
-    /// clients that understand `resourceTemplates` keep their schema-
-    /// discovery story.
-    fn resources_list_payload(&self) -> Value {
-        let recent: Vec<String> = self
-            .store
-            .list_recent_record_ids(RESOURCES_LIST_RECENT_LIMIT)
-            .unwrap_or_default();
-        let mut resources: Vec<Value> = recent
+    /// Pagination ordering is lexicographic ascending by record id
+    /// (record id is content-derived → deterministic across hosts).
+    /// `nextCursor` is `Some(last_id)` when the page hit the limit and
+    /// another page MAY exist; otherwise `None`. The templates are
+    /// **only** emitted on the first page (`cursor == None`) so
+    /// downstream paginators see them once, not on every page.
+    ///
+    /// Store errors are propagated as JSON-RPC `-32603` (internal
+    /// error) — round-21 also closes the §19.3 finding that the
+    /// previous handler swallowed errors via `unwrap_or_default`.
+    async fn handle_resources_list(
+        &self,
+        id: Value,
+        params: Value,
+    ) -> crate::protocol::JsonRpcResponse {
+        let cursor = params.get("cursor").and_then(|v| v.as_str());
+        let requested_limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32)
+            .unwrap_or(RESOURCES_LIST_PAGE);
+
+        let (ids, next_cursor) = match self.store.list_record_ids_paged(cursor, requested_limit) {
+            Ok(p) => p,
+            Err(e) => {
+                return crate::protocol::JsonRpcResponse::err(
+                    id,
+                    -32603,
+                    format!("resources/list: {e}"),
+                );
+            }
+        };
+
+        let mut resources: Vec<Value> = ids
             .iter()
-            .map(|id| {
+            .map(|rid| {
                 json!({
-                    "uri": format!("anamnesis://record/{id}"),
-                    "name": format!("record {}", &id[..id.len().min(12)]),
+                    "uri": format!("anamnesis://record/{rid}"),
+                    "name": format!("record {}", &rid[..rid.len().min(12)]),
                     "description": "One AnamnesisRecord as JSON.",
                     "mimeType": "application/json",
                 })
             })
             .collect();
-        // Templates kept in the response (under a separate key per MCP
-        // spec) so schema-discovery still works for clients that want
-        // to learn the URI shapes.
+
+        // Templates appear ONLY on the first page. Paginating
+        // consumers see them once; later pages stay focused on the
+        // continuing record window so `nextCursor` semantics stay
+        // clean.
         let templates = static_resource_templates();
-        // Some clients still only read `resources` — for back-compat
-        // we ALSO inline the templates there. The generic-mcp adapter
-        // filters templates out, so this duplication is harmless to it
-        // and helpful for less sophisticated consumers.
-        for t in templates.as_array().into_iter().flatten() {
-            resources.push(t.clone());
+        if cursor.is_none() {
+            for t in templates.as_array().into_iter().flatten() {
+                resources.push(t.clone());
+            }
         }
-        json!({
+
+        let mut payload = json!({
             "resources": resources,
             "resourceTemplates": templates,
-        })
+        });
+        if let Some(c) = next_cursor {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("nextCursor".into(), Value::String(c));
+            }
+        }
+        crate::protocol::JsonRpcResponse::ok(id, payload)
     }
 }
 
-/// Cap on how many concrete record URIs to emit in `resources/list`.
-/// Sized to be useful as a discoverability window without forcing the
-/// server to dump the whole store on every list call.
-pub const RESOURCES_LIST_RECENT_LIMIT: u32 = 100;
+/// Default page size for `resources/list` when the client doesn't
+/// supply `limit`. Round-21 changed the semantics from "recent
+/// window" to "first page of full catalogue"; sized so a single
+/// page response stays under ~50 KB of JSON.
+pub const RESOURCES_LIST_PAGE: u32 = 100;
+
+/// Deprecated alias kept for binary back-compat in any out-of-tree
+/// consumer (`anamnesis-mcp-server` is published; renaming the const
+/// would be a SemVer break unless we keep the old name in scope). New
+/// code should use `RESOURCES_LIST_PAGE`.
+#[deprecated(note = "renamed in round-21 to RESOURCES_LIST_PAGE; this alias is for back-compat")]
+pub const RESOURCES_LIST_RECENT_LIMIT: u32 = RESOURCES_LIST_PAGE;
 
 fn static_resource_templates() -> Value {
     json!([

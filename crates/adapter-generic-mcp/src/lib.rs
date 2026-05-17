@@ -185,6 +185,12 @@ mod async_stream {
 
     use super::*;
 
+    /// Hard cap so a misbehaving / hostile upstream that returns
+    /// `nextCursor` forever can't make the adapter spin indefinitely.
+    /// 1000 pages × 1000 records = 1M record ceiling per scan, which
+    /// is far above any realistic single migration.
+    const MAX_LIST_PAGES: u32 = 1000;
+
     pub async fn fetch_all(
         cfg: Arc<GenericMcpConfig>,
         client: reqwest::Client,
@@ -192,40 +198,73 @@ mod async_stream {
         let url = cfg.url.clone();
         let token = cfg.token.clone();
         let endpoint = format!("{}/mcp", url.trim_end_matches('/'));
-        // 1. resources/list
-        let list_payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "resources/list",
-            "params": {}
-        });
-        let mut req = client.post(&endpoint).json(&list_payload);
-        if let Some(t) = token.as_deref() {
-            req = req.bearer_auth(t);
+
+        // Round-21 (§-1.5 PR-2): page through `resources/list` via
+        // `cursor` / `nextCursor` so full migrations are no longer
+        // truncated at the upstream's first-page limit. The previous
+        // call sent `params: {}` (always page 1) and trusted whatever
+        // the upstream chose to put in `resources` — typically capped
+        // at 100. Now we follow `nextCursor` until the upstream stops
+        // returning one OR we hit `MAX_LIST_PAGES`.
+        let mut uris: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages_seen: u32 = 0;
+        loop {
+            pages_seen += 1;
+            if pages_seen > MAX_LIST_PAGES {
+                tracing::warn!(
+                    adapter = ADAPTER_ID,
+                    "resources/list reached MAX_LIST_PAGES={MAX_LIST_PAGES}; \
+                     refusing to follow another cursor (possible upstream loop)"
+                );
+                break;
+            }
+            let params = match cursor.as_deref() {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let list_payload = json!({
+                "jsonrpc": "2.0",
+                "id": pages_seen,
+                "method": "resources/list",
+                "params": params,
+            });
+            let mut req = client.post(&endpoint).json(&list_payload);
+            if let Some(t) = token.as_deref() {
+                req = req.bearer_auth(t);
+            }
+            let body: Value = req
+                .send()
+                .await
+                .map_err(|e| Error::Adapter {
+                    adapter: ADAPTER_ID.into(),
+                    message: format!("list send (page {pages_seen}): {e}"),
+                })?
+                .json()
+                .await
+                .map_err(|e| Error::Adapter {
+                    adapter: ADAPTER_ID.into(),
+                    message: format!("list parse (page {pages_seen}): {e}"),
+                })?;
+            if let Some(arr) = body["result"]["resources"].as_array() {
+                for r in arr {
+                    if let Some(u) = r["uri"].as_str() {
+                        // Skip template URIs (contain placeholders).
+                        if !u.contains('{') {
+                            uris.push(u.to_owned());
+                        }
+                    }
+                }
+            }
+            // Follow `nextCursor` if present and non-empty.
+            cursor = body["result"]["nextCursor"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
         }
-        let body: Value = req
-            .send()
-            .await
-            .map_err(|e| Error::Adapter {
-                adapter: ADAPTER_ID.into(),
-                message: format!("list send: {e}"),
-            })?
-            .json()
-            .await
-            .map_err(|e| Error::Adapter {
-                adapter: ADAPTER_ID.into(),
-                message: format!("list parse: {e}"),
-            })?;
-        let uris: Vec<String> = body["result"]["resources"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| r["uri"].as_str().map(str::to_owned))
-                    // Skip template URIs that contain placeholders.
-                    .filter(|u| !u.contains('{'))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         // 2. resources/read for each concrete URI.
         let mut raws = Vec::new();
