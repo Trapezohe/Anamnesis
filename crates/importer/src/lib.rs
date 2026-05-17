@@ -18,7 +18,7 @@
 
 use anamnesis_core::adapter::MemoryAdapter;
 use anamnesis_core::chunker::Chunker;
-use anamnesis_core::RawRecord;
+use anamnesis_core::{Audit, AuditEntry, RawRecord};
 use anamnesis_store::Store;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -183,6 +183,151 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
                 }
             }
         }
+    }
+}
+
+/// Options accepted by `ImportService::import`.
+///
+/// Round-18 (§-1.5 PR-3) — moved out of CLI / MCP. CLI fills these from
+/// argv; MCP fills them from the JSON-RPC `tools/call` arguments. Either
+/// caller sees the same source-registry + audit + `last_import_at` side
+/// effects.
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// Scan-only mode. Counts `raw_seen` but writes nothing to the store,
+    /// the source registry, or the audit log.
+    pub dry_run: bool,
+    /// Canonical location to write back into `sources.location` on a
+    /// successful run. `None` means "leave whatever's there" — used by
+    /// URL-based adapters where the URL was already written by `source
+    /// add` and re-deriving it here would just be a round-trip.
+    pub canonical_location: Option<String>,
+    /// Whether the caller had an explicit location (CLI `--path`, MCP
+    /// registry entry). Surfaces in the audit entry for diagnostics; the
+    /// store doesn't care.
+    pub source_was_explicit: bool,
+}
+
+/// Errors that `ImportService` can fail with, on top of plain
+/// `ImportError`. Distinguished so callers can render the friendlier
+/// "import succeeded but audit failed" type messages.
+#[derive(Debug, Error)]
+pub enum ImportServiceError {
+    /// Underlying `ImportRunner` failure (store-level abort).
+    #[error("runner: {0}")]
+    Runner(#[from] ImportError),
+    /// Store-level failure outside the runner (registry / last_import_at).
+    #[error("store: {0}")]
+    Store(#[from] anamnesis_store::StoreError),
+}
+
+/// Service object that wraps `ImportRunner` with the side effects
+/// every caller agreed to share (§-1.6.9): write through `source`
+/// registry (without clobbering `config_json`), stamp `last_import_at`
+/// only on a real run, and append a single `import` entry to the
+/// data-dir `audit.log`.
+///
+/// This is the load-bearing seam for §-1.5 PR-3 — before round-18 the
+/// CLI `run_import` did all of this inline while the MCP
+/// `tool_import_source` did almost none of it. Both now flow through
+/// here; see `crates/cli/src/main.rs::run_import` and
+/// `crates/mcp-server/src/server.rs::tool_import_source`.
+pub struct ImportService<'a> {
+    store: &'a Store,
+    audit: Audit,
+}
+
+impl<'a> ImportService<'a> {
+    /// Build a service bound to `store` and an `Audit` log writer.
+    pub fn new(store: &'a Store, audit: Audit) -> Self {
+        Self { store, audit }
+    }
+
+    /// Run an import.
+    ///
+    /// Order of operations on a non-dry-run:
+    ///   1. Look up the existing `(adapter, instance)` row so we can
+    ///      preserve `config_json` (and `location` when the caller
+    ///      passes `None`). This is the §-1.4 round-17 contract:
+    ///      registry side-channel data set by `source add` must
+    ///      survive re-import.
+    ///   2. `register_source` — idempotent upsert with preserved
+    ///      `config_json`. This happens BEFORE the runner so even a
+    ///      partially-failing run leaves the source visible in
+    ///      `source list`.
+    ///   3. `ImportRunner::run` — the actual scan/normalize/upsert.
+    ///   4. `update_last_import_at` — only on success.
+    ///   5. `audit.record("import", ...)` — single line per call.
+    ///
+    /// Dry-run mode short-circuits to `adapter.scan().count()` without
+    /// any of (1–5). `summary.raw_seen` reflects the count;
+    /// `records_upserted == 0`, `chunks_written == 0`, `errors == 0`.
+    pub async fn import<A: MemoryAdapter>(
+        &self,
+        adapter: &A,
+        opts: ImportOptions,
+    ) -> std::result::Result<ImportSummary, ImportServiceError> {
+        let descriptor = adapter.descriptor();
+
+        if opts.dry_run {
+            // dry-run NEVER touches the registry, last_import_at, or
+            // audit (`source list` should reflect only persisted state).
+            use anamnesis_core::adapter::ScanOpts;
+            let mut stream = adapter.scan(ScanOpts::default());
+            let mut seen = 0u64;
+            while let Some(item) = stream.next().await {
+                if item.is_ok() {
+                    seen += 1;
+                }
+            }
+            let mut summary =
+                ImportSummary::empty(&descriptor.adapter, descriptor.instance.as_deref());
+            summary.raw_seen = seen;
+            return Ok(summary);
+        }
+
+        // 1. Preserve registry side-channel data.
+        let existing = self
+            .store
+            .get_source(&descriptor.adapter, descriptor.instance.as_deref())?;
+        let new_location: Option<String> = opts
+            .canonical_location
+            .clone()
+            .or_else(|| existing.as_ref().and_then(|r| r.location.clone()));
+        let existing_config = existing.and_then(|r| r.config_json);
+
+        // 2. Pre-register so `source list` shows the source even after a
+        //    partial run.
+        self.store.register_source(
+            &descriptor.adapter,
+            descriptor.instance.as_deref(),
+            new_location.as_deref(),
+            existing_config.as_deref(),
+        )?;
+
+        // 3. The real work.
+        let summary = ImportRunner::new(adapter).run(self.store).await?;
+
+        // 4. Mark success.
+        self.store
+            .update_last_import_at(&descriptor.adapter, descriptor.instance.as_deref())?;
+
+        // 5. Audit.
+        self.audit.record(AuditEntry::new(
+            "import",
+            serde_json::json!({
+                "adapter": descriptor.adapter,
+                "instance": descriptor.instance,
+                "raw_seen": summary.raw_seen,
+                "records_upserted": summary.records_upserted,
+                "chunks_written": summary.chunks_written,
+                "errors": summary.errors,
+                "location": new_location,
+                "source_was_explicit": opts.source_was_explicit,
+            }),
+        ));
+
+        Ok(summary)
     }
 }
 
@@ -426,5 +571,198 @@ mod tests {
             summary.chunks_written > 1,
             "tiny budget should produce >1 chunk"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Round-18 (§-1.5 PR-3): ImportService side-effect contract tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Open a real on-disk store + audit log writer in `tempdir`. The
+    /// in-memory store would work for store side effects, but `Audit`
+    /// needs a real `data_dir` to write `audit.log`.
+    fn store_and_audit() -> (Store, anamnesis_core::Audit, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("anamnesis.sqlite")).expect("open store");
+        let audit = anamnesis_core::Audit::new(dir.path());
+        (store, audit, dir)
+    }
+
+    /// Read the audit.log file produced by `Audit::new(dir).record(...)`
+    /// and return one JSON value per line.
+    fn read_audit_lines(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(dir.join("audit.log")).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("audit line is json"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn import_service_dry_run_writes_nothing_but_counts_raw() {
+        let (store, audit, dir) = store_and_audit();
+        let adapter = FakeAdapter::new(vec![pair("a", "alpha"), pair("b", "beta")]);
+
+        let summary = ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: true,
+                    canonical_location: Some("/somewhere".into()),
+                    source_was_explicit: true,
+                },
+            )
+            .await
+            .expect("dry-run must succeed");
+
+        // raw_seen reflects the scan; nothing else moves.
+        assert_eq!(summary.raw_seen, 2);
+        assert_eq!(summary.records_upserted, 0);
+        assert_eq!(summary.chunks_written, 0);
+        assert_eq!(summary.errors, 0);
+
+        // Source registry untouched: dry-run NEVER pre-registers.
+        let row = store.get_source("fake", Some("default")).unwrap();
+        assert!(
+            row.is_none(),
+            "dry-run must not register the source (would mislead `source list`)"
+        );
+
+        // No audit entry.
+        let lines = read_audit_lines(dir.path());
+        assert!(
+            lines.is_empty(),
+            "dry-run must not append to audit.log; got: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_service_writes_registry_last_import_at_and_audit_on_success() {
+        let (store, audit, dir) = store_and_audit();
+        let adapter = FakeAdapter::new(vec![pair("a", "alpha")]);
+
+        let summary = ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: false,
+                    canonical_location: Some("/tmp/round18".into()),
+                    source_was_explicit: true,
+                },
+            )
+            .await
+            .expect("import must succeed");
+
+        assert_eq!(summary.raw_seen, 1);
+        assert_eq!(summary.records_upserted, 1);
+        assert!(summary.chunks_written >= 1);
+
+        // Source row exists with the canonical location AND last_import_at.
+        let row = store
+            .get_source("fake", Some("default"))
+            .unwrap()
+            .expect("source row must exist after import");
+        assert_eq!(row.location.as_deref(), Some("/tmp/round18"));
+        assert!(
+            row.last_import_at.is_some(),
+            "last_import_at must be stamped on a successful run"
+        );
+
+        // Exactly one audit line, of action "import".
+        let lines = read_audit_lines(dir.path());
+        assert_eq!(lines.len(), 1, "expected one audit line, got {lines:?}");
+        assert_eq!(lines[0]["action"], "import");
+        assert_eq!(lines[0]["detail"]["adapter"], "fake");
+        assert_eq!(lines[0]["detail"]["records_upserted"], 1);
+        assert_eq!(lines[0]["detail"]["location"], "/tmp/round18");
+        assert_eq!(lines[0]["detail"]["source_was_explicit"], true);
+    }
+
+    #[tokio::test]
+    async fn import_service_preserves_config_json_across_reimport() {
+        // Round-17 PR-#25's fix in CLI's run_import migrated here: a
+        // generic-mcp source registered with config_json={"token_env":
+        // "..."} must keep that config_json after re-import (no None
+        // clobber).
+        let (store, audit, dir) = store_and_audit();
+
+        // 1. Operator did `source add fake --token-env FOO` first.
+        store
+            .register_source(
+                "fake",
+                Some("default"),
+                Some("https://upstream/api"),
+                Some(r#"{"token_env":"ANAMNESIS_FAKE_TOKEN"}"#),
+            )
+            .unwrap();
+
+        // 2. ImportService runs with canonical_location=None (the URL is
+        //    already in registry — file adapters pass Some(...), URL
+        //    adapters pass None).
+        let adapter = FakeAdapter::new(vec![pair("a", "alpha")]);
+        ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: false,
+                    canonical_location: None,
+                    source_was_explicit: true,
+                },
+            )
+            .await
+            .expect("import must succeed");
+
+        // 3. The URL AND the token_env config must survive.
+        let row = store
+            .get_source("fake", Some("default"))
+            .unwrap()
+            .expect("source row must exist");
+        assert_eq!(
+            row.location.as_deref(),
+            Some("https://upstream/api"),
+            "URL must survive re-registration"
+        );
+        let cfg = row.config_json.as_deref().unwrap_or("");
+        assert!(
+            cfg.contains("ANAMNESIS_FAKE_TOKEN"),
+            "token_env must survive; got config_json={cfg:?}"
+        );
+
+        // Audit still recorded.
+        assert_eq!(read_audit_lines(dir.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_service_does_not_stamp_last_import_on_normalize_only_failures() {
+        // A normalize() failure is per-record (counted in `errors`), not a
+        // store-level abort — ImportRunner returns Ok with errors > 0.
+        // We still consider the run "successful" in the system-state
+        // sense (it produced an `import` audit entry, `last_import_at`
+        // got stamped, sources were registered). This documents that
+        // contract so a future "fail run if any per-record errors" change
+        // doesn't silently break the audit/registry contract.
+        let (store, audit, dir) = store_and_audit();
+        let adapter = FakeAdapter::new(vec![pair("good", "ok"), pair("bad", "x")])
+            .with_normalize_failure("bad");
+
+        let summary = ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: false,
+                    canonical_location: Some("/p".into()),
+                    source_was_explicit: false,
+                },
+            )
+            .await
+            .expect("partial-failure run still returns Ok at runner level");
+
+        assert_eq!(summary.raw_seen, 2);
+        assert_eq!(summary.records_upserted, 1);
+        assert_eq!(summary.errors, 1);
+
+        let row = store.get_source("fake", Some("default")).unwrap().unwrap();
+        assert!(row.last_import_at.is_some());
+        let lines = read_audit_lines(dir.path());
+        assert_eq!(lines[0]["detail"]["errors"], 1);
     }
 }

@@ -18,10 +18,11 @@ use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use anamnesis_adapter_codex::codex_adapter;
+use anamnesis_adapter_generic_mcp::generic_mcp_adapter;
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
 use anamnesis_core::embedding::EmbeddingProvider;
 use anamnesis_core::model::RecordId;
-use anamnesis_importer::ImportRunner;
+use anamnesis_importer::{ImportOptions, ImportService};
 use anamnesis_search::{pack, ContextBudget, HybridOpts, HybridSearcher, SearchMode};
 use anamnesis_store::Store;
 use serde_json::{json, Value};
@@ -42,6 +43,36 @@ pub const ADMIN_TOOLS: &[&str] = &["import_source"];
 /// Was this tool tagged as admin?
 fn is_admin_tool(name: &str) -> bool {
     ADMIN_TOOLS.contains(&name)
+}
+
+/// Round-18 (§-1.5 PR-3): read the bearer token for a registered
+/// `generic-mcp` source from the operator's environment. The env-var
+/// *name* lives in `sources.config_json` (`{"token_env": "..."}`); the
+/// value is never stored — see PR-#25 round-17 rationale.
+///
+/// `Ok(None)` means "no token configured" (the upstream accepts
+/// unauthenticated). An empty string or missing env var when a
+/// `token_env` *is* registered yields `Err` so a misconfiguration
+/// fails fast at the MCP entry point rather than hitting the upstream
+/// with no auth.
+fn resolve_generic_mcp_token(config_json: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = config_json else {
+        return Ok(None);
+    };
+    let parsed: Value =
+        serde_json::from_str(raw).map_err(|e| format!("source.config_json invalid JSON: {e}"))?;
+    let Some(env) = parsed.get("token_env").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    match std::env::var(env) {
+        Ok(v) if !v.is_empty() => Ok(Some(v)),
+        Ok(_) => Err(format!(
+            "generic-mcp source's token_env={env:?} is set but empty"
+        )),
+        Err(_) => Err(format!(
+            "generic-mcp source requires env var {env:?} to be set"
+        )),
+    }
 }
 
 /// Stateful MCP server wrapping a `Store` and (optionally) an
@@ -447,52 +478,130 @@ impl AnamnesisServer {
         }))
     }
 
+    /// Round-18 (§-1.5 PR-3): MCP admin import now flows through the
+    /// shared `ImportService` so the system-state delta (registry +
+    /// `last_import_at` + `audit.log`) matches the CLI `import` path
+    /// exactly.
+    ///
+    /// Wire schema (after PR-3):
+    ///   `{ adapter: string, instance?: string, dry_run?: bool }`
+    ///
+    /// Removed: `path` (and the never-implemented `url`). Allowing
+    /// MCP clients to supply arbitrary filesystem paths bypassed the
+    /// `source add` registry and let any admin-tools-enabled client
+    /// read any path the server process could read — that was the
+    /// §-1.2.2 / §-1.6.8 boundary we tightened in this PR. To import
+    /// a new location, register it with CLI `anamnesis source add`
+    /// first, then call `import_source` over MCP.
+    ///
+    /// Skips the embedding worker (CLI does it; MCP must not block the
+    /// JSON-RPC request on minutes of embedding work — codex round-18
+    /// trap #2). The next CLI run or scheduled embed sweep will pick up
+    /// the freshly-imported chunks.
     async fn tool_import_source(&self, args: Value) -> Result<Value, String> {
         let adapter_id = args
             .get("adapter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "import_source.adapter is required".to_string())?;
         let instance = args.get("instance").and_then(|v| v.as_str());
-        let path_override = args.get("path").and_then(|v| v.as_str()).map(PathBuf::from);
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        match adapter_id {
+        // Tighten the boundary: MCP must not be a path-arbitrary import.
+        if args.get("path").is_some() || args.get("url").is_some() {
+            return Err("MCP import_source no longer accepts `path` or `url`; \
+                 register the source with `anamnesis source add` first, \
+                 then call this tool with just `adapter` (+ optional `instance`)."
+                .into());
+        }
+
+        // Look up the registry; refuse to invent a location.
+        let registered = self
+            .store
+            .get_source(adapter_id, instance)
+            .map_err(|e| format!("store: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "source {adapter_id}{} is not registered; use CLI \
+                     `anamnesis source add {adapter_id}{} ...` first.",
+                    instance.map(|i| format!(":{i}")).unwrap_or_default(),
+                    instance
+                        .map(|i| format!(" --instance {i}"))
+                        .unwrap_or_default(),
+                )
+            })?;
+
+        let service = ImportService::new(&self.store, anamnesis_core::Audit::new(&self.data_dir));
+        let opts = ImportOptions {
+            dry_run,
+            // The CLI fills `canonical_location` from --path / --url so
+            // a fresh import can re-anchor the registry. MCP never gets
+            // a fresh location (we just refused `path` and `url`), so we
+            // leave the registry's value untouched.
+            canonical_location: None,
+            source_was_explicit: true,
+        };
+
+        let summary = match adapter_id {
             anamnesis_adapter_claude_code::ADAPTER_ID => {
-                let projects_root =
-                    path_override.unwrap_or_else(|| self.home().join(".claude").join("projects"));
+                let projects_root = registered
+                    .location
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.home().join(".claude").join("projects"));
                 let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
                     projects_root,
                     instance: instance.map(str::to_owned),
                 });
-                let store = &self.store;
-                let summary = ImportRunner::new(&adapter)
-                    .run(store)
+                service
+                    .import(&adapter, opts)
                     .await
-                    .map_err(|e| format!("import: {e}"))?;
-                Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("import: {e}"))?
             }
             anamnesis_adapter_mem0::ADAPTER_ID => {
-                let db_path =
-                    path_override.unwrap_or_else(|| self.home().join(".mem0").join("db.sqlite"));
+                let db_path = registered
+                    .location
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.home().join(".mem0").join("db.sqlite"));
                 let adapter = mem0_sqlite_adapter(db_path, instance);
-                let store = &self.store;
-                let summary = ImportRunner::new(&adapter)
-                    .run(store)
+                service
+                    .import(&adapter, opts)
                     .await
-                    .map_err(|e| format!("import: {e}"))?;
-                Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("import: {e}"))?
             }
             anamnesis_adapter_codex::ADAPTER_ID => {
-                let root = path_override.unwrap_or_else(|| self.home().join(".codex"));
+                let root = registered
+                    .location
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.home().join(".codex"));
                 let adapter = codex_adapter(root, instance);
-                let store = &self.store;
-                let summary = ImportRunner::new(&adapter)
-                    .run(store)
+                service
+                    .import(&adapter, opts)
                     .await
-                    .map_err(|e| format!("import: {e}"))?;
-                Ok(serde_json::to_value(summary).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("import: {e}"))?
             }
-            other => Err(format!("unknown adapter: {other}")),
-        }
+            anamnesis_adapter_generic_mcp::ADAPTER_ID => {
+                let url = registered.location.as_deref().ok_or_else(|| {
+                    "generic-mcp source has no URL in the registry; \
+                     run `anamnesis source add generic-mcp --url ...` first"
+                        .to_string()
+                })?;
+                let token = resolve_generic_mcp_token(registered.config_json.as_deref())
+                    .map_err(|e| format!("token: {e}"))?;
+                let adapter = generic_mcp_adapter(url.to_string(), token.as_deref(), instance);
+                service
+                    .import(&adapter, opts)
+                    .await
+                    .map_err(|e| format!("import: {e}"))?
+            }
+            other => return Err(format!("unknown adapter: {other}")),
+        };
+
+        serde_json::to_value(summary).map_err(|e| e.to_string())
     }
 
     async fn tool_trace_provenance(&self, args: Value) -> Result<Value, String> {
@@ -912,13 +1021,30 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "import_source",
-                "description": "Run an import job for one source (claude-code or mem0).",
+                "description": "Run an import job for one source registered via CLI `anamnesis source add`. \
+                                The source's location (path or URL) and credentials (env-var name only — value \
+                                never leaves the operator's shell) are taken from the registry; MCP clients \
+                                cannot pass `path` or `url` directly. Adapter ids: claude-code, codex, mem0, \
+                                generic-mcp. Admin-gated — server must be started with --allow-admin-tools \
+                                or have it enabled in config.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "adapter": {"type": "string"},
-                        "instance": {"type": "string"},
-                        "path": {"type": "string", "description": "Path override (mem0 sqlite file or claude projects root)"}
+                        "adapter": {
+                            "type": "string",
+                            "description": "claude-code | codex | mem0 | generic-mcp",
+                            "enum": ["claude-code", "codex", "mem0", "generic-mcp"]
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Instance discriminator. Must match an existing source registry row \
+                                            for (adapter, instance)."
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "Scan-only: count raw records without writing. Source registry and \
+                                            audit log are not touched in dry-run."
+                        }
                     },
                     "required": ["adapter"]
                 }
