@@ -65,10 +65,17 @@ impl MemoryAdapter for CodexAdapter {
         }
     }
 
-    fn scan<'a>(&'a self, _opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
-        let cfg = self.config.clone();
-        let raws = collect_raw_records(&cfg);
-        Box::pin(stream::iter(raws).map(Ok))
+    fn scan<'a>(&'a self, opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+        // Round-20 (§-1.5 PR-4b): honor `opts.since` / `opts.full`.
+        // Same pattern as `adapter-claude-code`: walk the tree up-front
+        // (cheap), filter by file mtime BEFORE reading the body, and
+        // read the body lazily inside the async closure. `opts.full`
+        // bypasses the `since` filter; mtime read failures
+        // conservatively INCLUDE the file (the importer's raw_hash
+        // fast-path makes a false positive a no-op upsert; a false
+        // negative would silently drop user data).
+        let cfg = (*self.config).clone();
+        Box::pin(stream_raw_records(cfg, opts).map(Ok))
     }
 
     fn normalize(&self, raw: RawRecord) -> Result<Vec<AnamnesisRecord>> {
@@ -88,12 +95,34 @@ impl MemoryAdapter for CodexAdapter {
     }
 }
 
-fn collect_raw_records(cfg: &CodexConfig) -> Vec<RawRecord> {
-    match scanner::scan_root(&cfg.root) {
-        Ok(files) => files
-            .iter()
-            .filter_map(|path| match std::fs::read_to_string(path) {
-                Ok(body) => Some(normalizer::raw_session(path, body, cfg.instance.as_deref())),
+/// Round-20 (§-1.5 PR-4b): true streaming scan of codex session files
+/// that honors `opts.since` / `opts.full` exactly the same way the
+/// claude-code adapter does. Walk happens up-front (cheap); mtime check
+/// runs BEFORE the body read; body is read lazily inside the async
+/// closure.
+fn stream_raw_records(cfg: CodexConfig, opts: ScanOpts) -> BoxStream<'static, RawRecord> {
+    let files = match scanner::scan_root(&cfg.root) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                root = %cfg.root.display(),
+                "scan_root failed; emitting zero records"
+            );
+            return Box::pin(stream::iter(Vec::<RawRecord>::new()));
+        }
+    };
+
+    let since = if opts.full { None } else { opts.since };
+    let instance = cfg.instance.clone();
+    let stream = stream::iter(files).filter_map(move |path| {
+        let instance = instance.clone();
+        async move {
+            if !passes_since_filter(&path, since) {
+                return None;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(body) => Some(normalizer::raw_session(&path, body, instance.as_deref())),
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -102,17 +131,28 @@ fn collect_raw_records(cfg: &CodexConfig) -> Vec<RawRecord> {
                     );
                     None
                 }
-            })
-            .collect(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                root = %cfg.root.display(),
-                "scan_root failed; emitting zero records"
-            );
-            Vec::new()
+            }
         }
-    }
+    });
+    Box::pin(stream)
+}
+
+/// Whether the file at `path` is "newer than the threshold" for an
+/// incremental scan. `since == None` (default / `--full`) means "no
+/// filter, always include". Metadata-read failures conservatively
+/// INCLUDE the file — see `adapter-claude-code` for the same rationale.
+fn passes_since_filter(
+    path: &std::path::Path,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let Some(threshold) = since else { return true };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    chrono::DateTime::<chrono::Utc>::from(modified) > threshold
 }
 
 /// Convenience constructor.
@@ -205,5 +245,64 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].kind, Kind::Episode);
         assert_eq!(recs[0].source.adapter, "codex");
+    }
+
+    /// Round-20 (§-1.5 PR-4b): mtime filter.
+    #[tokio::test]
+    async fn scan_since_filters_files_by_mtime() {
+        use filetime::FileTime;
+        let dir = tmp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old_p = dir.join("old.jsonl");
+        let new_p = dir.join("new.jsonl");
+        fs::write(&old_p, "{\"role\":\"user\",\"content\":\"old\"}\n").unwrap();
+        fs::write(&new_p, "{\"role\":\"user\",\"content\":\"new\"}\n").unwrap();
+        filetime::set_file_mtime(&old_p, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp(1_750_000_000, 0).unwrap();
+
+        let a = codex_adapter(&dir, None);
+        let raws: Vec<_> = a
+            .scan(ScanOpts {
+                since: Some(cutoff),
+                full: false,
+            })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(raws.len(), 1, "old file should be filtered out");
+        assert!(raws[0]
+            .native_path
+            .as_deref()
+            .unwrap_or("")
+            .ends_with("new.jsonl"));
+    }
+
+    /// `opts.full` overrides `opts.since`.
+    #[tokio::test]
+    async fn scan_full_overrides_since() {
+        use filetime::FileTime;
+        let dir = tmp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old_p = dir.join("old.jsonl");
+        let new_p = dir.join("new.jsonl");
+        fs::write(&old_p, "{\"role\":\"user\",\"content\":\"old\"}\n").unwrap();
+        fs::write(&new_p, "{\"role\":\"user\",\"content\":\"new\"}\n").unwrap();
+        filetime::set_file_mtime(&old_p, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp(1_750_000_000, 0).unwrap();
+
+        let a = codex_adapter(&dir, None);
+        let raws: Vec<_> = a
+            .scan(ScanOpts {
+                since: Some(cutoff),
+                full: true, // override
+            })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(raws.len(), 2, "--full must include both files");
     }
 }
