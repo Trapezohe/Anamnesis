@@ -462,10 +462,13 @@ mod tests {
         seed_with_embeddings(&store, &provider).await;
         let searcher = HybridSearcher::new(&provider);
         let opts = HybridOpts::fulltext_only(10);
-        // FTS5 MATCH with an empty query is invalid; the search call should
-        // return an Err — verify we wrap it cleanly.
-        let result = searcher.search(&store, "", &opts).await;
-        assert!(result.is_err());
+        // PR-Jieba (round-5): the FTS layer now short-circuits an empty
+        // / punctuation-only query into an empty result set rather than
+        // letting SQLite raise on `MATCH ''`. An empty user query truly
+        // has zero matches; surfacing that as an error was an artefact
+        // of FTS5's strictness, not a useful signal.
+        let hits = searcher.search(&store, "", &opts).await.unwrap();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

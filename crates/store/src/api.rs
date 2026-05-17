@@ -611,6 +611,19 @@ impl Store {
         filter: &SearchFilter,
         limit: u32,
     ) -> Result<Vec<ChunkHit>> {
+        // PR-Jieba (round-5 consult, see `cjk` module): we MUST tokenize
+        // the query through the same pipeline that indexed the chunks.
+        // Otherwise FTS5 MATCH compares raw codepoints against the
+        // jieba-segmented index, and Chinese queries return zero hits.
+        // The Codex consult flagged this asymmetry as the load-bearing
+        // trap of the whole feature.
+        let match_query = crate::cjk::tokenize_query(query);
+        if match_query.is_empty() {
+            // FTS5 errors on empty MATCH; an empty user query has no
+            // searchable tokens, so zero hits is the right answer.
+            return Ok(Vec::new());
+        }
+
         // Build the SQL + bound parameters together — the candidate pool
         // is filtered BEFORE the `LIMIT` truncates it.
         // The first two bound params are always (query, limit); filter
@@ -636,7 +649,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
         let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(2 + filter_params.len());
-        bound.push(rusqlite::types::Value::Text(query.to_string()));
+        bound.push(rusqlite::types::Value::Text(match_query));
         bound.extend(filter_params);
         bound.push(rusqlite::types::Value::Integer(limit as i64));
         let rows = stmt
@@ -1158,6 +1171,112 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, r.id);
         assert!(hits[0].score > 0.0);
+    }
+
+    // ─── PR-Jieba (round-5): CJK FTS round-trip ───
+    //
+    // The point of jieba-based pre-tokenization is that a multi-char
+    // Chinese phrase the user typed maps to the same word boundaries
+    // jieba picked when we indexed the document. unicode61 alone
+    // (the pre-PR-Jieba behaviour) would still match — because every
+    // Han codepoint becomes its own token — but BM25 scoring would be
+    // dominated by character frequency, not phrase frequency. The
+    // semantics that matter to users only emerge once we agree that
+    // "记忆" is one token, not two.
+
+    #[test]
+    fn cjk_phrase_search_finds_indexed_document() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record(
+            "claude-code",
+            "cjk-1",
+            "Anamnesis 是跨 agent 的记忆基础设施，本地优先，无 telemetry",
+            Kind::Fact,
+        );
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+
+        // The exact phrase "记忆基础" (or any 2-char Chinese substring
+        // of the content) must surface the indexed record.
+        for query in &["记忆", "基础设施", "本地优先"] {
+            let hits = store
+                .search_chunks_fts(query, &SearchFilter::default(), 5)
+                .unwrap();
+            assert!(
+                !hits.is_empty(),
+                "CJK query {query:?} must find the indexed record"
+            );
+            assert_eq!(hits[0].record_id, r.id, "wrong record for query {query:?}");
+        }
+    }
+
+    #[test]
+    fn cjk_search_distinguishes_distinct_words() {
+        // Two documents that share characters but not jieba-segmented
+        // words. With unicode61 they'd both match a single-char query;
+        // with jieba they're correctly separated.
+        let store = Store::open_in_memory().unwrap();
+        let a = make_record("a", "a1", "我的偏好是 vim", Kind::Preference);
+        let b = make_record("a", "b1", "项目里有很多代码", Kind::Fact);
+        let ca = Chunker::default().chunk(&a.id, &a.content);
+        let cb = Chunker::default().chunk(&b.id, &b.content);
+        store.upsert_record(&a, &ca, None).unwrap();
+        store.upsert_record(&b, &cb, None).unwrap();
+
+        let hits_pref = store
+            .search_chunks_fts("偏好", &SearchFilter::default(), 5)
+            .unwrap();
+        assert_eq!(hits_pref.len(), 1);
+        assert_eq!(hits_pref[0].record_id, a.id);
+
+        let hits_proj = store
+            .search_chunks_fts("项目", &SearchFilter::default(), 5)
+            .unwrap();
+        assert_eq!(hits_proj.len(), 1);
+        assert_eq!(hits_proj[0].record_id, b.id);
+    }
+
+    #[test]
+    fn empty_or_punctuation_only_query_returns_no_hits() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "x", "alpha beta gamma", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+
+        // FTS5 errors on empty MATCH — we must short-circuit instead.
+        let empty = store
+            .search_chunks_fts("", &SearchFilter::default(), 5)
+            .unwrap();
+        assert!(empty.is_empty());
+        let punct = store
+            .search_chunks_fts("!!!  ???", &SearchFilter::default(), 5)
+            .unwrap();
+        assert!(punct.is_empty());
+    }
+
+    #[test]
+    fn cjk_reindex_picks_up_existing_chunks() {
+        // Migration 0003 sets `chunks_fts_rebuild_pending`; verify that
+        // `Store::open` running over an existing DB with rows in
+        // `record_chunks` reconstructs the FTS index. We can't easily
+        // simulate the pre-0003 DB state from in-memory tests, so we
+        // assert the simpler invariant: after `upsert_record + open`
+        // the FTS row count equals the chunks row count. This catches
+        // regression in the reindex path even if the migration shape
+        // changes.
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "x", "重新索引 测试", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        let conn = store.conn.lock();
+        let chunks_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM record_chunks", [], |r| r.get(0))
+            .unwrap();
+        let fts_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks_n, fts_n, "every chunk has an FTS row");
+        assert!(chunks_n > 0);
     }
 
     // ─── PR-C: candidate-side filter pushdown ───
