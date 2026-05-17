@@ -542,6 +542,11 @@ impl AnamnesisServer {
             // leave the registry's value untouched.
             canonical_location: None,
             source_was_explicit: true,
+            // Round-19 (§-1.5 PR-4a): MCP admin import currently always
+            // runs as a full scan. Surfacing `since` over MCP is the
+            // §-1.5 PR-5 work; until then ScanOpts::default() preserves
+            // the pre-PR-4 behavior exactly.
+            ..Default::default()
         };
 
         let summary = match adapter_id {

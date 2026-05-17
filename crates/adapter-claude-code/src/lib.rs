@@ -76,10 +76,16 @@ impl MemoryAdapter for ClaudeCodeAdapter {
         }
     }
 
-    fn scan<'a>(&'a self, _opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
-        let cfg = self.config.clone();
-        let raws = collect_raw_records(&cfg);
-        Box::pin(stream::iter(raws).map(Ok))
+    fn scan<'a>(&'a self, opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+        // Round-19 (§-1.5 PR-4a): stream files lazily and honor
+        // `opts.since` / `opts.full`. We still pre-walk the directory
+        // tree (the walk itself is cheap; what was expensive was reading
+        // every file into memory before yielding the first record).
+        // True per-file laziness happens inside `stream_raw_records`,
+        // which yields one `RawRecord` at a time and only reads the
+        // file body on demand.
+        let cfg = (*self.config).clone();
+        Box::pin(stream_raw_records(cfg, opts).map(Ok))
     }
 
     fn normalize(&self, raw: RawRecord) -> Result<Vec<AnamnesisRecord>> {
@@ -102,10 +108,40 @@ impl MemoryAdapter for ClaudeCodeAdapter {
     }
 }
 
-/// Walk every project under `projects_root` and produce one `RawRecord`
-/// per memory file + per session file. Files that can't be read are
-/// skipped (the caller logs to `import_errors`).
-fn collect_raw_records(cfg: &ClaudeCodeConfig) -> Vec<RawRecord> {
+/// Whether the file at `path` is "newer than the threshold" for an
+/// incremental scan. `since == None` (the default / `--full` case) means
+/// "no filter, always include".
+///
+/// On a metadata-read failure we conservatively INCLUDE the file
+/// (return `true`): the importer's per-record raw_hash fast-path is a
+/// safety net — a re-emitted unchanged record is a no-op upsert. False
+/// positives are cheap; a false negative would silently drop user data.
+fn passes_since_filter(
+    path: &std::path::Path,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let Some(threshold) = since else { return true };
+    match file_mtime(path) {
+        Some(mtime) => mtime > threshold,
+        None => {
+            tracing::debug!(
+                path = %path.display(),
+                "no mtime available; conservatively including in incremental scan"
+            );
+            true
+        }
+    }
+}
+
+/// Walk every project under `projects_root` and **stream** one
+/// `RawRecord` per memory / session file. Files that can't be read are
+/// skipped (the caller logs to `import_errors`). Lazy IO — the file
+/// body is read inside the per-item closure, not up-front.
+///
+/// Round-19 (§-1.5 PR-4a): if `opts.since` is set, files whose mtime is
+/// at or before `since` are skipped without reading the body.
+/// `opts.full` overrides this back to "yield everything".
+fn stream_raw_records(cfg: ClaudeCodeConfig, opts: ScanOpts) -> BoxStream<'static, RawRecord> {
     let scans = match scanner::scan_projects_root(&cfg.projects_root) {
         Ok(s) => s,
         Err(e) => {
@@ -114,53 +150,62 @@ fn collect_raw_records(cfg: &ClaudeCodeConfig) -> Vec<RawRecord> {
                 root = %cfg.projects_root.display(),
                 "scan_projects_root failed; emitting zero records"
             );
-            return Vec::new();
+            return Box::pin(stream::iter(Vec::<RawRecord>::new()));
         }
     };
-    let mut out = Vec::new();
+
+    // Flatten into a single (kind, path) list while preserving the
+    // existing order (memory files first per project, then sessions).
+    // PR-4b will push this flattening inside the scanner itself; for
+    // PR-4a we only fix the IO-per-file laziness.
+    enum FileKind {
+        Memory,
+        Session,
+    }
+    let mut work: Vec<(FileKind, std::path::PathBuf)> = Vec::new();
     for proj in scans {
         for mem in proj.memory_files {
-            match std::fs::read_to_string(&mem) {
-                Ok(body) => {
-                    let mtime = file_mtime(&mem);
-                    out.push(normalizer::raw_memory(
-                        &mem,
-                        body,
-                        mtime,
-                        cfg.instance.as_deref(),
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %mem.display(),
-                        error = %e,
-                        "skipping unreadable memory file"
-                    );
-                }
-            }
+            work.push((FileKind::Memory, mem));
         }
         for sess in proj.jsonl_files {
-            match std::fs::read_to_string(&sess) {
+            work.push((FileKind::Session, sess));
+        }
+    }
+
+    // Apply `since` filter via per-file mtime BEFORE reading bodies.
+    let since = if opts.full { None } else { opts.since };
+    let instance = cfg.instance.clone();
+    let stream = stream::iter(work).filter_map(move |(kind, path)| {
+        let instance = instance.clone();
+        async move {
+            if !passes_since_filter(&path, since) {
+                return None;
+            }
+            match std::fs::read_to_string(&path) {
                 Ok(body) => {
-                    let mtime = file_mtime(&sess);
-                    out.push(normalizer::raw_session(
-                        &sess,
-                        &body,
-                        mtime,
-                        cfg.instance.as_deref(),
-                    ));
+                    let mtime = file_mtime(&path);
+                    let raw = match kind {
+                        FileKind::Memory => {
+                            normalizer::raw_memory(&path, body, mtime, instance.as_deref())
+                        }
+                        FileKind::Session => {
+                            normalizer::raw_session(&path, &body, mtime, instance.as_deref())
+                        }
+                    };
+                    Some(raw)
                 }
                 Err(e) => {
                     tracing::warn!(
-                        path = %sess.display(),
+                        path = %path.display(),
                         error = %e,
-                        "skipping unreadable session file"
+                        "skipping unreadable file"
                     );
+                    None
                 }
             }
         }
-    }
-    out
+    });
+    Box::pin(stream)
 }
 
 /// Read a file's modification time as `DateTime<Utc>`. Returns `None`
@@ -342,5 +387,107 @@ mod tests {
         let h = a.health().await;
         assert!(!h.ok);
         assert!(h.detail.contains("not found"));
+    }
+
+    /// Round-19 (§-1.5 PR-4a): the adapter must skip files whose mtime
+    /// is at or before `opts.since`. Build a fixture with two memory
+    /// files, force one's mtime into the past, then scan with `since`
+    /// set between them. Only the newer file should be emitted.
+    #[tokio::test]
+    async fn scan_since_filters_files_by_mtime() {
+        use filetime::FileTime;
+        let root = tmp_dir();
+        let proj = root.join("proj-pr4");
+
+        touch(
+            &proj.join("memory").join("old.md"),
+            "---\ntype: fact\n---\nold content",
+        );
+        touch(
+            &proj.join("memory").join("new.md"),
+            "---\ntype: fact\n---\nnew content",
+        );
+
+        // Force the old file's mtime to a known-past timestamp.
+        let old_path = proj.join("memory").join("old.md");
+        filetime::set_file_mtime(&old_path, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+
+        // Cutoff sits AFTER the old file but BEFORE the new file.
+        // (`new.md` was just written, so its mtime is "now"; old.md was
+        // pushed back to ~2023-11-14.)
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp(1_750_000_000, 0).unwrap();
+
+        let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
+            projects_root: root,
+            instance: Some("default".into()),
+        });
+
+        let raws: Vec<_> = adapter
+            .scan(ScanOpts {
+                since: Some(cutoff),
+                full: false,
+            })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            raws.len(),
+            1,
+            "since-filter should drop the old.md file; got: {raws:?}"
+        );
+        assert!(
+            raws[0]
+                .native_path
+                .as_deref()
+                .unwrap_or("")
+                .ends_with("new.md"),
+            "the surviving record must be new.md; got native_path={:?}",
+            raws[0].native_path,
+        );
+    }
+
+    /// `opts.full = true` must override `opts.since` — the contract that
+    /// keeps `--full` honest.
+    #[tokio::test]
+    async fn scan_full_overrides_since_filter() {
+        use filetime::FileTime;
+        let root = tmp_dir();
+        let proj = root.join("proj-pr4-full");
+        touch(
+            &proj.join("memory").join("old.md"),
+            "---\ntype: fact\n---\nold",
+        );
+        touch(
+            &proj.join("memory").join("new.md"),
+            "---\ntype: fact\n---\nnew",
+        );
+        let old_path = proj.join("memory").join("old.md");
+        filetime::set_file_mtime(&old_path, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp(1_750_000_000, 0).unwrap();
+        let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
+            projects_root: root,
+            instance: Some("default".into()),
+        });
+
+        let raws: Vec<_> = adapter
+            .scan(ScanOpts {
+                since: Some(cutoff),
+                full: true, // → ignore `since`
+            })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            raws.len(),
+            2,
+            "--full must override --since; expected both files, got: {raws:?}"
+        );
     }
 }
