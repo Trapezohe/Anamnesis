@@ -493,7 +493,12 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     let store = Store::open(&db)?;
     let stats = store.stats()?;
     let active = store.active_model()?;
-    let sources = store.list_sources_full()?;
+    // Round-16: surface per-source counts + freshness right on
+    // `status`, not just on `source list`. Operators landing on `status`
+    // for the first time should see "this source hasn't imported in 30
+    // days" without having to know about a second subcommand.
+    let per_source = store.list_sources_with_counts()?;
+    let now = chrono::Utc::now().timestamp();
     if json {
         let payload = serde_json::json!({
             "initialized": true,
@@ -508,13 +513,26 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
                 "jobs_pending": stats.jobs_pending,
                 "jobs_failed": stats.jobs_failed,
             },
-            "sources": sources.iter().map(|r| serde_json::json!({
-                "adapter": r.adapter,
-                "instance": if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
-                "location": r.location,
-                "added_at": r.added_at,
-                "last_import_at": r.last_import_at,
-            })).collect::<Vec<_>>(),
+            "sources": per_source.iter().map(|r| {
+                let freshness = source_freshness(r.source.last_import_at, now);
+                serde_json::json!({
+                    "adapter": r.source.adapter,
+                    "instance": if r.source.instance.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(r.source.instance.clone())
+                    },
+                    "location": r.source.location,
+                    "added_at": r.source.added_at,
+                    "last_import_at": r.source.last_import_at,
+                    "record_count": r.record_count,
+                    "chunk_count": r.chunk_count,
+                    // Round-16 additions — let consumers branch on
+                    // staleness without re-computing it from `now`.
+                    "freshness": freshness.label,
+                    "age_seconds": freshness.age_seconds,
+                })
+            }).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -531,7 +549,89 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     println!("chunks          : {}", stats.chunks);
     println!("jobs pending    : {}", stats.jobs_pending);
     println!("jobs failed     : {}", stats.jobs_failed);
+
+    // Per-source health table. Always emitted (even when empty) so the
+    // operator sees the "no sources yet — run `anamnesis source add`"
+    // affordance right after `init`.
+    println!();
+    if per_source.is_empty() {
+        println!("sources by health:");
+        println!("  (no sources registered — try `anamnesis discover` or `anamnesis source add`)");
+    } else {
+        println!(
+            "{:<14} {:<14} {:<8} {:<8} {:<16} {}",
+            "adapter", "instance", "records", "chunks", "last_import", "status"
+        );
+        for r in &per_source {
+            let freshness = source_freshness(r.source.last_import_at, now);
+            println!(
+                "{:<14} {:<14} {:<8} {:<8} {:<16} {}",
+                r.source.adapter,
+                if r.source.instance.is_empty() {
+                    "-".to_string()
+                } else {
+                    r.source.instance.clone()
+                },
+                r.record_count,
+                r.chunk_count,
+                freshness.age_human,
+                freshness.label,
+            );
+        }
+    }
     Ok(())
+}
+
+/// Human-readable freshness summary for a source, derived from
+/// `last_import_at` (Unix seconds, `None` for never-imported sources).
+///
+/// `label` is one of `"never-imported" | "fresh" | "stale"`:
+///   - `never-imported`: `last_import_at is None` (registered but no
+///     import has landed)
+///   - `fresh`: imported within the last 24 hours
+///   - `stale`: imported more than 24 hours ago
+///
+/// `age_seconds` is `None` for never-imported, otherwise the gap from
+/// `last_import_at` to `now`. `age_human` is the same gap rounded to a
+/// short string: `<1m`, `5m`, `3h`, `2d`, `30d+`.
+struct Freshness {
+    label: &'static str,
+    age_seconds: Option<i64>,
+    age_human: String,
+}
+
+fn source_freshness(last_import_at: Option<i64>, now: i64) -> Freshness {
+    match last_import_at {
+        None => Freshness {
+            label: "never-imported",
+            age_seconds: None,
+            age_human: "<never>".into(),
+        },
+        Some(t) => {
+            let age = now.saturating_sub(t).max(0);
+            let label = if age < 24 * 3600 { "fresh" } else { "stale" };
+            Freshness {
+                label,
+                age_seconds: Some(age),
+                age_human: human_age_short(age),
+            }
+        }
+    }
+}
+
+/// Compact human-readable age: `<1m`, `5m`, `3h`, `2d`, `30d+`.
+fn human_age_short(age_seconds: i64) -> String {
+    if age_seconds < 60 {
+        "<1m".into()
+    } else if age_seconds < 3600 {
+        format!("{}m", age_seconds / 60)
+    } else if age_seconds < 24 * 3600 {
+        format!("{}h", age_seconds / 3600)
+    } else if age_seconds < 30 * 24 * 3600 {
+        format!("{}d", age_seconds / (24 * 3600))
+    } else {
+        "30d+".into()
+    }
 }
 
 async fn cmd_discover() -> Result<()> {
@@ -1491,4 +1591,72 @@ fn install_model(_data_dir: &std::path::Path, _key: &str) -> Result<()> {
     Err(anyhow!(
         "this build lacks `local-fastembed`; rebuild with `--features local-fastembed`"
     ))
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::{human_age_short, source_freshness};
+
+    #[test]
+    fn freshness_never_imported_when_last_import_is_none() {
+        let f = source_freshness(None, 1_000_000);
+        assert_eq!(f.label, "never-imported");
+        assert!(f.age_seconds.is_none());
+        assert_eq!(f.age_human, "<never>");
+    }
+
+    #[test]
+    fn freshness_fresh_within_24h() {
+        let now = 1_000_000_i64;
+        // Just imported.
+        let f = source_freshness(Some(now), now);
+        assert_eq!(f.label, "fresh");
+        assert_eq!(f.age_seconds, Some(0));
+        assert_eq!(f.age_human, "<1m");
+
+        // 23h59m ago → still fresh.
+        let f = source_freshness(Some(now - (24 * 3600 - 1)), now);
+        assert_eq!(f.label, "fresh");
+    }
+
+    #[test]
+    fn freshness_stale_after_24h_boundary() {
+        let now = 1_000_000_i64;
+        // Exactly 24h → boundary lands on stale.
+        let f = source_freshness(Some(now - 24 * 3600), now);
+        assert_eq!(f.label, "stale");
+        assert_eq!(f.age_seconds, Some(24 * 3600));
+        assert_eq!(f.age_human, "1d");
+
+        // 7 days ago.
+        let f = source_freshness(Some(now - 7 * 24 * 3600), now);
+        assert_eq!(f.label, "stale");
+        assert_eq!(f.age_human, "7d");
+    }
+
+    #[test]
+    fn freshness_clamps_negative_age_to_zero() {
+        // A clock skew that makes `last_import_at > now` must not
+        // underflow or report negative age. Round to "<1m"/fresh.
+        let f = source_freshness(Some(2_000_000), 1_000_000);
+        assert_eq!(f.label, "fresh");
+        assert_eq!(f.age_seconds, Some(0));
+        assert_eq!(f.age_human, "<1m");
+    }
+
+    #[test]
+    fn human_age_short_buckets() {
+        assert_eq!(human_age_short(0), "<1m");
+        assert_eq!(human_age_short(30), "<1m");
+        assert_eq!(human_age_short(59), "<1m");
+        assert_eq!(human_age_short(60), "1m");
+        assert_eq!(human_age_short(125), "2m");
+        assert_eq!(human_age_short(3600), "1h");
+        assert_eq!(human_age_short(7200), "2h");
+        assert_eq!(human_age_short(24 * 3600), "1d");
+        assert_eq!(human_age_short(7 * 24 * 3600), "7d");
+        assert_eq!(human_age_short(29 * 24 * 3600), "29d");
+        assert_eq!(human_age_short(30 * 24 * 3600), "30d+");
+        assert_eq!(human_age_short(365 * 24 * 3600), "30d+");
+    }
 }

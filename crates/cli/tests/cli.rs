@@ -83,6 +83,127 @@ fn status_after_init_prints_counters() {
 }
 
 #[test]
+fn status_shows_per_source_health_block_with_empty_hint_when_no_sources() {
+    // Round-16: even with zero sources registered, `status` shows the
+    // "sources by health:" block so the first-run UX includes an
+    // explicit "try discover / source add" affordance.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(
+            contains("sources by health:")
+                .and(contains("no sources registered"))
+                .and(contains("anamnesis discover").or(contains("anamnesis source add"))),
+        );
+}
+
+#[test]
+fn status_per_source_table_lists_never_imported_source() {
+    // Round-16: register a source without importing. The per-source
+    // table must list it with status = "never-imported" so the
+    // operator can spot registered-but-empty sources at a glance.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--instance",
+            "default",
+            "--path",
+            "/tmp/round-16-fake",
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(
+            contains("claude-code")
+                .and(contains("default"))
+                .and(contains("never-imported"))
+                // The legacy global counters must still be present —
+                // we're adding the per-source block, not replacing the
+                // header.
+                .and(contains("records         : 0")),
+        );
+}
+
+#[test]
+fn status_json_includes_per_source_counts_and_freshness() {
+    // Round-16 JSON contract: each source object exposes
+    // `record_count`, `chunk_count`, `freshness`, `age_seconds`
+    // alongside the existing `last_import_at` / `added_at` fields.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--instance",
+            "default",
+            "--path",
+            "/tmp/round-16-fake",
+        ])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).expect("utf8 stdout");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("status --json must be JSON");
+    let arr = v
+        .get("sources")
+        .and_then(|s| s.as_array())
+        .expect("sources array");
+    assert_eq!(arr.len(), 1, "exactly one source registered");
+    let s = &arr[0];
+    assert_eq!(
+        s.get("adapter").and_then(|x| x.as_str()),
+        Some("claude-code")
+    );
+    assert_eq!(s.get("instance").and_then(|x| x.as_str()), Some("default"));
+    assert_eq!(s.get("record_count").and_then(|x| x.as_u64()), Some(0));
+    assert_eq!(s.get("chunk_count").and_then(|x| x.as_u64()), Some(0));
+    assert_eq!(
+        s.get("freshness").and_then(|x| x.as_str()),
+        Some("never-imported")
+    );
+    assert!(s.get("age_seconds").map(|x| x.is_null()).unwrap_or(false));
+    assert!(s
+        .get("last_import_at")
+        .map(|x| x.is_null())
+        .unwrap_or(false));
+}
+
+#[test]
 fn source_add_then_list_shows_entry() {
     let dir = tmp_dir();
     cli()
