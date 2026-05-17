@@ -1128,20 +1128,72 @@ async fn cmd_search(
     } else if filtered.is_empty() {
         println!("no results");
     } else {
+        // Round-12: human-readable card mirrors the JSON wire format
+        // (PR-#16) — same fields, same names, same semantics. CLI
+        // operators see what MCP agents see; nothing is invented or
+        // recomputed.
         for (i, p) in filtered.iter().enumerate() {
+            let best = p.matched_chunks.first();
+            let kind = format!("{:?}", p.record.kind).to_lowercase();
+            let scope = format!("{:?}", p.record.scope).to_lowercase();
+
+            // Line 1: rank, RRF score, adapter[:instance], kind/scope.
+            let inst = p
+                .record
+                .source
+                .instance
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(":{s}"))
+                .unwrap_or_default();
             println!(
-                "[{:>2}] {:>5.3}  {}  ({}, {:?})",
+                "[{:>2}] rrf={:.3}  {}{}  ({kind}, {scope})",
                 i + 1,
                 p.score,
                 p.record.source.adapter,
-                p.record.provenance.native_path.as_deref().unwrap_or("?"),
-                p.record.kind,
+                inst,
             );
-            if let Some(c) = p.matched_chunks.first() {
+
+            // Line 2: per-modality score breakdown + timestamps. Same
+            // raw values the JSON exposes; null modality scores rendered
+            // as `-` so the column line stays parseable visually.
+            let fts = best
+                .and_then(|c| c.fts_score)
+                .map(|s| format!("{s:.3}"))
+                .unwrap_or_else(|| "-".into());
+            let vec = best
+                .and_then(|c| c.vector_score)
+                .map(|s| format!("{s:.3}"))
+                .unwrap_or_else(|| "-".into());
+            let created = p.record.created_at.format("%Y-%m-%dT%H:%MZ");
+            let updated = p
+                .record
+                .updated_at
+                .map(|t| t.format("%Y-%m-%dT%H:%MZ").to_string())
+                .unwrap_or_else(|| "-".into());
+            println!("     fts={fts}  vec={vec}  created={created}  updated={updated}");
+
+            // Line 3: trace ids — exactly what an agent / a follow-up
+            // CLI invocation would feed into `trace_provenance` /
+            // `get_record`. Surface both record_id and chunk_id so the
+            // operator can copy-paste either.
+            let chunk_id = best
+                .map(|c| c.chunk_id.clone())
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "     record_id={}  chunk_id={}  trace_id={}",
+                p.record.id.0, chunk_id, p.record.id.0,
+            );
+
+            // Line 4: native_path (full, so operators can `cat $path`).
+            println!(
+                "     native_path={}",
+                p.record.provenance.native_path.as_deref().unwrap_or("-"),
+            );
+
+            // Line 5: snippet (truncated on char boundary to stay terminal-safe).
+            if let Some(c) = best {
                 let snippet = c.content.replace('\n', " ");
-                // Truncate on a char boundary so CJK / em-dash snippets
-                // don't panic mid-codepoint. 180 chars (not bytes) is a
-                // sensible terminal width for one-line previews.
                 let snippet = if snippet.chars().count() > 180 {
                     let mut s: String = snippet.chars().take(180).collect();
                     s.push('…');
@@ -1149,8 +1201,9 @@ async fn cmd_search(
                 } else {
                     snippet
                 };
-                println!("       {snippet}");
+                println!("     snippet: {snippet}");
             }
+            println!();
         }
     }
     Ok(())
