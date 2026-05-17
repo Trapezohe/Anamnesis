@@ -292,6 +292,29 @@ Current MCP surface:
 
 ## Quick Start
 
+### Install pre-built binary (recommended)
+
+Each tagged release ships pre-built binaries for **macOS** (aarch64 +
+x86_64), **Linux** (x86_64 + aarch64), and **Windows** (x86_64) on the
+[Releases page](https://github.com/Trapezohe/Anamnesis/releases). The
+release artefact is a tarball / zip containing two binaries:
+
+- `anamnesis` — the CLI (`init`, `import`, `search`, `serve`, …).
+- `anamnesis-mcp` — the standalone MCP server (stdio + loopback HTTP).
+
+```bash
+# Linux x86_64 example — substitute the artefact for your platform.
+VERSION=0.0.2
+TARGET=x86_64-unknown-linux-gnu
+curl -L "https://github.com/Trapezohe/Anamnesis/releases/download/v${VERSION}/anamnesis-${VERSION}-${TARGET}.tar.gz" \
+  | tar -xz
+sudo install -m 755 "anamnesis-${VERSION}-${TARGET}"/anamnesis      /usr/local/bin/
+sudo install -m 755 "anamnesis-${VERSION}-${TARGET}"/anamnesis-mcp  /usr/local/bin/
+```
+
+Verify the SHA-256 against the `.sha256` sidecar on the release page
+before extracting if you're cautious about supply chain.
+
 ### Install from source
 
 ```bash

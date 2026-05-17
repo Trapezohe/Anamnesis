@@ -1,0 +1,177 @@
+# Release workflow — runs when a tag matching `v*` is pushed.
+#
+# Builds the two end-user binaries (`anamnesis` + `anamnesis-mcp`) on
+# the four supported targets, packages each pair as a tarball
+# (`anamnesis-<version>-<target>.tar.gz`) or zip on Windows, and uploads
+# them to a GitHub Release that the tag also creates.
+#
+# Local-first: no telemetry, no external publishers, no hosted services
+# beyond GitHub itself. Aligns with §-1.2.3 (local-first) and §-1.2.4
+# (Apache 2.0 binaries, no paid tier).
+#
+# To cut a release:
+#   1. Bump `workspace.package.version` in Cargo.toml.
+#   2. `git tag -a v0.0.2 -m "v0.0.2"` && `git push --tags`.
+#   3. The workflow runs, attaches binaries to the release draft, and
+#      flips the release from draft → published when all four jobs
+#      succeed.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)build artifacts for (e.g. v0.0.2)'
+        required: true
+
+permissions:
+  contents: write  # needed to create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The CLI bundles fastembed-rs by default; we DO NOT download the
+  # ~500 MB model into the binary build artifact. Users run
+  # `anamnesis model download default` once on their machine.
+  FASTEMBED_DOWNLOAD: '0'
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross (linux-aarch64 only)
+        if: matrix.cross
+        run: cargo install cross --locked
+      - name: Build `anamnesis` (CLI)
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }} -p anamnesis-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p anamnesis-cli
+          fi
+      - name: Build `anamnesis-mcp` (server)
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }} -p anamnesis-mcp-server
+          else
+            cargo build --release --target ${{ matrix.target }} -p anamnesis-mcp-server
+          fi
+      - name: Stage release artifacts
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            version="${{ github.event.inputs.tag }}"
+            version="${version#v}"
+          fi
+          stage_dir="anamnesis-${version}-${{ matrix.target }}"
+          mkdir -p "$stage_dir"
+          # Binary file extension on Windows.
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/anamnesis.exe" "$stage_dir/"
+            cp "target/${{ matrix.target }}/release/anamnesis-mcp.exe" "$stage_dir/"
+          else
+            cp "target/${{ matrix.target }}/release/anamnesis" "$stage_dir/"
+            cp "target/${{ matrix.target }}/release/anamnesis-mcp" "$stage_dir/"
+          fi
+          cp README.md LICENSE "$stage_dir/"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "stage_dir=$stage_dir" >> "$GITHUB_OUTPUT"
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tar czf "${{ steps.stage.outputs.stage_dir }}.tar.gz" "${{ steps.stage.outputs.stage_dir }}"
+          shasum -a 256 "${{ steps.stage.outputs.stage_dir }}.tar.gz" \
+            > "${{ steps.stage.outputs.stage_dir }}.tar.gz.sha256"
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "${{ steps.stage.outputs.stage_dir }}"
+          Compress-Archive -Path "$name" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -FilePath "$name.zip.sha256" -Encoding ascii
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            anamnesis-*-${{ matrix.target }}.tar.gz
+            anamnesis-*-${{ matrix.target }}.tar.gz.sha256
+            anamnesis-*-${{ matrix.target }}.zip
+            anamnesis-*-${{ matrix.target }}.zip.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Promote draft release to published
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const tag = context.ref.startsWith('refs/tags/')
+              ? context.ref.replace('refs/tags/', '')
+              : context.payload.inputs.tag;
+            if (!tag) {
+              core.setFailed('no tag in context — neither tag push nor workflow_dispatch input');
+              return;
+            }
+            const { data: rel } = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag,
+            });
+            if (!rel.draft) {
+              core.info(`release ${tag} is already published; nothing to do`);
+              return;
+            }
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: rel.id,
+              draft: false,
+            });
+            core.info(`promoted release ${tag} from draft to published`);

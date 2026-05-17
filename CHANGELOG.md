@@ -4,6 +4,53 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 ## [Unreleased] — Phase 2 → 3 transition
 
+### Added — North-Star iteration (§-1.5 PR-1 through PR-5)
+
+- **§-1.5 PR-5 — Full filter surface on MCP / CLI search.** `tools/list`
+  schema for `search_memories` now advertises `instance`, `kind` (enum),
+  `scope` (enum), `since` / `until` (RFC3339). Handler reads them into
+  `SearchFilter.{instance,time_from,time_to}` (previously hardcoded to
+  `None`). CLI `anamnesis search --instance / --since / --until` flags.
+  (#30)
+- **§-1.5 PR-2 — Cursor pagination for `resources/list`.** Store
+  exposes `list_record_ids_paged(cursor, limit)` with stable
+  lexicographic ordering and `MAX_LIST_LIMIT = 1000`. MCP returns
+  `nextCursor`. `generic-mcp` adapter follows the cursor up to
+  `MAX_LIST_PAGES = 1000`. End-to-end 250-record migration test
+  asserts no records lost. (#29)
+- **§-1.5 PR-4b — Remaining adapters honor `ScanOpts`.** codex
+  (file-mtime filter, true streaming); mem0 (Rust-side row filter on
+  `updated_at ?? created_at` parsing both RFC3339 and stringified
+  epoch); generic-mcp (one-shot warning until PR-2 upstream
+  timestamps exist). (#28)
+- **§-1.5 PR-4a — `ScanOpts` pushdown end-to-end.** `--since` /
+  `--full` CLI flags reach `ImportRunner` and `adapter.scan(opts)`;
+  CLI auto-fills `since` from `sources.last_import_at`. claude-code
+  adapter does true streaming + per-file mtime filter. New
+  `ImportRunner::run_with_opts` API. (#27)
+- **§-1.5 PR-3 — Unified `ImportService`.** CLI and MCP admin import
+  produce identical system-state deltas (registry, `last_import_at`,
+  `audit.log`). MCP `import_source` rejects `path` / `url` args
+  (clients must register sources via CLI `source add` first). (#26)
+- **§-1.5 PR-1 — `generic-mcp` is a first-class CLI source.**
+  `anamnesis source add generic-mcp --url <upstream> --token-env
+  <ENV>` + `anamnesis import generic-mcp:<instance>`. Token name lives
+  in registry; value resolved from operator's env at import time.
+  (#25)
+- **§-2.6 Demo path.** End-to-end loopback migration demonstrated:
+  Anamnesis instance A → MCP HTTP → generic-mcp adapter → Anamnesis
+  instance B, with provenance preserved across the boundary.
+
+### Added — Release Engineering (Phase 3 prep)
+
+- **Pre-built release binaries** for macOS (aarch64 + x86_64), Linux
+  (x86_64 + aarch64), Windows (x86_64) — triggered by `v*` tag push.
+  Each release ships `anamnesis-<version>-<target>.{tar.gz,zip}` with
+  `anamnesis` + `anamnesis-mcp` binaries, README, LICENSE, and a
+  SHA-256 sidecar. (See `.github/workflows/release.yml`.)
+- README install path: pre-built binary install instructions
+  alongside `cargo install --path`.
+
 ### Added
 
 #### CLI
