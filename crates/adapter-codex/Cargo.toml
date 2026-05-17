@@ -20,3 +20,4 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+filetime = "0.2"

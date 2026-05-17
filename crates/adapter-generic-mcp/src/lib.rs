@@ -124,7 +124,26 @@ impl MemoryAdapter for GenericMcpAdapter {
         }
     }
 
-    fn scan<'a>(&'a self, _opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+    fn scan<'a>(&'a self, opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+        // Round-20 (§-1.5 PR-4b): generic-mcp can't filter by
+        // `opts.since` today because upstream `resources/list` exposes
+        // neither per-resource `updated_at` nor a cursor-by-time
+        // protocol. That gap belongs to §-1.5 PR-2 (resources/list
+        // pagination). For now: emit a single one-shot warning per scan
+        // when `opts.since` is set + `opts.full` is false, then return
+        // every available resource. This is honest about the limitation
+        // and preserves the existing migration loop's correctness
+        // (the importer's raw_hash fast-path still skips no-op upserts).
+        if !opts.full && opts.since.is_some() {
+            tracing::warn!(
+                adapter = ADAPTER_ID,
+                instance = ?self.config.instance,
+                since = ?opts.since,
+                "generic-mcp adapter does not support `--since` filtering yet \
+                 (waiting on §-1.5 PR-2: resources/list pagination + timestamps); \
+                 returning all available upstream resources"
+            );
+        }
         let cfg = self.config.clone();
         let client = self.client.clone();
         // We fetch lazily inside the stream so the importer's async

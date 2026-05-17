@@ -91,9 +91,18 @@ impl MemoryAdapter for Mem0Adapter {
         }
     }
 
-    fn scan<'a>(&'a self, _opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+    fn scan<'a>(&'a self, opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+        // Round-20 (§-1.5 PR-4b): honor `opts.since` / `opts.full`.
+        // mem0 SQLite has both `created_at` and `updated_at` (TEXT,
+        // typically ISO 8601 or epoch seconds). The since-filter
+        // compares against `updated_at.unwrap_or(created_at)` so a
+        // record that mutated post-import isn't missed. Filtering is
+        // row-level (Rust-side) because mem0 doesn't normalize the
+        // timestamp column type — SQL `WHERE created_at >= ?` would be
+        // unsafe across the ISO/epoch variants the scanner already
+        // tolerates.
         let cfg = self.config.clone();
-        let raws = collect_raw_records(&cfg);
+        let raws = collect_raw_records(&cfg, &opts);
         Box::pin(stream::iter(raws).map(Ok))
     }
 
@@ -119,11 +128,12 @@ impl MemoryAdapter for Mem0Adapter {
     }
 }
 
-fn collect_raw_records(cfg: &Mem0Config) -> Vec<RawRecord> {
+fn collect_raw_records(cfg: &Mem0Config, opts: &ScanOpts) -> Vec<RawRecord> {
     match cfg {
         Mem0Config::Sqlite { path, instance } => match scanner::read_all(path) {
             Ok(rows) => rows
                 .iter()
+                .filter(|r| passes_since_filter(r, opts))
                 .map(|r| normalizer::raw_from_row(r, instance.as_deref()))
                 .collect(),
             Err(e) => {
@@ -140,6 +150,47 @@ fn collect_raw_records(cfg: &Mem0Config) -> Vec<RawRecord> {
             Vec::new()
         }
     }
+}
+
+/// Whether a mem0 row passes the `opts.since` window. `opts.full == true`
+/// always returns true (= "ignore since"). `opts.since == None` always
+/// returns true. Otherwise, the row passes when **either** of:
+///
+///   * `updated_at` (preferred — captures post-creation edits) is
+///     parseable AND strictly greater than the threshold, OR
+///   * `created_at` is parseable AND strictly greater than the threshold,
+///
+/// is true. Unparseable timestamps conservatively INCLUDE the row (the
+/// importer's raw_hash fast-path makes a false positive a no-op upsert;
+/// a false negative would silently drop user data — see §-1.6.4).
+fn passes_since_filter(row: &scanner::Mem0Row, opts: &ScanOpts) -> bool {
+    if opts.full {
+        return true;
+    }
+    let Some(threshold) = opts.since else {
+        return true;
+    };
+    let updated = row.updated_at.as_deref().and_then(parse_mem0_timestamp);
+    let created = row.created_at.as_deref().and_then(parse_mem0_timestamp);
+    match (updated, created) {
+        (Some(u), _) => u > threshold,
+        (None, Some(c)) => c > threshold,
+        (None, None) => true, // unparseable → include
+    }
+}
+
+/// Parse mem0's `created_at` / `updated_at` strings, which historically
+/// could be either RFC3339 (`"2026-05-01T12:00:00Z"`) or epoch seconds
+/// stringified (`"1714564800"`). Tries RFC3339 first, then i64-as-epoch.
+/// Returns `None` if neither parse succeeds.
+fn parse_mem0_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(epoch) = s.parse::<i64>() {
+        return chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0);
+    }
+    None
 }
 
 /// Convenience: build an adapter from a SQLite path.
@@ -298,5 +349,119 @@ mod tests {
         let a_ids = run().await;
         let b_ids = run().await;
         assert_eq!(a_ids, b_ids);
+    }
+
+    /// Round-20 (§-1.5 PR-4b): build a fixture where rows have
+    /// different `created_at` values (mix of epoch + ISO 8601 to exercise
+    /// both parsers), then scan with `opts.since` and assert filtering.
+    fn seed_db_mixed_timestamps(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories(
+                id TEXT PRIMARY KEY,
+                memory TEXT NOT NULL,
+                user_id TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            );",
+        )
+        .unwrap();
+        // 1700000000 = 2023-11-14T22:13:20Z (well before cutoff)
+        // 1750000000 = 2025-06-15T17:33:20Z (cutoff)
+        // 1800000000 = 2027-01-15T08:00:00Z (well after cutoff)
+        let rows = [
+            ("old-epoch", "old via epoch", "1700000000", None),
+            ("old-iso", "old via iso", "2024-01-01T00:00:00Z", None),
+            ("new-epoch", "new via epoch", "1800000000", None),
+            ("new-iso", "new via iso", "2026-12-01T00:00:00Z", None),
+            // updated_at supersedes created_at: created_at OLD but
+            // updated_at NEW → should be included.
+            (
+                "updated-old-to-new",
+                "edited recently",
+                "1700000000",
+                Some("2026-11-01T00:00:00Z"),
+            ),
+        ];
+        for (id, mem, ca, ua) in rows {
+            conn.execute(
+                "INSERT INTO memories(id, memory, user_id, created_at, updated_at) \
+                 VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![id, mem, "u1", ca, ua],
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_since_filters_rows_by_created_or_updated_at() {
+        let dir = tmp_dir();
+        let db = dir.join("db.sqlite");
+        seed_db_mixed_timestamps(&db);
+        let a = sqlite_adapter(&db, None);
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp(1_750_000_000, 0).unwrap();
+        let raws: Vec<_> = a
+            .scan(ScanOpts {
+                since: Some(cutoff),
+                full: false,
+            })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+        // Should keep: new-epoch, new-iso, updated-old-to-new (3).
+        // Drop: old-epoch, old-iso (2).
+        assert_eq!(
+            raws.len(),
+            3,
+            "expected 3 post-cutoff rows; got {} — native_ids: {:?}",
+            raws.len(),
+            raws.iter().map(|r| &r.native_id).collect::<Vec<_>>()
+        );
+        // native_id format: `"{instance}|{id}"` where instance defaults
+        // to `"self-hosted"` when none is provided (see normalizer).
+        let ids: Vec<&str> = raws.iter().map(|r| r.native_id.as_str()).collect();
+        assert!(ids.contains(&"self-hosted|new-epoch"), "ids={ids:?}");
+        assert!(ids.contains(&"self-hosted|new-iso"), "ids={ids:?}");
+        assert!(
+            ids.contains(&"self-hosted|updated-old-to-new"),
+            "ids={ids:?}"
+        );
+        assert!(!ids.contains(&"self-hosted|old-epoch"));
+        assert!(!ids.contains(&"self-hosted|old-iso"));
+    }
+
+    #[tokio::test]
+    async fn scan_full_overrides_since_filter() {
+        let dir = tmp_dir();
+        let db = dir.join("db.sqlite");
+        seed_db_mixed_timestamps(&db);
+        let a = sqlite_adapter(&db, None);
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp(1_750_000_000, 0).unwrap();
+        let raws: Vec<_> = a
+            .scan(ScanOpts {
+                since: Some(cutoff),
+                full: true, // override → all 5
+            })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(raws.len(), 5);
+    }
+
+    #[test]
+    fn parse_mem0_timestamp_handles_both_formats() {
+        // RFC 3339 round-trip.
+        let rfc = super::parse_mem0_timestamp("2026-05-01T12:00:00Z").unwrap();
+        assert_eq!(rfc.to_rfc3339(), "2026-05-01T12:00:00+00:00");
+        // Epoch seconds round-trip.
+        let epoch = super::parse_mem0_timestamp("1714564800").unwrap();
+        assert_eq!(epoch.timestamp(), 1714564800);
+        // Garbage stays None.
+        assert!(super::parse_mem0_timestamp("not-a-time").is_none());
+        assert!(super::parse_mem0_timestamp("").is_none());
     }
 }
