@@ -45,6 +45,16 @@ fn is_admin_tool(name: &str) -> bool {
     ADMIN_TOOLS.contains(&name)
 }
 
+/// Round-22 (§-1.5 PR-5): parse an RFC3339 timestamp into the unix
+/// seconds form the `SearchFilter` stores. Used by `search_memories`
+/// for `since` / `until` parameters. Returns a string-form error so the
+/// JSON-RPC layer can wrap it as a `-32602` invalid-params response.
+fn parse_rfc3339_to_unix(s: &str) -> std::result::Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc).timestamp())
+        .map_err(|e| format!("expected RFC3339 (e.g. 2026-04-01T00:00:00Z): {e}"))
+}
+
 /// Round-18 (§-1.5 PR-3): read the bearer token for a registered
 /// `generic-mcp` source from the operator's environment. The env-var
 /// *name* lives in `sources.config_json` (`{"token_env": "..."}`); the
@@ -261,6 +271,10 @@ impl AnamnesisServer {
             .get("source")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+        let instance = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let kind = args
             .get("kind")
             .and_then(|v| v.as_str())
@@ -269,6 +283,18 @@ impl AnamnesisServer {
             .get("scope")
             .and_then(|v| v.as_str())
             .map(|s| s.to_lowercase());
+        // Round-22 (§-1.5 PR-5): time-window filters. The store layer
+        // already supports `time_from` / `time_to` via SQL pushdown
+        // (PR-C); this just plumbs them through from the MCP wire so
+        // an agent can ask "what did I learn in the last week".
+        let time_from = match args.get("since").and_then(|v| v.as_str()) {
+            Some(s) => Some(parse_rfc3339_to_unix(s).map_err(|e| format!("since: {e}"))?),
+            None => None,
+        };
+        let time_to = match args.get("until").and_then(|v| v.as_str()) {
+            Some(s) => Some(parse_rfc3339_to_unix(s).map_err(|e| format!("until: {e}"))?),
+            None => None,
+        };
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -290,11 +316,11 @@ impl AnamnesisServer {
         // post-RRF filtering.
         let filter = anamnesis_store::SearchFilter {
             source: source.clone(),
-            instance: None,
+            instance,
             kind,
             scope,
-            time_from: None,
-            time_to: None,
+            time_from,
+            time_to,
         };
 
         let store = &self.store;
@@ -998,12 +1024,41 @@ fn tools_list_payload_all() -> Value {
         "tools": [
             {
                 "name": "search_memories",
-                "description": "Hybrid search across all imported records (FTS + vector + RRF).",
+                "description": "Hybrid search across all imported records (FTS + vector + RRF). \
+                                All filters push down to the SQL recall stage (PR-C / §-1.5 PR-5) \
+                                so they survive minority-source dominance.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "source": {"type": "string", "description": "Restrict to one adapter (e.g. claude-code, mem0)"},
+                        "source": {
+                            "type": "string",
+                            "description": "Restrict to one adapter id (claude-code, codex, mem0, generic-mcp)."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Restrict to a specific source instance (the discriminator passed to \
+                                            `source add --instance`). Meaningful only when `source` is also set."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["fact", "preference", "feedback", "reference", "episode", "skill", "unknown"],
+                            "description": "Restrict to one Kind."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["user", "project", "session", "ephemeral"],
+                            "description": "Restrict to one Scope."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "RFC3339 lower bound on records.created_at (inclusive). \
+                                            E.g. \"2026-04-01T00:00:00Z\"."
+                        },
+                        "until": {
+                            "type": "string",
+                            "description": "RFC3339 upper bound on records.created_at (inclusive)."
+                        },
                         "limit": {"type": "integer", "minimum": 1, "default": 10},
                         "mode": {"type": "string", "enum": ["fulltext", "vector", "hybrid"], "default": "hybrid"}
                     },
@@ -1640,6 +1695,151 @@ mod tests {
 
         // Snippet present.
         assert!(hit["snippet"].as_str().unwrap().contains("uniqueWireToken"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Round-22 (§-1.5 PR-5): MCP filter surface — schema + handler.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// `tools/list` must advertise the full filter set so an MCP agent
+    /// learning the schema knows it can narrow by kind / scope /
+    /// instance / since / until without trial-and-error.
+    #[tokio::test]
+    async fn tools_list_search_memories_advertises_filter_schema() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let sm = tools
+            .iter()
+            .find(|t| t["name"] == "search_memories")
+            .expect("search_memories must be in tools/list");
+        let props = sm["inputSchema"]["properties"].as_object().unwrap();
+        for f in [
+            "query", "source", "instance", "kind", "scope", "since", "until", "limit", "mode",
+        ] {
+            assert!(
+                props.contains_key(f),
+                "search_memories schema missing `{f}` after PR-5"
+            );
+        }
+        // The enums must enumerate the real options so agents can validate
+        // locally.
+        let kinds = props["kind"]["enum"].as_array().unwrap();
+        assert!(kinds.iter().any(|v| v == "preference"));
+        let scopes = props["scope"]["enum"].as_array().unwrap();
+        assert!(scopes.iter().any(|v| v == "session"));
+    }
+
+    /// `search_memories` with `since` set must filter the recall stage,
+    /// not just post-filter. Two records at t=2024 and t=2026 with the
+    /// same query token; `since=2025-01-01` keeps only the newer.
+    #[tokio::test]
+    async fn search_memories_since_filters_by_created_at() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        // 2026-01-01T00:00:00Z = 1767225600
+        let old = make_record(
+            "claude-code",
+            "r-old",
+            "filterTokenAlpha shared snippet content",
+            1704067200,
+        );
+        let new = make_record(
+            "claude-code",
+            "r-new",
+            "filterTokenAlpha shared snippet content",
+            1767225600,
+        );
+        let s = server_with_records(&[old, new]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "filterTokenAlpha",
+                        "mode": "fulltext",
+                        "since": "2025-01-01T00:00:00Z",
+                        "limit": 10
+                    }
+                }),
+            ))
+            .await;
+        let results = resp.result.unwrap()["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            results.len(),
+            1,
+            "since-filter must drop the 2024 record; got {results:#?}"
+        );
+        assert!(!results[0]["record_id"].as_str().unwrap().is_empty());
+    }
+
+    /// `until` is the upper bound — same fixture, `until=2025-01-01`
+    /// keeps only the OLDER record.
+    #[tokio::test]
+    async fn search_memories_until_filters_by_created_at() {
+        let old = make_record(
+            "claude-code",
+            "r-old",
+            "filterTokenBeta shared snippet content",
+            1704067200,
+        );
+        let new = make_record(
+            "claude-code",
+            "r-new",
+            "filterTokenBeta shared snippet content",
+            1767225600,
+        );
+        let s = server_with_records(&[old, new]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "filterTokenBeta",
+                        "mode": "fulltext",
+                        "until": "2025-01-01T00:00:00Z",
+                        "limit": 10
+                    }
+                }),
+            ))
+            .await;
+        let results = resp.result.unwrap()["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(results.len(), 1);
+    }
+
+    /// Malformed timestamps must surface a clean error, not silently
+    /// fall back to "no filter".
+    #[tokio::test]
+    async fn search_memories_since_rejects_non_rfc3339() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "anything",
+                        "since": "yesterday",
+                    }
+                }),
+            ))
+            .await;
+        let err_msg = resp
+            .error
+            .as_ref()
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        assert!(
+            err_msg.contains("RFC3339") || err_msg.contains("since"),
+            "expected clear RFC3339 error; got: {err_msg:?}"
+        );
     }
 
     #[tokio::test]
