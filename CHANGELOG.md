@@ -2,7 +2,14 @@
 
 All notable changes to Anamnesis are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — Phase 2 → 3 transition
+## [Unreleased]
+
+_Nothing yet — open the next iteration here._
+
+## [0.0.2] — 2026-05-18 — Phase 2 → 3 transition
+
+First **tagged release with pre-built binaries** for macOS / Linux /
+Windows (see [Releases](https://github.com/Trapezohe/Anamnesis/releases/tag/v0.0.2)).
 
 ### Added — North-Star iteration (§-1.5 PR-1 through PR-5)
 
@@ -120,5 +127,6 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 - **Adapter contract test framework** — `anamnesis_core::contract::AdapterContract`.
 - **E2E tests** — fixture-driven for the full discover → import → search loop.
 
-[Unreleased]: https://github.com/Trapezohe/Anamnesis/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/Trapezohe/Anamnesis/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/Trapezohe/Anamnesis/releases/tag/v0.0.2
 [0.0.1]: https://github.com/Trapezohe/Anamnesis/releases/tag/v0.0.1

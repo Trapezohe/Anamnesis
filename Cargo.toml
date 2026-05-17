@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -26,16 +26,16 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
-anamnesis-core = { path = "crates/core", version = "0.0.1" }
-anamnesis-store = { path = "crates/store", version = "0.0.1" }
-anamnesis-embedder = { path = "crates/embedder", version = "0.0.1", default-features = false }
-anamnesis-search = { path = "crates/search", version = "0.0.1" }
-anamnesis-importer = { path = "crates/importer", version = "0.0.1" }
-anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.1" }
-anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.1" }
-anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.1" }
-anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.1" }
-anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.1", default-features = false }
+anamnesis-core = { path = "crates/core", version = "0.0.2" }
+anamnesis-store = { path = "crates/store", version = "0.0.2" }
+anamnesis-embedder = { path = "crates/embedder", version = "0.0.2", default-features = false }
+anamnesis-search = { path = "crates/search", version = "0.0.2" }
+anamnesis-importer = { path = "crates/importer", version = "0.0.2" }
+anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.2" }
+anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.2" }
+anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.2" }
+anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.2" }
+anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.2", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
