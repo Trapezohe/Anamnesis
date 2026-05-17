@@ -102,12 +102,23 @@ enum Command {
         /// Restrict to one source (adapter id).
         #[arg(long)]
         source: Option<String>,
+        /// Restrict to a specific source instance. Meaningful only when
+        /// `--source` is also set; the SQL key is `(adapter, instance)`.
+        #[arg(long)]
+        instance: Option<String>,
         /// Restrict to one Kind: fact | preference | feedback | reference | episode | skill | unknown.
         #[arg(long)]
         kind: Option<String>,
         /// Restrict to one Scope: user | project | session | ephemeral.
         #[arg(long)]
         scope: Option<String>,
+        /// RFC3339 lower bound on records.created_at (inclusive). E.g.
+        /// `2026-04-01T00:00:00Z`.
+        #[arg(long)]
+        since: Option<String>,
+        /// RFC3339 upper bound on records.created_at (inclusive).
+        #[arg(long)]
+        until: Option<String>,
         /// Result limit.
         #[arg(long, default_value_t = 10)]
         limit: u32,
@@ -320,8 +331,11 @@ async fn main() -> Result<()> {
         Command::Search {
             query,
             source,
+            instance,
             kind,
             scope,
+            since,
+            until,
             limit,
             mode,
             json,
@@ -330,8 +344,11 @@ async fn main() -> Result<()> {
                 &data_dir,
                 &query,
                 source.as_deref(),
+                instance.as_deref(),
                 kind.as_deref(),
                 scope.as_deref(),
+                since.as_deref(),
+                until.as_deref(),
                 limit,
                 &mode,
                 json,
@@ -1362,8 +1379,11 @@ async fn cmd_search(
     data_dir: &std::path::Path,
     query: &str,
     source: Option<&str>,
+    instance: Option<&str>,
     kind: Option<&str>,
     scope: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
     limit: u32,
     mode_str: &str,
     json: bool,
@@ -1382,6 +1402,29 @@ async fn cmd_search(
         Some(s) => Some(parse_scope(s)?),
         None => None,
     };
+    // Round-22 (§-1.5 PR-5): RFC3339 → unix-seconds for the
+    // `SearchFilter.time_from` / `time_to` SQL pushdown. Clap-level
+    // validation (`Option<String>`) keeps the wire ergonomic; the
+    // adapter-level parse error here is what users see if they hand-
+    // type a malformed timestamp.
+    let time_from = match since {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| anyhow!("--since must be RFC3339 (e.g. 2026-04-01T00:00:00Z): {e}"))?
+                .with_timezone(&chrono::Utc)
+                .timestamp(),
+        ),
+        None => None,
+    };
+    let time_to = match until {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| anyhow!("--until must be RFC3339 (e.g. 2026-04-30T23:59:59Z): {e}"))?
+                .with_timezone(&chrono::Utc)
+                .timestamp(),
+        ),
+        None => None,
+    };
 
     // Embedding provider needed for Vector/Hybrid modes.
     let provider = match mode {
@@ -1394,11 +1437,11 @@ async fn cmd_search(
     // their lower-case string form to match how the store writes them.
     let store_filter = anamnesis_store::SearchFilter {
         source: source.map(str::to_owned),
-        instance: None,
+        instance: instance.map(str::to_owned),
         kind: kind_filter.map(|k| format!("{k:?}").to_lowercase()),
         scope: scope_filter.map(|s| format!("{s:?}").to_lowercase()),
-        time_from: None,
-        time_to: None,
+        time_from,
+        time_to,
     };
 
     let hits = run_search(&store, query, &store_filter, limit, mode, provider.as_ref()).await?;
