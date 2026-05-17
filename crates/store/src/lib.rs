@@ -10,7 +10,7 @@
 
 pub mod api;
 
-pub use api::{ChunkHit, PendingEmbeddingJob, StoreStats};
+pub use api::{ChunkHit, PendingEmbeddingJob, SearchFilter, SourceRow, StoreStats};
 
 use std::path::Path;
 

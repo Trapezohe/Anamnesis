@@ -108,6 +108,7 @@ mod tests {
     use anamnesis_core::model::{
         AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
     };
+    use anamnesis_store::SearchFilter;
     use async_trait::async_trait;
     use chrono::Utc;
 
@@ -347,7 +348,12 @@ mod tests {
             .pop()
             .unwrap();
         let hits = store
-            .search_chunks_vec(&alpha_vec, &provider.model_id().0, 2)
+            .search_chunks_vec(
+                &alpha_vec,
+                &provider.model_id().0,
+                &SearchFilter::default(),
+                2,
+            )
             .unwrap();
         assert!(!hits.is_empty());
         assert!((hits[0].score - 1.0).abs() < 1e-6);

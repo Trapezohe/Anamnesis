@@ -123,6 +123,48 @@ pub struct ChunkHit {
     pub score: f64,
 }
 
+/// Filter pushed into the SQL candidate-retrieval stage of `search_chunks_*`.
+///
+/// **All fields go into the SQL `WHERE` clause before `LIMIT` is applied**,
+/// so they shape the candidate pool itself — never just trim a pre-built
+/// majority pool after the fact. This is the load-bearing fix from
+/// BLUEPRINT §17.5 PR-C: with thousands of records from one adapter and a
+/// handful from another, post-filter shrinkage can leave the minority
+/// adapter's results empty even when they're the best match.
+///
+/// Empty filter (all fields `None`) is a no-op — the original
+/// `WHERE chunks_fts MATCH ?` / `WHERE e.model_id = ?` is preserved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilter {
+    /// Adapter id (e.g. `"claude-code"`, `"mem0"`). When set, only chunks
+    /// belonging to records from this adapter survive.
+    pub source: Option<String>,
+    /// Instance discriminator. Only meaningful when `source` is also set
+    /// (the SQL key is `(adapter, instance)`).
+    pub instance: Option<String>,
+    /// `Kind` string: `"fact"` / `"preference"` / `"feedback"` / `"reference"`
+    /// / `"episode"` / `"skill"` / `"unknown"`.
+    pub kind: Option<String>,
+    /// `Scope` string: `"user"` / `"project"` / `"session"` / `"ephemeral"`.
+    pub scope: Option<String>,
+    /// Inclusive lower bound on `records.created_at` (unix epoch seconds).
+    pub time_from: Option<i64>,
+    /// Inclusive upper bound on `records.created_at` (unix epoch seconds).
+    pub time_to: Option<i64>,
+}
+
+impl SearchFilter {
+    /// True when every field is `None` — caller can skip the JOIN.
+    pub fn is_empty(&self) -> bool {
+        self.source.is_none()
+            && self.instance.is_none()
+            && self.kind.is_none()
+            && self.scope.is_none()
+            && self.time_from.is_none()
+            && self.time_to.is_none()
+    }
+}
+
 /// A claimed embedding job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingEmbeddingJob {
@@ -563,18 +605,42 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnamnesisRecord>
 impl Store {
     /// FTS5 chunk search. Returns hits ordered by BM25 (lower rank = better);
     /// `score` is the bm25() value (negated so larger = more relevant).
-    pub fn search_chunks_fts(&self, query: &str, limit: u32) -> Result<Vec<ChunkHit>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
+    pub fn search_chunks_fts(
+        &self,
+        query: &str,
+        filter: &SearchFilter,
+        limit: u32,
+    ) -> Result<Vec<ChunkHit>> {
+        // Build the SQL + bound parameters together — the candidate pool
+        // is filtered BEFORE the `LIMIT` truncates it.
+        // The first two bound params are always (query, limit); filter
+        // params start at index 3 in declaration order below.
+        // All placeholders are anonymous `?`. SQLite forbids mixing
+        // numbered (`?1`) and unnumbered placeholders within one
+        // statement, which is exactly what would happen if we kept the
+        // pre-PR-C `?1` MATCH placeholder and appended `?` filter
+        // predicates after it.
+        let mut sql = String::from(
             "SELECT rc.id, rc.record_id, rc.seq, rc.content, bm25(chunks_fts) AS score \
              FROM chunks_fts \
-             JOIN record_chunks rc ON rc.rowid = chunks_fts.rowid \
-             WHERE chunks_fts MATCH ?1 \
-             ORDER BY score \
-             LIMIT ?2",
-        )?;
+             JOIN record_chunks rc ON rc.rowid = chunks_fts.rowid",
+        );
+        let need_records_join = !filter.is_empty();
+        if need_records_join {
+            sql.push_str(" JOIN records r ON r.id = rc.record_id");
+        }
+        sql.push_str(" WHERE chunks_fts MATCH ?");
+        let filter_params = append_filter_predicates(&mut sql, filter);
+        sql.push_str(" ORDER BY score LIMIT ?");
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(2 + filter_params.len());
+        bound.push(rusqlite::types::Value::Text(query.to_string()));
+        bound.extend(filter_params);
+        bound.push(rusqlite::types::Value::Integer(limit as i64));
         let rows = stmt
-            .query_map(params![query, limit], |r| {
+            .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
                 let raw_score: f64 = r.get(4)?;
                 Ok(ChunkHit {
                     chunk_id: r.get(0)?,
@@ -591,21 +657,41 @@ impl Store {
     /// Linear-scan vector search over `chunk_embeddings` filtered by
     /// `model_id`. Acceptable for Phase-1 corpora (<100k chunks per
     /// BLUEPRINT §12). sqlite-vec swap-in lives behind the same API.
+    ///
+    /// `filter` is pushed into the SQL `WHERE` (joined against
+    /// `record_chunks` → `records`) so the cosine pass only scores
+    /// candidates that already match — this matters at 1700+:7
+    /// distributions where any post-filter would leave the minority
+    /// adapter empty.
     pub fn search_chunks_vec(
         &self,
         query_vec: &[f32],
         model_id: &str,
+        filter: &SearchFilter,
         limit: u32,
     ) -> Result<Vec<ChunkHit>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT e.chunk_id, e.embedding, rc.record_id, rc.seq, rc.content \
              FROM chunk_embeddings e \
-             JOIN record_chunks rc ON rc.id = e.chunk_id \
-             WHERE e.model_id = ?1",
-        )?;
+             JOIN record_chunks rc ON rc.id = e.chunk_id",
+        );
+        let need_records_join = !filter.is_empty();
+        if need_records_join {
+            sql.push_str(" JOIN records r ON r.id = rc.record_id");
+        }
+        sql.push_str(" WHERE e.model_id = ?");
+        let filter_params = append_filter_predicates(&mut sql, filter);
+        // No LIMIT on the SQL — we still have to score every survivor; the
+        // top-k cut happens in Rust after cosine. But the survivor set is
+        // now bounded by the filter, not by the entire embedding table.
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + filter_params.len());
+        bound.push(rusqlite::types::Value::Text(model_id.to_string()));
+        bound.extend(filter_params);
         let mut scored: Vec<ChunkHit> = Vec::new();
-        let rows = stmt.query_map(params![model_id], |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Vec<u8>>(1)?,
@@ -634,6 +720,49 @@ impl Store {
         scored.truncate(limit as usize);
         Ok(scored)
     }
+}
+
+/// Append filter predicates to `sql` and return the bound parameters in
+/// declaration order. Caller decides where in their param stream these
+/// land — they're given as positional values via `params_from_iter`.
+///
+/// Predicates use `r.<col>`, requiring the caller to have already added
+/// `JOIN records r ON r.id = rc.record_id` (we don't add it here so the
+/// SQL builder owns join shape).
+fn append_filter_predicates(
+    sql: &mut String,
+    filter: &SearchFilter,
+) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value as V;
+    let mut params: Vec<V> = Vec::new();
+    if let Some(s) = &filter.source {
+        sql.push_str(" AND r.adapter = ?");
+        params.push(V::Text(s.clone()));
+    }
+    if let Some(i) = &filter.instance {
+        // BLUEPRINT §18 trap: `records.instance` is NOT NULL DEFAULT ''.
+        // We normalise the *empty / None* case to `''` so SQL key lookup
+        // never misses, mirroring the sources-registry handling in PR-B.
+        sql.push_str(" AND r.instance = ?");
+        params.push(V::Text(i.clone()));
+    }
+    if let Some(k) = &filter.kind {
+        sql.push_str(" AND r.kind = ?");
+        params.push(V::Text(k.clone()));
+    }
+    if let Some(sc) = &filter.scope {
+        sql.push_str(" AND r.scope = ?");
+        params.push(V::Text(sc.clone()));
+    }
+    if let Some(from) = filter.time_from {
+        sql.push_str(" AND r.created_at >= ?");
+        params.push(V::Integer(from));
+    }
+    if let Some(to) = filter.time_to {
+        sql.push_str(" AND r.created_at <= ?");
+        params.push(V::Integer(to));
+    }
+    params
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1002,9 +1131,13 @@ mod tests {
             .unwrap();
         assert_eq!(chunk_count as usize, c2.len());
         // FTS index should match v2 content, not v1.
-        let hits = store.search_chunks_fts("different", 5).unwrap();
+        let hits = store
+            .search_chunks_fts("different", &SearchFilter::default(), 5)
+            .unwrap();
         assert!(!hits.is_empty());
-        let stale = store.search_chunks_fts("v1", 5).unwrap();
+        let stale = store
+            .search_chunks_fts("v1", &SearchFilter::default(), 5)
+            .unwrap();
         assert!(stale.is_empty());
     }
 
@@ -1019,10 +1152,142 @@ mod tests {
         );
         let c = Chunker::default().chunk(&r.id, &r.content);
         store.upsert_record(&r, &c, None).unwrap();
-        let hits = store.search_chunks_fts("quick fox", 5).unwrap();
+        let hits = store
+            .search_chunks_fts("quick fox", &SearchFilter::default(), 5)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, r.id);
         assert!(hits[0].score > 0.0);
+    }
+
+    // ─── PR-C: candidate-side filter pushdown ───
+    //
+    // Codex's acceptance assertion (BLUEPRINT §17.5 PR-C consult):
+    //
+    //   "Construct 1744 claude-code records + 7 mem0 records sharing
+    //    one query term; `source=mem0` must return non-empty results,
+    //    all from mem0, even with a candidate-pool limit smaller than
+    //    the claude-code majority."
+    //
+    // If filter pushdown is wrong, FTS picks the top-pool by BM25
+    // unfiltered → the pool fills with claude-code chunks → post-filter
+    // shrinks to zero. The whole point of pushdown is that the SQL
+    // recall stage drops claude-code BEFORE the limit applies.
+
+    #[test]
+    fn filter_pushdown_returns_minority_source_under_majority_dominance() {
+        let store = Store::open_in_memory().unwrap();
+        // 1744 claude-code records (every one matches "sharedterm").
+        for i in 0..1744u32 {
+            let r = make_record(
+                "claude-code",
+                &format!("cc-{i:04}"),
+                "sharedterm claude noise",
+                Kind::Episode,
+            );
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+        // 7 mem0 records, all matching the same term.
+        for i in 0..7u32 {
+            let r = make_record(
+                "mem0",
+                &format!("m0-{i}"),
+                "sharedterm mem0 fact",
+                Kind::Fact,
+            );
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+
+        // With NO filter, the pool of 50 is dominated by claude-code.
+        let none = store
+            .search_chunks_fts("sharedterm", &SearchFilter::default(), 50)
+            .unwrap();
+        assert_eq!(none.len(), 50, "unfiltered hits fill the pool");
+        let mem0_in_unfiltered = none
+            .iter()
+            .filter(|h| h.content.contains("mem0 fact"))
+            .count();
+        assert!(
+            mem0_in_unfiltered <= 7,
+            "without pushdown, the 7 mem0 records are squeezed by the 1744 claude-code majority"
+        );
+
+        // WITH source=mem0 pushed into SQL, the pool is drawn from mem0
+        // chunks only — even at the same pool size of 50.
+        let filter = SearchFilter {
+            source: Some("mem0".into()),
+            ..SearchFilter::default()
+        };
+        let mem0_hits = store.search_chunks_fts("sharedterm", &filter, 50).unwrap();
+        assert!(
+            !mem0_hits.is_empty(),
+            "source=mem0 must return non-empty results from the minority adapter"
+        );
+        assert_eq!(
+            mem0_hits.len(),
+            7,
+            "filter pushdown must surface all 7 mem0 chunks, not zero"
+        );
+        for h in &mem0_hits {
+            assert!(
+                h.content.contains("mem0 fact"),
+                "every hit must come from the mem0 adapter, not the claude-code majority"
+            );
+            assert!(
+                !h.content.contains("claude noise"),
+                "no claude-code chunk should leak through the SQL filter"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_pushdown_supports_kind_and_scope_independently() {
+        let store = Store::open_in_memory().unwrap();
+        for (na, content, kind) in &[
+            ("a", "shared topic alpha", Kind::Fact),
+            ("b", "shared topic beta", Kind::Preference),
+            ("c", "shared topic gamma", Kind::Feedback),
+        ] {
+            let r = make_record("claude-code", na, content, *kind);
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+        let kind_filter = SearchFilter {
+            kind: Some("preference".into()),
+            ..SearchFilter::default()
+        };
+        let hits = store
+            .search_chunks_fts("shared topic", &kind_filter, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("beta"));
+    }
+
+    #[test]
+    fn filter_pushdown_respects_time_range() {
+        let store = Store::open_in_memory().unwrap();
+        // Manually crafted records at known timestamps.
+        for (na, content, ts) in &[
+            ("old", "shared topic", 1700000000_i64), // 2023-11
+            ("mid", "shared topic", 1750000000_i64), // 2025-06
+            ("new", "shared topic", 1800000000_i64), // 2027-01
+        ] {
+            let mut r = make_record("claude-code", na, content, Kind::Episode);
+            r.created_at = Utc.timestamp_opt(*ts, 0).unwrap();
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+        let filter = SearchFilter {
+            time_from: Some(1720000000),
+            time_to: Some(1780000000),
+            ..SearchFilter::default()
+        };
+        let hits = store
+            .search_chunks_fts("shared topic", &filter, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "only the mid record falls in the window");
     }
 
     #[test]
@@ -1099,7 +1364,12 @@ mod tests {
 
         // Vector search must now find this chunk.
         let hits = store
-            .search_chunks_vec(&[0.5, 0.5, 0.5, 0.5], "local:fake:1", 5)
+            .search_chunks_vec(
+                &[0.5, 0.5, 0.5, 0.5],
+                "local:fake:1",
+                &SearchFilter::default(),
+                5,
+            )
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!((hits[0].score - 1.0).abs() < 1e-9);
