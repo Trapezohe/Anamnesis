@@ -221,6 +221,22 @@ pub struct SourceRow {
     pub last_import_at: Option<i64>,
 }
 
+/// Source row joined with its current per-source counts. Returned by
+/// `list_sources_with_counts`; consumed by MCP `list_sources` and CLI
+/// `source list` so agents and operators see how much data is behind
+/// each registered source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceWithCounts {
+    /// The source registry row itself.
+    pub source: SourceRow,
+    /// Number of distinct records currently in the store for this
+    /// `(adapter, instance)` pair. `0` for a registered-but-never-imported
+    /// source — that's a useful staleness signal, not a defect.
+    pub record_count: u64,
+    /// Number of chunks across all records for this source.
+    pub chunk_count: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source registry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,6 +327,54 @@ impl Store {
                     config_json: r.get(3)?,
                     added_at: r.get(4)?,
                     last_import_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Like `list_sources_full` but also carries per-source record /
+    /// chunk counts so MCP consumers can answer "is this source stale?"
+    /// and "how much data lives behind it?" without a second round
+    /// trip.
+    ///
+    /// Counts are computed via `LEFT JOIN`, so a source that's been
+    /// registered but has never produced records still appears with
+    /// counts of zero — which is exactly the signal an agent needs to
+    /// detect a configured-but-broken adapter.
+    ///
+    /// Aggregation is grouped on `(adapter, instance)` because the
+    /// canonical key in the `sources` table uses `instance=''` for the
+    /// default instance. Grouping on `adapter` alone would silently
+    /// merge multiple instances of the same adapter into one row.
+    pub fn list_sources_with_counts(&self) -> Result<Vec<SourceWithCounts>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.adapter, s.instance, s.location, s.config_json, \
+                    s.added_at, s.last_import_at, \
+                    COUNT(DISTINCT r.id) AS record_count, \
+                    COUNT(rc.id)         AS chunk_count \
+             FROM sources s \
+             LEFT JOIN records r \
+                    ON r.adapter = s.adapter AND r.instance = s.instance \
+             LEFT JOIN record_chunks rc \
+                    ON rc.record_id = r.id \
+             GROUP BY s.adapter, s.instance \
+             ORDER BY s.adapter, s.instance",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SourceWithCounts {
+                    source: SourceRow {
+                        adapter: r.get(0)?,
+                        instance: r.get(1)?,
+                        location: r.get(2)?,
+                        config_json: r.get(3)?,
+                        added_at: r.get(4)?,
+                        last_import_at: r.get(5)?,
+                    },
+                    record_count: r.get::<_, i64>(6)? as u64,
+                    chunk_count: r.get::<_, i64>(7)? as u64,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1149,6 +1213,111 @@ mod tests {
         assert_eq!(mem0.instance, "");
         assert!(mem0.location.is_none());
         assert!(mem0.last_import_at.is_none());
+    }
+
+    // ─── Round-9: list_sources_with_counts (per-source aggregation) ───
+
+    #[test]
+    fn list_sources_with_counts_includes_zero_for_never_imported_source() {
+        // Codex acceptance: a source that's been registered but has no
+        // records yet must STILL appear with record_count/chunk_count = 0.
+        // This is the "registered but stale / never imported" signal an
+        // agent needs to detect a misconfigured adapter.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", None, Some("/tmp/missing.db"), None)
+            .unwrap();
+        let rows = store.list_sources_with_counts().unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.source.adapter, "mem0");
+        assert_eq!(r.record_count, 0);
+        assert_eq!(r.chunk_count, 0);
+        assert!(r.source.last_import_at.is_none());
+    }
+
+    #[test]
+    fn list_sources_with_counts_aggregates_records_and_chunks_per_source() {
+        // Two sources, different shape:
+        //   claude-code  (default instance): 3 records, 3 chunks
+        //   mem0         (instance="prod"):  1 record,  1 chunk
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", None, Some("/c"), None)
+            .unwrap();
+        store
+            .register_source("mem0", Some("prod"), Some("/m"), None)
+            .unwrap();
+
+        for native in ["a", "b", "c"] {
+            let r = make_record("claude-code", native, "x", Kind::Fact);
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+        // Note: make_record sets instance=None, which is stored as "".
+        // We need a "claude-code"/"" row to match the records above —
+        // the register_source(None, ...) call already did that.
+
+        // For mem0 we need a record under instance="prod" so the JOIN
+        // hits the right source row. Build it manually.
+        let mut mem_r = make_record("mem0", "m1", "y", Kind::Fact);
+        mem_r.source.instance = Some("prod".into());
+        mem_r.id = RecordId::from_parts("mem0", Some("prod"), "m1");
+        let mem_c = Chunker::default().chunk(&mem_r.id, &mem_r.content);
+        store.upsert_record(&mem_r, &mem_c, None).unwrap();
+
+        let rows = store.list_sources_with_counts().unwrap();
+        assert_eq!(rows.len(), 2);
+        let cc = rows
+            .iter()
+            .find(|r| r.source.adapter == "claude-code")
+            .unwrap();
+        assert_eq!(
+            cc.source.instance, "",
+            "default instance kept as empty string"
+        );
+        assert_eq!(cc.record_count, 3);
+        assert_eq!(cc.chunk_count, 3);
+        let mem = rows.iter().find(|r| r.source.adapter == "mem0").unwrap();
+        assert_eq!(
+            mem.source.instance, "prod",
+            "instance must round-trip through the JOIN"
+        );
+        assert_eq!(mem.record_count, 1);
+        assert_eq!(mem.chunk_count, 1);
+    }
+
+    #[test]
+    fn list_sources_with_counts_groups_by_adapter_and_instance_not_just_adapter() {
+        // Trap Codex flagged: grouping by adapter alone would collapse
+        // (mem0, "self-hosted") and (mem0, "cloud") into one row even
+        // when they have different counts. Pin the right behavior here.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", Some("self-hosted"), Some("/local"), None)
+            .unwrap();
+        store
+            .register_source("mem0", Some("cloud"), Some("https://x"), None)
+            .unwrap();
+
+        // 2 records under "self-hosted", 0 under "cloud".
+        for native in ["x", "y"] {
+            let mut r = make_record("mem0", native, "z", Kind::Fact);
+            r.source.instance = Some("self-hosted".into());
+            r.id = RecordId::from_parts("mem0", Some("self-hosted"), native);
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+
+        let rows = store.list_sources_with_counts().unwrap();
+        assert_eq!(rows.len(), 2, "two distinct (adapter, instance) rows");
+        let local = rows
+            .iter()
+            .find(|r| r.source.instance == "self-hosted")
+            .unwrap();
+        assert_eq!(local.record_count, 2);
+        let cloud = rows.iter().find(|r| r.source.instance == "cloud").unwrap();
+        assert_eq!(cloud.record_count, 0);
     }
 
     #[test]

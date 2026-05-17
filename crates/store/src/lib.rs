@@ -11,7 +11,9 @@
 pub mod api;
 pub mod cjk;
 
-pub use api::{ChunkHit, PendingEmbeddingJob, SearchFilter, SourceRow, StoreStats};
+pub use api::{
+    ChunkHit, PendingEmbeddingJob, SearchFilter, SourceRow, SourceWithCounts, StoreStats,
+};
 
 use std::path::Path;
 

@@ -363,12 +363,27 @@ impl AnamnesisServer {
     async fn tool_list_sources(&self) -> Result<Value, String> {
         let store = &self.store;
         let stats = store.stats().map_err(|e| format!("stats: {e}"))?;
-        let rows = store.list_sources().map_err(|e| format!("list: {e}"))?;
+        // Round-9: per-source counts + last_import_at let an agent
+        // distinguish "bad retrieval" from "stale source" without a
+        // second round trip. LEFT JOIN means registered-but-empty
+        // sources still appear (record_count=0) — which is the signal
+        // the agent needs to detect a misconfigured adapter.
+        let rows = store
+            .list_sources_with_counts()
+            .map_err(|e| format!("list: {e}"))?;
         Ok(json!({
-            "sources": rows.iter().map(|(adapter, instance, location)| json!({
-                "adapter": adapter,
-                "instance": if instance.is_empty() { Value::Null } else { Value::String(instance.clone()) },
-                "location": location,
+            "sources": rows.iter().map(|r| json!({
+                "adapter": r.source.adapter,
+                "instance": if r.source.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(r.source.instance.clone())
+                },
+                "location": r.source.location,
+                "added_at": r.source.added_at,
+                "last_import_at": r.source.last_import_at,
+                "record_count": r.record_count,
+                "chunk_count": r.chunk_count,
             })).collect::<Vec<_>>(),
             "active_model": store.active_model().ok().flatten(),
             "stats": {
@@ -1080,6 +1095,109 @@ mod tests {
         let structured = &result["structuredContent"];
         let sources = structured["sources"].as_array().unwrap();
         assert!(sources.iter().any(|s| s["adapter"] == "claude-code"));
+        assert_eq!(structured["stats"]["records"], 1);
+    }
+
+    /// Round-9: pin the wire format an MCP agent receives from
+    /// `list_sources`. Each source object must carry the staleness +
+    /// volume signal an agent needs to decide "query this source vs.
+    /// flag it as misconfigured".
+    #[tokio::test]
+    async fn list_sources_wire_format_carries_counts_and_staleness() {
+        // We build the store explicitly here (not via server_with_records)
+        // so the record's `instance` and the registered source's
+        // `instance` agree — that's what real adapters / the CLI do
+        // (PR-#9 source-registry-canonical-import landed this).
+        let store = Store::open_in_memory().unwrap();
+        let r = AnamnesisRecord {
+            id: RecordId::from_parts("claude-code", None, "x"),
+            source: SourceDescriptor {
+                adapter: "claude-code".into(),
+                instance: None,
+                version: "0.0.1".into(),
+            },
+            content: "alpha beta gamma".into(),
+            embedding: None,
+            scope: Scope::User,
+            kind: Kind::Fact,
+            created_at: chrono::Utc.timestamp_opt(1700000000, 0).unwrap(),
+            updated_at: None,
+            tags: vec![],
+            metadata: Default::default(),
+            provenance: Provenance {
+                native_id: "x".into(),
+                native_path: None,
+                captured_at: chrono::Utc.timestamp_opt(1700000000, 0).unwrap(),
+                raw_hash: "h-wire".into(),
+            },
+            schema_version: anamnesis_core::SCHEMA_VERSION,
+        };
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        // Default instance (None) → stored as "" in the sources table,
+        // matching record.instance and producing a JOIN-hit.
+        store
+            .register_source("claude-code", None, Some("/tmp/x"), None)
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+
+        let resp = s
+            .handle(req("tools/call", json!({"name": "list_sources"})))
+            .await;
+        let result = resp.result.unwrap();
+        let structured = &result["structuredContent"];
+        let sources = structured["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+
+        // All seven required wire-format keys.
+        for key in [
+            "adapter",
+            "instance",
+            "location",
+            "added_at",
+            "last_import_at",
+            "record_count",
+            "chunk_count",
+        ] {
+            assert!(
+                source.get(key).is_some(),
+                "missing wire field {key:?} in list_sources response"
+            );
+        }
+
+        // Specific shapes.
+        assert_eq!(source["adapter"], "claude-code");
+        // Codex acceptance #3: a default instance (stored as "" in SQL)
+        // must serialize as JSON null on the wire — the empty string
+        // is an SQL implementation detail, not part of the agent
+        // contract.
+        assert_eq!(
+            source["instance"],
+            Value::Null,
+            "default instance must serialize as JSON null, not empty string"
+        );
+        assert!(source["added_at"].as_i64().is_some());
+        assert_eq!(
+            source["record_count"], 1,
+            "the seeded record must be counted under its registered source"
+        );
+        assert!(
+            source["chunk_count"].as_u64().unwrap() >= 1,
+            "alpha beta gamma must produce at least one chunk"
+        );
+
+        // last_import_at remains null until the source has actually
+        // been imported (the test seeded register_source manually
+        // without calling update_last_import_at). This pins Codex's
+        // acceptance #3 in the wire layer.
+        assert_eq!(
+            source["last_import_at"],
+            Value::Null,
+            "registered-but-never-imported source must report null last_import_at"
+        );
+
+        // Stats block still present + correct (back-compat).
         assert_eq!(structured["stats"]["records"], 1);
     }
 
