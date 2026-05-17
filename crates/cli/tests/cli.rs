@@ -578,3 +578,241 @@ fn search_json_mode_emits_parseable_json() {
     assert_eq!(parsed["mode"], "fulltext");
     assert!(parsed["results"].is_array());
 }
+
+// ─── PR-B: source registry is the canonical truth for import ───
+
+fn seed_mem0_db(path: &std::path::Path, rows: &[(&str, &str)]) {
+    use rusqlite::Connection;
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL, user_id TEXT);",
+    )
+    .unwrap();
+    for (id, mem) in rows {
+        conn.execute(
+            "INSERT INTO memories(id, memory) VALUES(?1, ?2)",
+            [*id, *mem],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn import_auto_registers_source_when_path_override_used() {
+    // No `source add` first — import must auto-register the location
+    // it actually used so `status` / `source list` stay truthful.
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("m.sqlite");
+    seed_mem0_db(&mem0_db, &[("a", "alpha")]);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["stats"]["sources"].as_u64(),
+        Some(1),
+        "stats.sources must reach 1 after a successful import"
+    );
+    let sources = payload["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["adapter"], "mem0");
+    assert_eq!(
+        sources[0]["location"].as_str(),
+        Some(mem0_db.to_str().unwrap()),
+        "registered location must equal the --path that was used"
+    );
+    assert!(
+        sources[0]["last_import_at"].as_i64().is_some(),
+        "last_import_at must be non-null after a successful non-dry-run import"
+    );
+}
+
+#[test]
+fn dry_run_import_does_not_touch_registry() {
+    // dry-run is read-only — must NOT write to sources or update timestamps.
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("m.sqlite");
+    seed_mem0_db(&mem0_db, &[("a", "x")]);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--dry-run",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("dry-run"));
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["stats"]["sources"].as_u64(),
+        Some(0),
+        "dry-run must leave the source registry untouched"
+    );
+}
+
+#[test]
+fn import_uses_registered_location_when_no_path_given() {
+    // The Codex acceptance criterion: register path A, run plain
+    // `import mem0` (no --path), and only A's rows must show up.
+    let dir = tmp_dir();
+    let db_a = dir.path().join("registered.sqlite");
+    let db_b = dir.path().join("other.sqlite");
+    seed_mem0_db(&db_a, &[("a", "alpha from A")]);
+    seed_mem0_db(&db_b, &[("b", "beta from B")]);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", db_a.to_str().unwrap()])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["import", "mem0", "--no-embed"])
+        .assert()
+        .success()
+        .stdout(contains("1 upserted"));
+    // Search should find alpha (from A) but not beta (from B).
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "alpha", "--mode", "fulltext"])
+        .assert()
+        .success()
+        .stdout(contains("alpha"));
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "beta", "--mode", "fulltext"])
+        .assert()
+        .success()
+        .stdout(contains("no results").or(contains("0 hit")));
+}
+
+#[test]
+fn explicit_path_overwrites_registered_location() {
+    // PR-B: --path is trusted override; the registry catches up to it.
+    let dir = tmp_dir();
+    let db_a = dir.path().join("first.sqlite");
+    let db_b = dir.path().join("second.sqlite");
+    seed_mem0_db(&db_a, &[("a", "first")]);
+    seed_mem0_db(&db_b, &[("b", "second")]);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", db_a.to_str().unwrap()])
+        .assert()
+        .success();
+    // --path B overrides registered A and rewrites the registry.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            db_b.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = payload["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "still exactly one row, not two");
+    assert_eq!(
+        sources[0]["location"].as_str(),
+        Some(db_b.to_str().unwrap()),
+        "explicit --path must overwrite the registered location"
+    );
+}
+
+#[test]
+fn double_import_keeps_one_source_row_and_advances_timestamp() {
+    // Idempotency check — a second import on the same source must NOT
+    // produce a second row.
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("m.sqlite");
+    seed_mem0_db(&mem0_db, &[("a", "x")]);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    for _ in 0..2 {
+        cli()
+            .env("ANAMNESIS_DATA_DIR", dir.path())
+            .args([
+                "import",
+                "mem0",
+                "--no-embed",
+                "--path",
+                mem0_db.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    }
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["stats"]["sources"].as_u64(),
+        Some(1),
+        "exactly one source row across repeated imports"
+    );
+    assert!(
+        payload["sources"][0]["last_import_at"].as_i64().is_some(),
+        "last_import_at non-null"
+    );
+}

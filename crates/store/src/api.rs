@@ -153,12 +153,42 @@ pub struct StoreStats {
     pub sources: u64,
 }
 
+/// Full row from `sources` — what `list_sources_full` and `get_source`
+/// return. The legacy `list_sources` 3-tuple shape stays for back-compat.
+///
+/// `instance` is the empty string `""` (NOT `None`) to represent the
+/// default instance — that's the canonical key the table uses (see
+/// `0002_phase1.sql`). Callers that work in `Option<String>` must convert
+/// at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRow {
+    /// Adapter id (e.g. `"claude-code"`).
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// User-registered location (path / URL / connection string). `None`
+    /// when registered without one — `import` will fall back to the
+    /// adapter default and register that as the canonical location.
+    pub location: Option<String>,
+    /// JSON-encoded adapter-specific config, opaque to the store.
+    pub config_json: Option<String>,
+    /// Unix epoch seconds — when the source was first registered.
+    pub added_at: i64,
+    /// Unix epoch seconds — when the last successful (non-dry-run)
+    /// import finished. `None` until the first import lands.
+    pub last_import_at: Option<i64>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source registry
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl Store {
     /// Register or update a memory source. Idempotent.
+    ///
+    /// `instance = None` is stored as the empty string `""` because the
+    /// `sources` table uses NOT NULL DEFAULT '' on that column; matching
+    /// against `NULL` would silently miss the row.
     pub fn register_source(
         &self,
         adapter: &str,
@@ -176,6 +206,73 @@ impl Store {
             params![adapter, inst, location, config_json],
         )?;
         Ok(())
+    }
+
+    /// Look up a single source row by `(adapter, instance)`.
+    ///
+    /// Returns `None` if no row exists. `instance = None` is normalised to
+    /// the empty string for the lookup (see `register_source` rationale).
+    pub fn get_source(&self, adapter: &str, instance: Option<&str>) -> Result<Option<SourceRow>> {
+        let inst = instance.unwrap_or("");
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT adapter, instance, location, config_json, added_at, last_import_at \
+                 FROM sources WHERE adapter = ?1 AND instance = ?2",
+                params![adapter, inst],
+                |r| {
+                    Ok(SourceRow {
+                        adapter: r.get(0)?,
+                        instance: r.get(1)?,
+                        location: r.get(2)?,
+                        config_json: r.get(3)?,
+                        added_at: r.get(4)?,
+                        last_import_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Stamp `last_import_at` for a source.
+    ///
+    /// Returns `Ok(true)` when the source existed and was updated, `Ok(false)`
+    /// when no matching row exists (the caller should usually
+    /// `register_source` first so this can never be `false` on the happy
+    /// path).
+    pub fn update_last_import_at(&self, adapter: &str, instance: Option<&str>) -> Result<bool> {
+        let inst = instance.unwrap_or("");
+        let n = self.conn.lock().execute(
+            "UPDATE sources SET last_import_at = strftime('%s','now') \
+             WHERE adapter = ?1 AND instance = ?2",
+            params![adapter, inst],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Like `list_sources` but returns the full row shape including
+    /// `added_at` and `last_import_at`. Newer code should prefer this; the
+    /// 3-tuple `list_sources` stays for back-compat with existing callers.
+    pub fn list_sources_full(&self) -> Result<Vec<SourceRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT adapter, instance, location, config_json, added_at, last_import_at \
+             FROM sources ORDER BY adapter, instance",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SourceRow {
+                    adapter: r.get(0)?,
+                    instance: r.get(1)?,
+                    location: r.get(2)?,
+                    config_json: r.get(3)?,
+                    added_at: r.get(4)?,
+                    last_import_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Forget a source. Does NOT cascade-delete records (those keep their
@@ -754,6 +851,115 @@ mod tests {
                 ("mem0".into(), "".into(), Some("/tmp/m.db".into())),
             ]
         );
+    }
+
+    // ─── PR-B: SourceRow / get_source / update_last_import_at ───
+
+    #[test]
+    fn get_source_normalises_none_instance_to_empty_string() {
+        // Codex-flagged gotcha: `sources.instance` is NOT NULL DEFAULT ''.
+        // If callers pass instance=None and we lookup with SQL NULL, the
+        // row will never be found → silent re-registration. Verify
+        // get_source matches the same row register_source(None, ...) wrote.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", None, Some("/path/db.sqlite"), None)
+            .unwrap();
+        let row = store.get_source("mem0", None).unwrap();
+        let row = row.expect("instance=None must round-trip via get_source");
+        assert_eq!(row.adapter, "mem0");
+        assert_eq!(row.instance, "", "default instance stored as empty string");
+        assert_eq!(row.location.as_deref(), Some("/path/db.sqlite"));
+        assert!(row.last_import_at.is_none());
+        // Also: Some("") should not be treated as a distinct instance.
+        let row_via_empty = store.get_source("mem0", Some("")).unwrap();
+        assert!(row_via_empty.is_some(), "Some(\"\") must hit same row");
+    }
+
+    #[test]
+    fn get_source_returns_none_for_unregistered() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.get_source("claude-code", None).unwrap().is_none());
+        assert!(store
+            .get_source("mem0", Some("nonexistent-instance"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn update_last_import_at_stamps_existing_row() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", None, Some("/p"), None)
+            .unwrap();
+        assert!(store
+            .get_source("claude-code", None)
+            .unwrap()
+            .unwrap()
+            .last_import_at
+            .is_none());
+        let updated = store.update_last_import_at("claude-code", None).unwrap();
+        assert!(updated, "update returns true when a row was stamped");
+        let row = store.get_source("claude-code", None).unwrap().unwrap();
+        assert!(
+            row.last_import_at.is_some(),
+            "last_import_at must be non-null after a successful update"
+        );
+    }
+
+    #[test]
+    fn update_last_import_at_for_missing_row_returns_false() {
+        let store = Store::open_in_memory().unwrap();
+        let updated = store.update_last_import_at("claude-code", None).unwrap();
+        assert!(
+            !updated,
+            "no matching source row → returns Ok(false) without inserting"
+        );
+        assert!(store.list_sources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn register_source_is_idempotent_keeps_added_at_stable() {
+        // The trap: a second register_source must NOT insert a new row.
+        // ON CONFLICT keeps added_at fixed (it's only set in INSERT).
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", None, Some("/path/A"), None)
+            .unwrap();
+        let row1 = store.get_source("mem0", None).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        store
+            .register_source("mem0", None, Some("/path/B"), None)
+            .unwrap();
+        let rows = store.list_sources().unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate rows");
+        let row2 = store.get_source("mem0", None).unwrap().unwrap();
+        assert_eq!(row1.added_at, row2.added_at, "added_at stays stable");
+        assert_eq!(row2.location.as_deref(), Some("/path/B"));
+    }
+
+    #[test]
+    fn list_sources_full_carries_all_fields() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", Some("work"), Some("/work"), Some("{}"))
+            .unwrap();
+        store
+            .update_last_import_at("claude-code", Some("work"))
+            .unwrap();
+        store.register_source("mem0", None, None, None).unwrap(); // location=None is valid
+
+        let rows = store.list_sources_full().unwrap();
+        assert_eq!(rows.len(), 2);
+        let cc = rows.iter().find(|r| r.adapter == "claude-code").unwrap();
+        assert_eq!(cc.instance, "work");
+        assert_eq!(cc.location.as_deref(), Some("/work"));
+        assert_eq!(cc.config_json.as_deref(), Some("{}"));
+        assert!(cc.last_import_at.is_some());
+        let mem0 = rows.iter().find(|r| r.adapter == "mem0").unwrap();
+        assert_eq!(mem0.instance, "");
+        assert!(mem0.location.is_none());
+        assert!(mem0.last_import_at.is_none());
     }
 
     #[test]
