@@ -134,6 +134,7 @@ version = "0.0.1"
 dependencies = [
  "anamnesis-adapter-claude-code",
  "anamnesis-adapter-codex",
+ "anamnesis-adapter-generic-mcp",
  "anamnesis-adapter-mem0",
  "anamnesis-core",
  "anamnesis-embedder",

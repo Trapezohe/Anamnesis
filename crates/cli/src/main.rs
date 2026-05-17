@@ -156,15 +156,28 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum SourceCmd {
     /// Register a new source.
+    ///
+    /// File-based adapters take `--path`. URL-based adapters (e.g.
+    /// `generic-mcp`) take `--url` and optionally `--token-env`.
     Add {
-        /// Adapter name (e.g. `claude-code`, `mem0`).
+        /// Adapter name (e.g. `claude-code`, `mem0`, `codex`, `generic-mcp`).
         adapter: String,
         /// Instance discriminator (optional).
         #[arg(long)]
         instance: Option<String>,
         /// Filesystem path, if the adapter takes one.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "url")]
         path: Option<PathBuf>,
+        /// Upstream URL, for URL-based adapters like `generic-mcp`
+        /// (e.g. `http://127.0.0.1:7878`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Name of the environment variable holding the bearer token
+        /// for URL-based adapters. The value is resolved at import time,
+        /// not at registration time — only the variable *name* is stored
+        /// in the registry, never the token itself.
+        #[arg(long, requires = "url")]
+        token_env: Option<String>,
     },
     /// List configured sources.
     List,
@@ -676,9 +689,43 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             adapter,
             instance,
             path,
+            url,
+            token_env,
         } => {
-            let location = path.as_ref().map(|p| p.display().to_string());
-            store.register_source(&adapter, instance.as_deref(), location.as_deref(), None)?;
+            // Round-17 (§19.3 PR-1): generic-mcp is now a first-class
+            // CLI source — `source add generic-mcp --url ... [--token-env
+            // ENV]` registers the upstream MCP HTTP server and lets the
+            // subsequent `import generic-mcp:<instance>` pull from it
+            // without any test-only construction code. The token *name*,
+            // never the token *value*, lives in the registry (resolved
+            // at import time via the operator's env).
+            let location: Option<String> = match (path.as_ref(), url.as_ref()) {
+                (Some(_), Some(_)) => {
+                    // clap's `conflicts_with` should prevent this, but
+                    // belt-and-braces.
+                    return Err(anyhow!("--path and --url are mutually exclusive"));
+                }
+                (Some(p), None) => Some(p.display().to_string()),
+                (None, Some(u)) => Some(u.clone()),
+                (None, None) => None,
+            };
+            let config_json: Option<String> = token_env
+                .as_deref()
+                .map(|env| serde_json::json!({ "token_env": env }).to_string());
+            // Sanity: for URL-based adapters, refuse to register without
+            // a URL. This keeps `import generic-mcp:<i>` from later
+            // failing with the confusing "no default path" error.
+            if adapter == anamnesis_adapter_generic_mcp::ADAPTER_ID && url.is_none() {
+                return Err(anyhow!(
+                    "source add generic-mcp requires --url <upstream-mcp-url>"
+                ));
+            }
+            store.register_source(
+                &adapter,
+                instance.as_deref(),
+                location.as_deref(),
+                config_json.as_deref(),
+            )?;
             println!(
                 "registered: {adapter}{}{}",
                 instance
@@ -759,7 +806,7 @@ async fn cmd_import(
     // "no default path".
     if !is_known_adapter(adapter_id) {
         return Err(anyhow!(
-            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0"
+            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, generic-mcp"
         ));
     }
 
@@ -780,7 +827,39 @@ async fn cmd_import(
     let store_for_lookup = Store::open(db_path(data_dir))?;
     let registered = store_for_lookup.get_source(adapter_id, instance)?;
     let registered_location = registered.as_ref().and_then(|r| r.location.clone());
+    let registered_config = registered.as_ref().and_then(|r| r.config_json.clone());
     drop(store_for_lookup);
+
+    // Round-17 (§19.3 PR-1): generic-mcp is URL-based, not path-based.
+    // It does NOT use `default_path_for` (URLs have no useful default —
+    // the operator must register one via `source add generic-mcp --url`)
+    // and it does NOT pass a PathBuf to `run_import`.
+    if adapter_id == anamnesis_adapter_generic_mcp::ADAPTER_ID {
+        if path_override.is_some() {
+            return Err(anyhow!(
+                "generic-mcp is URL-based; use `anamnesis source add generic-mcp --url <url>` \
+                 instead of `--path`"
+            ));
+        }
+        let url = registered_location.ok_or_else(|| {
+            anyhow!(
+                "generic-mcp source {target:?} is not registered. Run `anamnesis source add \
+             generic-mcp{instance_suffix} --url <upstream-mcp-url> [--token-env ENV]` first.",
+                target = target,
+                instance_suffix = instance
+                    .as_ref()
+                    .map(|i| format!(":{i}"))
+                    .unwrap_or_default(),
+            )
+        })?;
+        let token = resolve_generic_mcp_token(registered_config.as_deref())?;
+        let adapter = anamnesis_adapter_generic_mcp::generic_mcp_adapter(
+            url.clone(),
+            token.as_deref(),
+            instance,
+        );
+        return run_import(data_dir, &adapter, dry_run, no_embed, None, true).await;
+    }
 
     let (location, source_was_explicit) = match path_override {
         Some(p) => (p.to_path_buf(), true),
@@ -831,7 +910,35 @@ async fn cmd_import(
             .await
         }
         other => Err(anyhow!(
-            "adapter {other:?} not wired; supported: claude-code, codex, mem0"
+            "adapter {other:?} not wired; supported: claude-code, codex, mem0, generic-mcp"
+        )),
+    }
+}
+
+/// Read the bearer token for a generic-mcp source from the operator's
+/// environment, looking up the env var name stored in
+/// `sources.config_json` (`{"token_env": "ANAMNESIS_FOO_TOKEN"}`).
+///
+/// Returns `Ok(None)` when no `token_env` was registered (the upstream
+/// allows unauthenticated access). Errors when the env var name is
+/// registered but the variable is unset — that's a misconfiguration the
+/// operator probably wants to know about *before* the import hits 401.
+fn resolve_generic_mcp_token(config_json: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = config_json else {
+        return Ok(None);
+    };
+    let parsed: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| anyhow!("source.config_json is not valid JSON: {e}"))?;
+    let Some(env) = parsed.get("token_env").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    match std::env::var(env) {
+        Ok(v) if !v.is_empty() => Ok(Some(v)),
+        Ok(_) => Err(anyhow!(
+            "generic-mcp source's token_env={env:?} is set but empty"
+        )),
+        Err(_) => Err(anyhow!(
+            "generic-mcp source requires env var {env:?} to be set with the bearer token"
         )),
     }
 }
@@ -845,6 +952,7 @@ fn is_known_adapter(adapter_id: &str) -> bool {
         anamnesis_adapter_claude_code::ADAPTER_ID
             | anamnesis_adapter_mem0::ADAPTER_ID
             | anamnesis_adapter_codex::ADAPTER_ID
+            | anamnesis_adapter_generic_mcp::ADAPTER_ID
     )
 }
 
@@ -891,12 +999,24 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     // partial / erroring import shows up in `source list` — otherwise
     // operators have no way to inspect which path the run was reading
     // from. We only stamp `last_import_at` after success below.
-    let location_str = canonical_location.map(|p| p.display().to_string());
+    //
+    // Round-17 (§19.3 PR-1): preserve any existing `location` /
+    // `config_json` (e.g. generic-mcp's URL and `{"token_env": "..."}`)
+    // when auto-re-registering. The previous code unconditionally wrote
+    // `config_json = NULL` here, which would clobber the operator's
+    // `source add --token-env` choice on every import; URL-based
+    // adapters also pass `canonical_location = None`, which would have
+    // erased their stored URL.
+    let existing = store.get_source(&descriptor.adapter, descriptor.instance.as_deref())?;
+    let new_location: Option<String> = canonical_location
+        .map(|p| p.display().to_string())
+        .or_else(|| existing.as_ref().and_then(|r| r.location.clone()));
+    let existing_config = existing.and_then(|r| r.config_json);
     store.register_source(
         &descriptor.adapter,
         descriptor.instance.as_deref(),
-        location_str.as_deref(),
-        None,
+        new_location.as_deref(),
+        existing_config.as_deref(),
     )?;
 
     let summary = ImportRunner::new(adapter).run(&store).await?;
@@ -921,7 +1041,7 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
             "records_upserted": summary.records_upserted,
             "chunks_written": summary.chunks_written,
             "errors": summary.errors,
-            "location": location_str,
+            "location": new_location,
             "source_was_explicit": source_was_explicit,
         }),
     ));
