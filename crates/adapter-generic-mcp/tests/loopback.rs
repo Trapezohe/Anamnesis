@@ -7,24 +7,69 @@
 
 use anamnesis_adapter_generic_mcp::{generic_mcp_adapter, GenericMcpAdapter, GenericMcpConfig};
 use anamnesis_core::adapter::{MemoryAdapter, ScanOpts};
+use anamnesis_core::chunker::Chunker;
+use anamnesis_core::model::{
+    AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+};
 use anamnesis_mcp_server::{sse, AnamnesisServer};
 use anamnesis_store::Store;
+use chrono::Utc;
 use futures::StreamExt;
 
-fn build_upstream() -> AnamnesisServer {
+/// Build an upstream server with optional seed records. Each `(id, content)`
+/// pair is upserted under the `claude-code` adapter so `resources/list`
+/// has something concrete to enumerate.
+fn build_upstream_with_seeds(seeds: &[(&str, &str)]) -> AnamnesisServer {
     let data = tempfile::tempdir().expect("tempdir");
     let store = Store::open(data.path().join("anamnesis.sqlite")).unwrap();
     store
         .register_source("claude-code", None, Some("/tmp/x"), None)
         .unwrap();
+    for (native_id, content) in seeds {
+        let r = AnamnesisRecord {
+            id: RecordId::from_parts("claude-code", None, native_id),
+            source: SourceDescriptor {
+                adapter: "claude-code".into(),
+                instance: None,
+                version: "0.0.1".into(),
+            },
+            content: (*content).to_string(),
+            embedding: None,
+            scope: Scope::User,
+            kind: Kind::Fact,
+            created_at: Utc::now(),
+            updated_at: None,
+            tags: vec![],
+            metadata: Default::default(),
+            provenance: Provenance {
+                native_id: (*native_id).into(),
+                native_path: Some(format!("/p/{native_id}")),
+                captured_at: Utc::now(),
+                raw_hash: format!("h-{native_id}"),
+            },
+            schema_version: SCHEMA_VERSION,
+        };
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
     Box::leak(Box::new(data));
     AnamnesisServer::new(store, None, std::path::PathBuf::from("/tmp"))
 }
 
+fn build_upstream() -> AnamnesisServer {
+    build_upstream_with_seeds(&[])
+}
+
 #[tokio::test]
 async fn generic_mcp_lists_then_reads_upstream_resources() {
-    // 1. Spin up upstream anamnesis-mcp on an ephemeral port.
-    let server = build_upstream();
+    // Round-13: seed a concrete record so resources/list emits a
+    // resolvable URI (not just `{id}` templates that the adapter would
+    // skip). Asserts the full loopback: upstream record → MCP →
+    // generic-mcp adapter scan → RawRecord with the seed text.
+    let server = build_upstream_with_seeds(&[(
+        "seed-1",
+        "loopback round-13 sentinel content uniqueLoopbackToken",
+    )]);
     let (listener, addr, app, token) = sse::bind(server, Some("loopback-token".into()))
         .await
         .unwrap();
@@ -32,18 +77,12 @@ async fn generic_mcp_lists_then_reads_upstream_resources() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // 2. Wire generic-mcp adapter pointing at upstream.
     let adapter: GenericMcpAdapter =
         generic_mcp_adapter(format!("http://{addr}"), Some(&token), Some("loopback"));
 
-    // 3. Health probe.
     let h = adapter.health().await;
     assert!(h.ok, "upstream should be healthy: {}", h.detail);
 
-    // 4. Scan emits resources. Even with no records, the resource list
-    //    has 3 URI templates, but they're all `{...}` placeholders so the
-    //    adapter filters them out → 0 concrete URIs in the seed setup.
-    //    That's still a valid "round-trip with zero hits" result.
     let raws: Vec<_> = adapter
         .scan(ScanOpts::default())
         .collect::<Vec<_>>()
@@ -51,8 +90,40 @@ async fn generic_mcp_lists_then_reads_upstream_resources() {
         .into_iter()
         .filter_map(|r| r.ok())
         .collect();
-    // Templates filtered out; concrete records may or may not exist.
-    assert!(raws.is_empty() || raws.iter().all(|r| r.native_id.starts_with("loopback|")));
+
+    // The whole point of round-13: NO MORE permissive empty assertion.
+    // The upstream has a real record, so the loopback MUST surface at
+    // least one raw with the seeded content.
+    assert!(
+        !raws.is_empty(),
+        "loopback must return at least 1 raw record now that the upstream has data \
+         (previous empty-result was the round-13 bug we just fixed)"
+    );
+
+    let any_with_seed_content = raws.iter().any(|r| {
+        let payload_text = r.payload.to_string();
+        payload_text.contains("uniqueLoopbackToken")
+    });
+    assert!(
+        any_with_seed_content,
+        "at least one raw must carry the seeded content. \
+         Got payloads: {:?}",
+        raws.iter()
+            .map(|r| r.payload.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // native_path follows the generic-mcp convention: upstream URI.
+    let any_with_record_uri = raws.iter().any(|r| {
+        r.native_path
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("anamnesis://record/")
+    });
+    assert!(
+        any_with_record_uri,
+        "at least one raw must carry an anamnesis://record/<id> native_path"
+    );
 
     handle.abort();
 }
