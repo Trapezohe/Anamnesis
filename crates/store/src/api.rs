@@ -386,6 +386,28 @@ impl Store {
     ///
     /// Returns `(records_added_or_updated, chunks_written)`. Both counts
     /// are 1/N — meaningful for tests and import job summaries.
+    /// Returns `(records_written, chunks_written)`. Both are `0` when the
+    /// record already exists with an identical `raw_hash` (= the source
+    /// payload byte-for-byte unchanged), in which case **the call is a
+    /// total no-op**: no `records` rewrite, no `raw_artifacts` rewrite,
+    /// and crucially no `record_chunks` DELETE / INSERT — which is what
+    /// keeps the jieba `chunks_ai` / `chunks_ad` triggers from firing
+    /// 99,716 times on a re-import (see `docs/verification/round-6-
+    /// embedding-dogfood.md` Finding 2 for the regression this fixes).
+    ///
+    /// The fast-path check happens **before** any DELETE so the AFTER
+    /// DELETE trigger never runs on unchanged content. Putting the check
+    /// after the DELETE would wipe the entire performance win — the
+    /// tokenize_cjk(old.content) call inside `chunks_ad` is the
+    /// expensive piece, not the INSERT.
+    ///
+    /// raw_hash is a pure function of the source payload (see each
+    /// adapter's `normalize_*` for the blake3 input), so equal raw_hash
+    /// guarantees the normalized record and its chunks are identical
+    /// to what's in the store. Tags / metadata / scope / kind cannot
+    /// drift independently of the source payload because every
+    /// normalizer derives them deterministically from the same source
+    /// bytes that produce raw_hash.
     pub fn upsert_record(
         &self,
         record: &AnamnesisRecord,
@@ -395,6 +417,31 @@ impl Store {
         let active = self.active_model()?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+
+        // Fast-path. The check must run before write_record / write_chunks
+        // so neither the records UPSERT nor the chunks DELETE+INSERT fires
+        // when nothing has changed.
+        let existing_hash: Option<String> = tx
+            .query_row(
+                "SELECT raw_hash FROM records WHERE id = ?1",
+                params![record.id.0],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_hash.as_deref() == Some(record.provenance.raw_hash.as_str()) {
+            // Nothing to do — but we still want any pending embedding
+            // jobs to be enqueued under the active model if they aren't
+            // already (e.g. user switched models since last import).
+            // `enqueue_jobs` is ON CONFLICT DO NOTHING, so this is safe
+            // and cheap (no jieba calls, no chunk rewrite).
+            if let Some(model_id) = active.as_deref() {
+                let now = chrono::Utc::now().timestamp();
+                enqueue_jobs(&tx, chunks, model_id, now)?;
+            }
+            tx.commit()?;
+            return Ok((0, 0));
+        }
+
         let now = chrono::Utc::now().timestamp();
         write_record(&tx, record)?;
         write_raw_artifact(&tx, record, raw_payload_json, now)?;
@@ -1122,15 +1169,155 @@ mod tests {
         assert!(back.source.instance.is_none());
     }
 
+    // ─── Round-7: write_chunks dedup (BLUEPRINT round-6 Finding 2 fix) ───
+    //
+    // Codex's acceptance: re-upserting a record whose raw_hash is
+    // unchanged must NOT touch record_chunks at all. The win is that
+    // the AFTER DELETE / AFTER INSERT triggers (which call
+    // tokenize_cjk(content)) don't fire on no-op re-imports.
+    //
+    // The store-level test asserts the invariant by counting trigger
+    // side effects: chunks_fts row content stays byte-identical across
+    // the re-upsert, which is only possible if no DELETE+INSERT cycle
+    // happened.
+
+    #[test]
+    fn reupsert_with_unchanged_raw_hash_returns_zero_zero() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "x", "stable content", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        let (n1, k1) = store.upsert_record(&r, &c, Some("{\"v\":1}")).unwrap();
+        assert_eq!((n1, k1), (1, c.len() as u64));
+
+        // Second call with the same record (same raw_hash) → no-op.
+        let (n2, k2) = store.upsert_record(&r, &c, Some("{\"v\":1}")).unwrap();
+        assert_eq!(
+            (n2, k2),
+            (0, 0),
+            "re-upsert with unchanged raw_hash must report zero work"
+        );
+    }
+
+    #[test]
+    fn reupsert_with_unchanged_raw_hash_does_not_touch_chunks() {
+        // Pin Codex's load-bearing assertion: the row in `chunks_fts`
+        // must be the SAME row (same rowid, same content) across a no-op
+        // re-upsert. If write_chunks fired its DELETE+INSERT, the chunk
+        // would get a fresh rowid (record_chunks.id stays the same but
+        // SQLite rowid is reassigned on INSERT after DELETE).
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "x", "the quick brown fox", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        let rowid_before: i64 = store
+            .conn()
+            .query_row(
+                "SELECT rowid FROM record_chunks WHERE record_id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        store.upsert_record(&r, &c, None).unwrap();
+        let rowid_after: i64 = store
+            .conn()
+            .query_row(
+                "SELECT rowid FROM record_chunks WHERE record_id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rowid_before, rowid_after,
+            "rowid changed → DELETE+INSERT happened → jieba triggers fired"
+        );
+        // FTS still finds the content (because chunks_fts wasn't touched).
+        let hits = store
+            .search_chunks_fts("quick fox", &SearchFilter::default(), 5)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn reupsert_with_changed_raw_hash_still_rewrites_chunks() {
+        // Negative case: when raw_hash genuinely changes the fast-path
+        // must NOT swallow the update. Content rewrite + FTS reindex
+        // must still happen.
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("a", "x", "old content", Kind::Fact);
+        r.provenance.raw_hash = "hash-v1".into();
+        let c1 = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c1, None).unwrap();
+
+        let mut r2 = r.clone();
+        r2.content = "new completely different content".into();
+        r2.provenance.raw_hash = "hash-v2".into();
+        let c2 = Chunker::default().chunk(&r2.id, &r2.content);
+        let (n, k) = store.upsert_record(&r2, &c2, None).unwrap();
+        assert_eq!(n, 1, "raw_hash changed → record written");
+        assert_eq!(k, c2.len() as u64, "chunks rewritten");
+        let hits = store
+            .search_chunks_fts("different", &SearchFilter::default(), 5)
+            .unwrap();
+        assert!(!hits.is_empty(), "new content searchable");
+        let stale = store
+            .search_chunks_fts("old", &SearchFilter::default(), 5)
+            .unwrap();
+        assert!(stale.is_empty(), "old content evicted");
+    }
+
+    #[test]
+    fn reupsert_no_op_still_enqueues_jobs_for_active_model() {
+        // If the user switched embedding models between two imports,
+        // the no-op fast-path must still enqueue jobs for the NEW model
+        // (otherwise chunks would be invisible to vector search under
+        // the new model). enqueue_jobs is ON CONFLICT DO NOTHING so
+        // this is safe + cheap.
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "x", "hello world", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        // First import with model A.
+        store.set_active_model("local:model-a:1").unwrap();
+        store.upsert_record(&r, &c, None).unwrap();
+
+        // Switch model, re-import the same record. raw_hash is identical
+        // so write path skips, but jobs should be enqueued under model-b.
+        store.set_active_model("local:model-b:1").unwrap();
+        let (n, k) = store.upsert_record(&r, &c, None).unwrap();
+        assert_eq!((n, k), (0, 0));
+
+        let pending_for_b: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_jobs \
+                 WHERE status = 'pending' AND model_id = 'local:model-b:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_for_b as usize,
+            c.len(),
+            "fast-path must still enqueue jobs under the active model"
+        );
+    }
+
     #[test]
     fn upsert_replaces_chunks_on_recall() {
         let store = Store::open_in_memory().unwrap();
-        let r = make_record("a", "x", "v1", Kind::Fact);
+        let mut r = make_record("a", "x", "v1", Kind::Fact);
+        r.provenance.raw_hash = "v1-hash".into();
         let c1 = Chunker::default().chunk(&r.id, &r.content);
         store.upsert_record(&r, &c1, None).unwrap();
 
         let mut r2 = r.clone();
         r2.content = "v2 different and longer ".repeat(40);
+        // Round-7: a content change must come with a raw_hash bump, or
+        // the fast-path will (correctly) treat the upsert as a no-op.
+        // Real adapters always recompute raw_hash from the source bytes
+        // so this is automatic in practice; the test must mirror that
+        // by bumping the hash here.
+        r2.provenance.raw_hash = "v2-hash".into();
         let c2 = Chunker::default().chunk(&r2.id, &r2.content);
         store.upsert_record(&r2, &c2, None).unwrap();
 
