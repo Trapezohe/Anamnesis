@@ -97,6 +97,75 @@ impl Drop for Guard {
     }
 }
 
+/// Open the store at `data_dir/anamnesis.sqlite`, register a synthetic
+/// claude-code source, and upsert one record + chunks containing a
+/// unique sentinel token. Returns the sentinel + record id for the
+/// caller's assertions.
+///
+/// We deliberately do NOT install an active embedding model — the
+/// downstream `anamnesis serve --sse` process will see `provider =
+/// None` and take the FTS-only path through hybrid search. Avoids the
+/// ~500 MB model download in CI.
+fn seed_synthetic_search_record(data_dir: &std::path::Path) -> (&'static str, String) {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let db = data_dir.join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store for seeding");
+    store
+        .register_source("claude-code", None, Some("/tmp/round-15"), None)
+        .expect("register synthetic source");
+
+    let native_id = "round-15-seed-1";
+    // The sentinel must survive jieba+unicode61 tokenization. CamelCase
+    // ASCII does; pick a token unique enough that it cannot collide with
+    // any other test fixture.
+    let sentinel = "UniqueRound15HttpSearchToken";
+    let content = format!(
+        "round-15 SSE integration sentinel: {sentinel} — this record \
+         exists only so the over-HTTP search test has something to find."
+    );
+
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, native_id),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0.0.1".into(),
+        },
+        content,
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native_id.into(),
+            native_path: Some(format!("/p/{native_id}")),
+            captured_at: Utc::now(),
+            raw_hash: format!("h-{native_id}"),
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let chunks = Chunker::default().chunk(&r.id, &r.content);
+    store
+        .upsert_record(&r, &chunks, None)
+        .expect("upsert synthetic record");
+
+    // Drop the store explicitly so its SQLite handle is closed before
+    // the child server opens its own connection. SQLite in WAL mode
+    // tolerates concurrent opens, but closing here keeps the test's
+    // failure mode obvious if that ever changes.
+    drop(store);
+    (sentinel, r.id.0.clone())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn serve_sse_http_transport_round_trips_initialize() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -168,5 +237,107 @@ async fn serve_sse_http_transport_round_trips_initialize() {
     assert_eq!(
         server_name, "anamnesis",
         "initialize must return serverInfo.name = anamnesis, got payload: {v}"
+    );
+}
+
+/// Round-15: prove an MCP client can actually *call a tool* (not just
+/// `initialize`) over the SSE/HTTP transport exposed by the unified
+/// CLI. Seeds one record with a unique sentinel, then runs a
+/// JSON-RPC `tools/call` for `search_memories` and checks the wire
+/// format committed in PR-#16:
+///
+///   - HTTP 200, no JSON-RPC `error` member
+///   - `result.structuredContent.results` is a non-empty array
+///   - every hit has a non-empty `trace_id` (alias for `record_id`)
+///   - at least one hit has `from_fts == true` (no embedding model is
+///     installed → FTS path is the only one available, so this is the
+///     load-bearing modality for the test)
+///   - at least one hit's `snippet` contains the seeded sentinel
+#[tokio::test(flavor = "current_thread")]
+async fn serve_sse_search_memories_round_trips_over_http() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (sentinel, _record_id) = seed_synthetic_search_record(dir.path());
+
+    let token = "round-15-search-token-3e5a";
+    let (child, addr) = spawn_and_wait_for_port(dir.path(), token);
+    let _guard = Guard(child);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "search_memories",
+            "arguments": {
+                "query": sentinel,
+                "limit": 5,
+                "mode": "fulltext"
+            }
+        }
+    });
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /mcp tools/call");
+    assert_eq!(
+        resp.status(),
+        200,
+        "tools/call must be 200 over HTTP, was {}",
+        resp.status()
+    );
+
+    let v: serde_json::Value = resp.json().await.expect("json tools/call response");
+    assert!(
+        v.get("error").is_none(),
+        "JSON-RPC error from tools/call: {v}"
+    );
+    let results = v
+        .pointer("/result/structuredContent/results")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("expected result.structuredContent.results array, got: {v}"));
+    assert!(
+        !results.is_empty(),
+        "search_memories over HTTP must return at least one hit for the seeded sentinel \
+         (FTS path is enough — no embedding model installed). payload: {v}"
+    );
+
+    for hit in results {
+        let trace_id = hit
+            .get("trace_id")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        assert!(
+            !trace_id.is_empty(),
+            "every search_memories hit must carry a non-empty trace_id; hit was: {hit}"
+        );
+    }
+
+    let any_from_fts = results
+        .iter()
+        .any(|h| h.get("from_fts").and_then(|f| f.as_bool()).unwrap_or(false));
+    assert!(
+        any_from_fts,
+        "at least one hit must have from_fts = true (FTS is the only \
+         active modality in this test). hits: {results:?}"
+    );
+
+    let any_with_sentinel = results.iter().any(|h| {
+        h.get("snippet")
+            .and_then(|s| s.as_str())
+            .map(|s| s.contains(sentinel))
+            .unwrap_or(false)
+    });
+    assert!(
+        any_with_sentinel,
+        "at least one hit's snippet must contain the seeded sentinel {sentinel:?}. \
+         hits: {results:?}"
     );
 }
