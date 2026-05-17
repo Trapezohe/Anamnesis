@@ -16,7 +16,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use anamnesis_core::adapter::MemoryAdapter;
+use anamnesis_core::adapter::{MemoryAdapter, ScanOpts};
 use anamnesis_core::chunker::Chunker;
 use anamnesis_core::{Audit, AuditEntry, RawRecord};
 use anamnesis_store::Store;
@@ -85,11 +85,28 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         self
     }
 
-    /// Drain `adapter.scan()` into `store`. Returns the run summary.
+    /// Drain `adapter.scan(Default::default())` into `store`. Equivalent
+    /// to `run_with_opts(store, ScanOpts::default())`; kept as a stable
+    /// shortcut for callers that don't care about increments.
     pub async fn run(&self, store: &Store) -> std::result::Result<ImportSummary, ImportError> {
+        self.run_with_opts(store, ScanOpts::default()).await
+    }
+
+    /// Drain `adapter.scan(opts)` into `store`. Returns the run summary.
+    ///
+    /// Round-19 (§-1.5 PR-4a): `ScanOpts` is finally honored. `opts.since`
+    /// filters records the adapter considers "older than the threshold";
+    /// `opts.full` tells the adapter to ignore `opts.since` (it does NOT
+    /// disable the store's `raw_hash` fast-path — that's a separate
+    /// `--reembed` concern, not an import concern).
+    pub async fn run_with_opts(
+        &self,
+        store: &Store,
+        opts: ScanOpts,
+    ) -> std::result::Result<ImportSummary, ImportError> {
         let descriptor = self.adapter.descriptor();
         let mut summary = ImportSummary::empty(&descriptor.adapter, descriptor.instance.as_deref());
-        let mut stream = self.adapter.scan(Default::default());
+        let mut stream = self.adapter.scan(opts);
 
         while let Some(item) = stream.next().await {
             match item {
@@ -192,6 +209,11 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
 /// argv; MCP fills them from the JSON-RPC `tools/call` arguments. Either
 /// caller sees the same source-registry + audit + `last_import_at` side
 /// effects.
+///
+/// Round-19 (§-1.5 PR-4a) — `scan_opts` is now first-class. CLI passes
+/// `--since` / `--full` through here so adapters can do incremental
+/// imports. `Default::default()` means "full scan" — MCP callers and
+/// older test harnesses that don't set it keep their original behavior.
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
     /// Scan-only mode. Counts `raw_seen` but writes nothing to the store,
@@ -206,6 +228,10 @@ pub struct ImportOptions {
     /// registry entry). Surfaces in the audit entry for diagnostics; the
     /// store doesn't care.
     pub source_was_explicit: bool,
+    /// Scan-level filters (`since`, `full`). Passed straight through to
+    /// `adapter.scan(opts)` so adapters that honor it can skip records
+    /// older than `since`. Default is "no filter / full scan".
+    pub scan_opts: ScanOpts,
 }
 
 /// Errors that `ImportService` can fail with, on top of plain
@@ -272,8 +298,11 @@ impl<'a> ImportService<'a> {
         if opts.dry_run {
             // dry-run NEVER touches the registry, last_import_at, or
             // audit (`source list` should reflect only persisted state).
-            use anamnesis_core::adapter::ScanOpts;
-            let mut stream = adapter.scan(ScanOpts::default());
+            //
+            // Round-19: dry-run honors `scan_opts` too — `--dry-run
+            // --since X` should report what an incremental run WOULD
+            // pull in, not the full corpus.
+            let mut stream = adapter.scan(opts.scan_opts.clone());
             let mut seen = 0u64;
             while let Some(item) = stream.next().await {
                 if item.is_ok() {
@@ -305,8 +334,10 @@ impl<'a> ImportService<'a> {
             existing_config.as_deref(),
         )?;
 
-        // 3. The real work.
-        let summary = ImportRunner::new(adapter).run(self.store).await?;
+        // 3. The real work — pass scan opts through to the adapter.
+        let summary = ImportRunner::new(adapter)
+            .run_with_opts(self.store, opts.scan_opts.clone())
+            .await?;
 
         // 4. Mark success.
         self.store
@@ -372,9 +403,20 @@ mod tests {
                 version: "0".into(),
             }
         }
-        fn scan<'a>(&'a self, _opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
-            let raws: Vec<Result<RawRecord>> =
-                self.records.iter().map(|(r, _)| Ok(r.clone())).collect();
+        fn scan<'a>(&'a self, opts: ScanOpts) -> BoxStream<'a, Result<RawRecord>> {
+            // Round-19 (§-1.5 PR-4a): mock honors `opts.since` so the
+            // importer-level test asserting "ScanOpts flows through
+            // ImportService.import" can be exercised without dragging
+            // in a real file/sqlite/HTTP adapter.
+            let raws: Vec<Result<RawRecord>> = self
+                .records
+                .iter()
+                .filter(|(r, _)| match opts.since {
+                    Some(t) if !opts.full => r.captured_at > t,
+                    _ => true,
+                })
+                .map(|(r, _)| Ok(r.clone()))
+                .collect();
             Box::pin(stream::iter(raws))
         }
         fn normalize(&self, raw: RawRecord) -> Result<Vec<AnamnesisRecord>> {
@@ -609,6 +651,7 @@ mod tests {
                     dry_run: true,
                     canonical_location: Some("/somewhere".into()),
                     source_was_explicit: true,
+                    ..Default::default()
                 },
             )
             .await
@@ -647,6 +690,7 @@ mod tests {
                     dry_run: false,
                     canonical_location: Some("/tmp/round18".into()),
                     source_was_explicit: true,
+                    ..Default::default()
                 },
             )
             .await
@@ -706,6 +750,7 @@ mod tests {
                     dry_run: false,
                     canonical_location: None,
                     source_was_explicit: true,
+                    ..Default::default()
                 },
             )
             .await
@@ -751,6 +796,7 @@ mod tests {
                     dry_run: false,
                     canonical_location: Some("/p".into()),
                     source_was_explicit: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -764,5 +810,133 @@ mod tests {
         assert!(row.last_import_at.is_some());
         let lines = read_audit_lines(dir.path());
         assert_eq!(lines[0]["detail"]["errors"], 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Round-19 (§-1.5 PR-4a): ScanOpts flows through ImportService.import
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Like `pair`, but stamps `RawRecord.captured_at` at the given UTC
+    /// time so tests can compose deterministic before/after windows.
+    fn pair_at(
+        native_id: &str,
+        content: &str,
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> (RawRecord, AnamnesisRecord) {
+        let (mut raw, mut record) = pair(native_id, content);
+        raw.captured_at = captured_at;
+        record.provenance.captured_at = captured_at;
+        (raw, record)
+    }
+
+    #[tokio::test]
+    async fn import_service_scan_opts_since_drops_records_older_than_threshold() {
+        // Three records at t0, t0+5min, t0+10min. ImportService called
+        // with scan_opts.since = t0+3min must only ingest the t0+5min
+        // and t0+10min ones.
+        let (store, audit, _dir) = store_and_audit();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let adapter = FakeAdapter::new(vec![
+            pair_at("old", "alpha", t0),
+            pair_at("mid", "bravo", t0 + chrono::Duration::minutes(5)),
+            pair_at("new", "charlie", t0 + chrono::Duration::minutes(10)),
+        ]);
+
+        let summary = ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: false,
+                    canonical_location: Some("/p".into()),
+                    source_was_explicit: true,
+                    scan_opts: ScanOpts {
+                        since: Some(t0 + chrono::Duration::minutes(3)),
+                        full: false,
+                    },
+                },
+            )
+            .await
+            .expect("import");
+
+        assert_eq!(
+            summary.raw_seen, 2,
+            "since-window should have dropped the t0 record before scan"
+        );
+        assert_eq!(summary.records_upserted, 2);
+    }
+
+    #[tokio::test]
+    async fn import_service_scan_opts_full_overrides_since_filter() {
+        // `full = true` must IGNORE `since` — the §-1.5 PR-4a contract.
+        // Three records at t0/+5/+10, since=t0+3min, full=true → all 3
+        // come through.
+        let (store, audit, _dir) = store_and_audit();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let adapter = FakeAdapter::new(vec![
+            pair_at("old", "alpha", t0),
+            pair_at("mid", "bravo", t0 + chrono::Duration::minutes(5)),
+            pair_at("new", "charlie", t0 + chrono::Duration::minutes(10)),
+        ]);
+
+        let summary = ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: false,
+                    canonical_location: Some("/p".into()),
+                    source_was_explicit: true,
+                    scan_opts: ScanOpts {
+                        since: Some(t0 + chrono::Duration::minutes(3)),
+                        full: true,
+                    },
+                },
+            )
+            .await
+            .expect("import");
+
+        assert_eq!(
+            summary.raw_seen, 3,
+            "--full must override --since; expected all 3 records through"
+        );
+        assert_eq!(summary.records_upserted, 3);
+    }
+
+    #[tokio::test]
+    async fn import_service_dry_run_honors_since_filter() {
+        // Dry-run + since: should COUNT only post-threshold records
+        // without touching the store. This guards the §-1.5 PR-4a
+        // promise that `--dry-run --since X` reports incremental
+        // size, not full-corpus size.
+        let (store, audit, dir) = store_and_audit();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let adapter = FakeAdapter::new(vec![
+            pair_at("old", "alpha", t0),
+            pair_at("new", "bravo", t0 + chrono::Duration::minutes(10)),
+        ]);
+
+        let summary = ImportService::new(&store, audit)
+            .import(
+                &adapter,
+                ImportOptions {
+                    dry_run: true,
+                    canonical_location: Some("/p".into()),
+                    source_was_explicit: true,
+                    scan_opts: ScanOpts {
+                        since: Some(t0 + chrono::Duration::minutes(5)),
+                        full: false,
+                    },
+                },
+            )
+            .await
+            .expect("dry-run");
+
+        assert_eq!(
+            summary.raw_seen, 1,
+            "dry-run must count only post-since raw records"
+        );
+        assert_eq!(summary.records_upserted, 0);
+        // No registry, no audit on dry-run.
+        assert!(store.get_source("fake", Some("default")).unwrap().is_none());
+        assert!(read_audit_lines(dir.path()).is_empty());
     }
 }

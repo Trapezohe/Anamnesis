@@ -70,9 +70,19 @@ enum Command {
     Import {
         /// Adapter name, optionally `adapter:instance`.
         target: String,
-        /// Full re-scan, ignoring dedup hashes.
-        #[arg(long)]
+        /// Full re-scan: ignore any incremental window (`--since` or
+        /// the auto-detected `last_import_at`) and ask the adapter to
+        /// re-emit every candidate record. Does NOT bypass the store's
+        /// `raw_hash` dedup — re-emitting an unchanged record is still
+        /// a no-op upsert (PR-#15 fast-path).
+        #[arg(long, conflicts_with = "since")]
         full: bool,
+        /// RFC3339 timestamp (e.g. `2026-04-01T00:00:00Z`) — only
+        /// records modified after this point get imported. When neither
+        /// `--full` nor `--since` is given, the importer falls back to
+        /// `sources.last_import_at` for incremental imports.
+        #[arg(long)]
+        since: Option<String>,
         /// Print what would be imported instead of writing.
         #[arg(long)]
         dry_run: bool,
@@ -291,10 +301,22 @@ async fn main() -> Result<()> {
         Command::Import {
             target,
             full,
+            since,
             dry_run,
             no_embed,
             path,
-        } => cmd_import(&data_dir, &target, full, dry_run, no_embed, path.as_deref()).await,
+        } => {
+            cmd_import(
+                &data_dir,
+                &target,
+                full,
+                since.as_deref(),
+                dry_run,
+                no_embed,
+                path.as_deref(),
+            )
+            .await
+        }
         Command::Search {
             query,
             source,
@@ -794,7 +816,8 @@ fn split_target(t: &str) -> (&str, Option<&str>) {
 async fn cmd_import(
     data_dir: &std::path::Path,
     target: &str,
-    _full: bool,
+    full: bool,
+    since_arg: Option<&str>,
     dry_run: bool,
     no_embed: bool,
     path_override: Option<&std::path::Path>,
@@ -808,6 +831,26 @@ async fn cmd_import(
         return Err(anyhow!(
             "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, generic-mcp"
         ));
+    }
+
+    // Round-19 (§-1.5 PR-4a): resolve the effective `ScanOpts`.
+    //
+    //   --full         → forced full scan, `since = None`.
+    //   --since <ts>   → explicit incremental bound (RFC3339 / chrono parse).
+    //   neither        → default to the source's registry `last_import_at`
+    //                    (auto-incremental). On a fresh source, this is
+    //                    `None` and the run is effectively a full scan.
+    //
+    // `--full` and `--since` are mutually exclusive at the clap layer.
+    let scan_opts = resolve_scan_opts(data_dir, adapter_id, instance, full, since_arg)?;
+    if !dry_run {
+        match (full, scan_opts.since.as_ref()) {
+            (true, _) => eprintln!("import: --full → ignoring any incremental window"),
+            (false, Some(t)) => eprintln!(
+                "import: incremental since {t} (override with --full for a complete re-scan)"
+            ),
+            (false, None) => {}
+        }
     }
 
     // PR-B (BLUEPRINT §18.4 F5): the source registry is the canonical
@@ -858,7 +901,7 @@ async fn cmd_import(
             token.as_deref(),
             instance,
         );
-        return run_import(data_dir, &adapter, dry_run, no_embed, None, true).await;
+        return run_import(data_dir, &adapter, dry_run, no_embed, None, true, scan_opts).await;
     }
 
     let (location, source_was_explicit) = match path_override {
@@ -882,6 +925,7 @@ async fn cmd_import(
                 no_embed,
                 Some(&location),
                 source_was_explicit,
+                scan_opts,
             )
             .await
         }
@@ -894,6 +938,7 @@ async fn cmd_import(
                 no_embed,
                 Some(&location),
                 source_was_explicit,
+                scan_opts,
             )
             .await
         }
@@ -906,6 +951,7 @@ async fn cmd_import(
                 no_embed,
                 Some(&location),
                 source_was_explicit,
+                scan_opts,
             )
             .await
         }
@@ -913,6 +959,52 @@ async fn cmd_import(
             "adapter {other:?} not wired; supported: claude-code, codex, mem0, generic-mcp"
         )),
     }
+}
+
+/// Resolve the effective `ScanOpts` for a CLI `import` invocation.
+///
+/// Order of precedence:
+///   1. `--full`             → `ScanOpts { since: None, full: true }`
+///   2. `--since "<ts>"`     → `ScanOpts { since: Some(parsed), full: false }`
+///   3. neither → look up the source's registry `last_import_at` and use
+///      it as the increment bound. On a fresh source (`last_import_at`
+///      is `None`) this is effectively a full scan.
+///
+/// `--full` and `--since` are mutually exclusive at the clap layer;
+/// belt-and-braces check here too.
+fn resolve_scan_opts(
+    data_dir: &std::path::Path,
+    adapter_id: &str,
+    instance: Option<&str>,
+    full: bool,
+    since_arg: Option<&str>,
+) -> Result<anamnesis_core::adapter::ScanOpts> {
+    use anamnesis_core::adapter::ScanOpts;
+    if full && since_arg.is_some() {
+        return Err(anyhow!("--full and --since are mutually exclusive"));
+    }
+    if full {
+        return Ok(ScanOpts {
+            since: None,
+            full: true,
+        });
+    }
+    if let Some(s) = since_arg {
+        let parsed = chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| anyhow!("--since must be RFC3339 (e.g. 2026-04-01T00:00:00Z): {e}"))?
+            .with_timezone(&chrono::Utc);
+        return Ok(ScanOpts {
+            since: Some(parsed),
+            full: false,
+        });
+    }
+    // Fall back to the source's registered `last_import_at`.
+    let store = Store::open(db_path(data_dir))?;
+    let row = store.get_source(adapter_id, instance)?;
+    let since = row
+        .and_then(|r| r.last_import_at)
+        .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0));
+    Ok(ScanOpts { since, full: false })
 }
 
 /// Read the bearer token for a generic-mcp source from the operator's
@@ -975,6 +1067,7 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     no_embed: bool,
     canonical_location: Option<&std::path::Path>,
     source_was_explicit: bool,
+    scan_opts: anamnesis_core::adapter::ScanOpts,
 ) -> Result<()> {
     // Round-18 (§-1.5 PR-3): the side effects of an import — preserving
     // registry `config_json`, stamping `last_import_at`, appending to
@@ -984,6 +1077,10 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     // that MCP shouldn't do: a) the human-readable progress line, b)
     // running the embedding worker (which can take minutes — fine for
     // CLI, but would block an MCP JSON-RPC request indefinitely).
+    //
+    // Round-19 (§-1.5 PR-4a): `scan_opts` now flows from the CLI
+    // resolver (--full / --since / auto-from-`last_import_at`) into
+    // `ImportOptions.scan_opts` and through to `adapter.scan(opts)`.
     let store = Store::open(db_path(data_dir))?;
     let service = ImportService::new(&store, audit(data_dir));
     let summary = service
@@ -993,6 +1090,7 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
                 dry_run,
                 canonical_location: canonical_location.map(|p| p.display().to_string()),
                 source_was_explicit,
+                scan_opts,
             },
         )
         .await
