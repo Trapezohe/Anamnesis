@@ -2,8 +2,21 @@
 //!
 //! Reads ONLY directory listings and file metadata during detection;
 //! content reads happen during `scan` (the import phase).
+//!
+//! ## JSONL recursion (PR-F, BLUEPRINT §18.4 F1)
+//!
+//! Modern Claude Code nests session files as
+//! `<project>/<session-uuid>/subagents/*.jsonl`. We recurse `*.jsonl`
+//! discovery up to [`MAX_JSONL_DEPTH`] levels under each project dir,
+//! skipping `memory/` (handled separately) and hidden entries. Memory
+//! markdown remains exactly one level deep (`<project>/memory/*.md`).
 
 use std::path::{Path, PathBuf};
+
+/// Maximum recursion depth for `.jsonl` discovery under a project dir.
+/// Real Claude Code data nests 3 levels (`<project>/<uuid>/subagents/*.jsonl`);
+/// 6 gives generous headroom without inviting accidental whole-tree walks.
+const MAX_JSONL_DEPTH: usize = 6;
 
 /// Result of scanning a single project subdirectory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,13 +66,69 @@ fn scan_project_dir(project_dir: &Path) -> std::io::Result<ProjectScan> {
         let ft = entry.file_type()?;
         if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             scan.jsonl_files.push(path);
-        } else if ft.is_dir() && path.file_name().and_then(|n| n.to_str()) == Some("memory") {
-            scan.memory_files = scan_memory_dir(&path)?;
+        } else if ft.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "memory" {
+                scan.memory_files = scan_memory_dir(&path)?;
+            } else if !name.is_empty() && !name.starts_with('.') {
+                // Recurse for nested session files
+                // (`<session-uuid>/subagents/*.jsonl` is the common shape).
+                collect_jsonl_recursive(&path, 1, &mut scan.jsonl_files)?;
+            }
         }
     }
     scan.jsonl_files.sort();
     scan.memory_files.sort();
     Ok(scan)
+}
+
+/// Recursively collect `*.jsonl` files under `dir`, up to
+/// [`MAX_JSONL_DEPTH`] levels deep. Skips hidden entries and any
+/// directory called `memory` (which is owned by the markdown branch).
+///
+/// Errors on intermediate entries are swallowed with a `tracing::warn!` —
+/// a single unreadable subdir must not kill the whole project scan.
+fn collect_jsonl_recursive(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    if depth > MAX_JSONL_DEPTH {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "skipping unreadable subdir");
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "skipping bad dirent");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(path);
+            }
+        } else if ft.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.is_empty() || name.starts_with('.') || name == "memory" {
+                continue;
+            }
+            collect_jsonl_recursive(&path, depth + 1, out)?;
+        }
+    }
+    Ok(())
 }
 
 fn scan_memory_dir(memory_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -198,6 +267,94 @@ mod tests {
         let scans = scan_projects_root(&root).unwrap();
         assert_eq!(scans[0].jsonl_files.len(), 1);
         assert_eq!(scans[0].memory_files.len(), 0);
+    }
+
+    #[test]
+    fn nested_subagent_jsonl_is_discovered() {
+        // Real Claude Code layout: <project>/<session-uuid>/subagents/*.jsonl
+        // Before PR-F these were silently dropped (97.8% of jsonl data lost
+        // on a real ~/.claude/projects/ in the wild).
+        let tmp = tmp();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-Users-x-y");
+        touch(&proj.join("top.jsonl"), "{}");
+        touch(
+            &proj
+                .join("8c525fd3-9ed6-4e59-b27c-ba544b76a425")
+                .join("subagents")
+                .join("agent-a.jsonl"),
+            "{}",
+        );
+        touch(
+            &proj
+                .join("8c525fd3-9ed6-4e59-b27c-ba544b76a425")
+                .join("subagents")
+                .join("agent-b.jsonl"),
+            "{}",
+        );
+        // Memory directory must still NOT be entered by jsonl recursion.
+        touch(
+            &proj.join("memory").join("user_role.md"),
+            "---\nname: r\n---\nx",
+        );
+        touch(
+            &proj.join("memory").join("not-jsonl.jsonl"),
+            "should be ignored",
+        );
+
+        let scans = scan_projects_root(&root).unwrap();
+        assert_eq!(scans.len(), 1);
+        let s = &scans[0];
+        assert_eq!(
+            s.jsonl_files.len(),
+            3,
+            "1 top-level + 2 nested subagents = 3; memory/ jsonl must NOT be counted"
+        );
+        assert!(
+            s.jsonl_files.iter().any(|p| p.ends_with("agent-a.jsonl")),
+            "agent-a.jsonl from nested subagents/ must be discovered"
+        );
+        assert!(
+            !s.jsonl_files
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == "memory")),
+            "no jsonl under memory/ should be picked up"
+        );
+        assert_eq!(s.memory_files.len(), 1, "memory md still found");
+    }
+
+    #[test]
+    fn hidden_subdirs_are_not_recursed() {
+        let tmp = tmp();
+        let root = tmp.path().join("projects");
+        let proj = root.join("proj");
+        touch(&proj.join("a.jsonl"), "");
+        touch(&proj.join(".cache").join("hidden.jsonl"), "");
+        let scans = scan_projects_root(&root).unwrap();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].jsonl_files.len(), 1);
+        assert!(scans[0].jsonl_files[0].ends_with("a.jsonl"));
+    }
+
+    #[test]
+    fn recursion_depth_is_bounded() {
+        // Construct a chain of MAX_JSONL_DEPTH + 2 levels, place a jsonl
+        // at the deepest level, and verify it's NOT discovered.
+        let tmp = tmp();
+        let root = tmp.path().join("projects");
+        let mut leaf = root.join("proj");
+        for i in 0..(MAX_JSONL_DEPTH + 2) {
+            leaf = leaf.join(format!("level-{i}"));
+        }
+        touch(&leaf.join("too-deep.jsonl"), "");
+        let scans = scan_projects_root(&root).unwrap();
+        assert!(
+            scans[0]
+                .jsonl_files
+                .iter()
+                .all(|p| !p.ends_with("too-deep.jsonl")),
+            "jsonl deeper than MAX_JSONL_DEPTH must not appear"
+        );
     }
 
     #[test]

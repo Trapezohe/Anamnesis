@@ -93,6 +93,19 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
         .collect::<Vec<_>>();
     let raw_hash = blake3::hash(raw_text.as_bytes()).to_hex().to_string();
     let id = RecordId::from_parts(crate::ADAPTER_ID, instance, &raw.native_id);
+
+    // Always carry source_file for provenance; flow every preserved
+    // frontmatter extra (originSessionId, node_type, custom annotations…)
+    // alongside it so downstream consumers don't lose context.
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "source_file".into(),
+        serde_json::Value::String(raw.native_path.clone().unwrap_or_default()),
+    );
+    for (k, v) in &split.frontmatter.extras {
+        metadata.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+
     AnamnesisRecord {
         id,
         source: SourceDescriptor {
@@ -107,10 +120,7 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
         created_at: raw.captured_at,
         updated_at: None,
         tags: tags.into_iter().filter(|t| !t.is_empty()).collect(),
-        metadata: serde_json::Map::from_iter([(
-            "source_file".into(),
-            serde_json::Value::String(raw.native_path.clone().unwrap_or_default()),
-        )]),
+        metadata,
         provenance: Provenance {
             native_id: raw.native_id.clone(),
             native_path: raw.native_path.clone(),
@@ -303,6 +313,49 @@ mod tests {
         };
         let err = normalize(raw, None).unwrap_err();
         assert!(format!("{err}").contains("payload_kind"));
+    }
+
+    // ─── PR-G end-to-end: top-level type + extras preservation ───
+
+    #[test]
+    fn normalize_memory_with_top_level_type_classifies_as_feedback() {
+        // Real-world example from BLUEPRINT §18.4 F2: my hand-written
+        // ~/.claude/.../feedback_project_location.md was classified as
+        // Unknown before PR-G because `type:` was at the top level.
+        let path = fixture_path("feedback_project_location");
+        let body = "---\nname: 项目目录放桌面\ndescription: 不要默认放 /tmp\ntype: feedback\noriginSessionId: 76a78a2d-e2af-4a15-9be4-f970d9e26e41\n---\n为新项目克隆或搭建工作目录时，默认放在 ~/Desktop。";
+        let raw = raw_memory(&path, body.into(), Some("default"));
+        let r = &normalize(raw, Some("default")).unwrap()[0];
+        assert_eq!(
+            r.kind,
+            Kind::Feedback,
+            "top-level type: feedback must reach the normalizer"
+        );
+        assert_eq!(r.scope, Scope::User);
+        assert_eq!(
+            r.metadata.get("originSessionId").and_then(|v| v.as_str()),
+            Some("76a78a2d-e2af-4a15-9be4-f970d9e26e41"),
+            "originSessionId must be preserved in record.metadata"
+        );
+    }
+
+    #[test]
+    fn normalize_memory_preserves_unknown_keys_in_metadata() {
+        let path = fixture_path("reference");
+        let body = "---\nname: env-cargo-path\nmetadata:\n  type: reference\n  node_type: memory\nweird_custom_field: keep-me\n---\nbody";
+        let raw = raw_memory(&path, body.into(), None);
+        let r = &normalize(raw, None).unwrap()[0];
+        assert_eq!(r.kind, Kind::Reference);
+        // node_type lives inside metadata: block; our minimal parser only
+        // grabs `type` from there, so it doesn't reach extras — accepted
+        // limitation, documented in BLUEPRINT §18.4 F2 fix proposal.
+        // weird_custom_field IS top-level, so it must be preserved.
+        assert_eq!(
+            r.metadata
+                .get("weird_custom_field")
+                .and_then(|v| v.as_str()),
+            Some("keep-me")
+        );
     }
 
     #[test]
