@@ -12,6 +12,7 @@ repository.workspace = true
 anamnesis-core = { workspace = true }
 anamnesis-store = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
