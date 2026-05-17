@@ -295,9 +295,11 @@ Current MCP surface:
 ### Install pre-built binary (recommended)
 
 Each tagged release ships pre-built binaries for **macOS** (aarch64 +
-x86_64), **Linux** (x86_64 + aarch64), and **Windows** (x86_64) on the
-[Releases page](https://github.com/Trapezohe/Anamnesis/releases). The
-release artefact is a tarball / zip containing two binaries:
+x86_64), **Linux** (x86_64), and **Windows** (x86_64) on the
+[Releases page](https://github.com/Trapezohe/Anamnesis/releases).
+Linux aarch64 currently installs from source (cross-compile is parked
+on `fastembed-rs` C-deps; tracked in the release workflow comments).
+The release artefact is a tarball / zip containing two binaries:
 
 - `anamnesis` — the CLI (`init`, `import`, `search`, `serve`, …).
 - `anamnesis-mcp` — the standalone MCP server (stdio + loopback HTTP).

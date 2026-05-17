@@ -50,10 +50,15 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            cross: true
+          # NOTE: aarch64-unknown-linux-gnu cross-compile is parked.
+          # The Rust toolchain itself cross-compiles fine, but
+          # `fastembed-rs` pulls C deps (onnxruntime, tokenizers'
+          # native bits) that need a cross sysroot we don't ship yet.
+          # Linux aarch64 users currently install from source. Re-add
+          # this row once we either:
+          #   (a) feature-gate `local-fastembed` off for the cross
+          #       build and ship a "FTS-only" Linux aarch64 binary, OR
+          #   (b) wire `cross` with a proper aarch64 sysroot.
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -69,25 +74,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install cross (linux-aarch64 only)
-        if: matrix.cross
-        run: cargo install cross --locked
       - name: Build `anamnesis` (CLI)
         shell: bash
-        run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p anamnesis-cli
-          else
-            cargo build --release --target ${{ matrix.target }} -p anamnesis-cli
-          fi
+        run: cargo build --release --target ${{ matrix.target }} -p anamnesis-cli
       - name: Build `anamnesis-mcp` (server)
         shell: bash
-        run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p anamnesis-mcp-server
-          else
-            cargo build --release --target ${{ matrix.target }} -p anamnesis-mcp-server
-          fi
+        run: cargo build --release --target ${{ matrix.target }} -p anamnesis-mcp-server
       - name: Stage release artifacts
         id: stage
         shell: bash
@@ -131,11 +123,12 @@ jobs:
         with:
           draft: true
           fail_on_unmatched_files: true
+          # Each matrix entry produces ONLY its archive flavour. The
+          # action expects every pattern listed to match, so we keep
+          # the patterns matrix-specific.
           files: |
-            anamnesis-*-${{ matrix.target }}.tar.gz
-            anamnesis-*-${{ matrix.target }}.tar.gz.sha256
-            anamnesis-*-${{ matrix.target }}.zip
-            anamnesis-*-${{ matrix.target }}.zip.sha256
+            anamnesis-*-${{ matrix.target }}.${{ matrix.archive }}
+            anamnesis-*-${{ matrix.target }}.${{ matrix.archive }}.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
