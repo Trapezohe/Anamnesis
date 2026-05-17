@@ -13,7 +13,7 @@ pub mod cjk;
 
 pub use api::{
     ChunkHit, ChunkLookup, PendingEmbeddingJob, RecordSummary, SearchFilter, SourceRow,
-    SourceWithCounts, StoreStats,
+    SourceWithCounts, StoreStats, MAX_LIST_LIMIT,
 };
 
 use std::path::Path;

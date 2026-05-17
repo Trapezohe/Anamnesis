@@ -169,6 +169,68 @@ async fn detector_reports_healthy_upstream() {
     handle.abort();
 }
 
+/// Round-21 (§-1.5 PR-2): a 250-record upstream catalogue must be
+/// migrated **completely** by the generic-mcp adapter via the new
+/// `cursor` / `nextCursor` protocol. Previously the adapter saw only
+/// the first page (capped at `RESOURCES_LIST_PAGE = 100`) and silently
+/// dropped 150 records.
+#[tokio::test]
+async fn loopback_paginates_250_records_without_loss() {
+    const N: usize = 250;
+
+    // Build a seed pool of (native_id, content) so we can build the
+    // upstream and then ask "did everything survive the migration?".
+    let seeds_owned: Vec<(String, String)> = (0..N)
+        .map(|i| {
+            (
+                format!("pr2-seed-{i:04}"),
+                format!("pr2 pagination sentinel {i}"),
+            )
+        })
+        .collect();
+    let seeds: Vec<(&str, &str)> = seeds_owned
+        .iter()
+        .map(|(id, c)| (id.as_str(), c.as_str()))
+        .collect();
+
+    let server = build_upstream_with_seeds(&seeds);
+    let (listener, addr, app, token) = sse::bind(server, Some("pr2-token".into())).await.unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let adapter = generic_mcp_adapter(format!("http://{addr}"), Some(&token), Some("pr2"));
+    let raws: Vec<_> = adapter
+        .scan(ScanOpts::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Every seeded record must come back. This is the §-1.1.2 contract:
+    // complete migration without dropping records.
+    assert_eq!(
+        raws.len(),
+        N,
+        "expected all {N} upstream records, got {}",
+        raws.len()
+    );
+
+    // And every distinct native_path must appear. (Set-equality across
+    // the full corpus; a bug that dropped some records but added
+    // duplicates would still fail this check.)
+    let native_paths: std::collections::HashSet<String> =
+        raws.iter().filter_map(|r| r.native_path.clone()).collect();
+    assert_eq!(
+        native_paths.len(),
+        N,
+        "all {N} native_paths must be distinct; some pages overlapped or duplicated"
+    );
+
+    handle.abort();
+}
+
 // Reference to suppress unused-import linting in tests.
 #[allow(dead_code)]
 fn _unused(_: GenericMcpConfig) {}
