@@ -444,16 +444,57 @@ impl AnamnesisServer {
     }
 
     async fn tool_trace_provenance(&self, args: Value) -> Result<Value, String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "trace_provenance.id is required".to_string())?;
         let store = &self.store;
-        let rec = store
-            .get_record(&RecordId(id.to_string()))
-            .map_err(|e| format!("store: {e}"))?
-            .ok_or_else(|| format!("record not found: {id}"))?;
-        Ok(json!({
+
+        // Round-10: accept EITHER `id` (= record_id) OR `chunk_id`.
+        // `search_memories` now returns `chunk_id` in every hit (PR-#16
+        // wire format), so an agent that wants to ask "what does this
+        // exact matched chunk look like in the raw source?" can chain
+        // directly without first resolving record → chunk.
+        let chunk_id_arg = args.get("chunk_id").and_then(|v| v.as_str());
+        let record_id_arg = args.get("id").and_then(|v| v.as_str());
+
+        let (rec, chunk_extras) = match (chunk_id_arg, record_id_arg) {
+            (Some(cid), _) => {
+                let lookup = store
+                    .get_chunk(cid)
+                    .map_err(|e| format!("store: {e}"))?
+                    .ok_or_else(|| format!("chunk not found: {cid}"))?;
+                let rec = store
+                    .get_record(&lookup.record_id)
+                    .map_err(|e| format!("store: {e}"))?
+                    .ok_or_else(|| {
+                        format!(
+                            "chunk {} found but parent record {} missing — db corruption?",
+                            cid, lookup.record_id.0
+                        )
+                    })?;
+                let tokenized = anamnesis_store::cjk::tokenize_indexing(&lookup.content);
+                let extras = json!({
+                    "chunk_id": lookup.chunk_id,
+                    "chunk_seq": lookup.seq,
+                    "chunk_content": lookup.content,
+                    "chunk_content_tokenized": tokenized,
+                    "chunk_token_estimate": lookup.token_estimate,
+                });
+                (rec, Some(extras))
+            }
+            (None, Some(id)) => {
+                let rec = store
+                    .get_record(&RecordId(id.to_string()))
+                    .map_err(|e| format!("store: {e}"))?
+                    .ok_or_else(|| format!("record not found: {id}"))?;
+                (rec, None)
+            }
+            (None, None) => {
+                return Err(
+                    "trace_provenance requires either `id` (record_id) or `chunk_id`".into(),
+                );
+            }
+        };
+
+        // Base provenance — same shape as before for back-compat.
+        let mut out = json!({
             "record_id": rec.id.0,
             "adapter": rec.source.adapter,
             "instance": rec.source.instance,
@@ -461,7 +502,17 @@ impl AnamnesisServer {
             "native_path": rec.provenance.native_path,
             "captured_at": rec.provenance.captured_at,
             "raw_hash": rec.provenance.raw_hash,
-        }))
+        });
+
+        // Chunk-level extras only when the caller asked by chunk_id.
+        if let (Some(obj), Some(extras)) = (out.as_object_mut(), chunk_extras) {
+            if let Some(extra_obj) = extras.as_object() {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -822,11 +873,26 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "trace_provenance",
-                "description": "Return native_id / native_path / raw_hash for one record.",
+                "description": "Return native_id / native_path / raw_hash for one record. \
+                                Pass `id` (record_id from search_memories.record_id) for record-level provenance, \
+                                or `chunk_id` (search_memories.chunk_id) to also get the chunk content and its \
+                                jieba-tokenized form for debugging retrieval quality.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string"}},
-                    "required": ["id"]
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Record id (= trace_id from search_memories)"
+                        },
+                        "chunk_id": {
+                            "type": "string",
+                            "description": "Chunk id from a search_memories hit. Pass this when you want to inspect the exact matched chunk."
+                        }
+                    },
+                    "anyOf": [
+                        {"required": ["id"]},
+                        {"required": ["chunk_id"]}
+                    ]
                 }
             }
         ]
@@ -1337,6 +1403,102 @@ mod tests {
         assert_eq!(structured["native_id"], "abc");
         assert_eq!(structured["native_path"], "/p/abc");
         assert_eq!(structured["raw_hash"], "h");
+        // Back-compat: record_id call must NOT include chunk-level extras.
+        assert!(structured.get("chunk_id").is_none());
+        assert!(structured.get("chunk_content").is_none());
+    }
+
+    /// Round-10: trace_provenance now accepts `chunk_id` to chain
+    /// directly from a `search_memories` hit into the matched chunk's
+    /// raw text + jieba-tokenized form. The record-level fields are
+    /// still surfaced so an agent gets one canonical provenance shape
+    /// either way.
+    #[tokio::test]
+    async fn trace_provenance_accepts_chunk_id_and_returns_chunk_content() {
+        // 含中文，便于断言 tokenized 字符串与 raw 不同（jieba 已切词）。
+        let r = make_record("claude-code", "abc", "项目偏好 — 用户喜欢 vim", 1700000000);
+        let s = server_with_records(&[r]);
+
+        // First call search_memories to discover the chunk_id the way
+        // a real agent would (we don't want to hard-code the format).
+        let search_resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {"query": "项目偏好", "mode": "fulltext", "limit": 1}
+                }),
+            ))
+            .await;
+        let chunk_id = search_resp.result.as_ref().unwrap()["structuredContent"]["results"][0]
+            ["chunk_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Trace via chunk_id.
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "trace_provenance",
+                    "arguments": {"chunk_id": chunk_id}
+                }),
+            ))
+            .await;
+        let structured = &resp.result.unwrap()["structuredContent"];
+
+        // Record-level provenance is still there.
+        assert_eq!(structured["adapter"], "claude-code");
+        assert_eq!(structured["native_id"], "abc");
+        assert_eq!(structured["native_path"], "/p/abc");
+        assert_eq!(structured["raw_hash"], "h");
+
+        // Chunk-level extras are now there too.
+        assert!(structured["chunk_id"].as_str().unwrap().contains(':'));
+        assert!(structured["chunk_seq"].as_u64().is_some());
+        let chunk_content = structured["chunk_content"].as_str().unwrap();
+        assert!(chunk_content.contains("项目偏好"));
+        let tokenized = structured["chunk_content_tokenized"].as_str().unwrap();
+        // Jieba should have segmented the Chinese — tokenized must
+        // be space-delimited and contain the multi-char Chinese token
+        // somewhere.
+        assert!(
+            tokenized.contains(' ') || tokenized.chars().count() < chunk_content.chars().count(),
+            "tokenized form should be space-joined jieba tokens, got {tokenized:?}"
+        );
+        assert!(structured["chunk_token_estimate"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn trace_provenance_chunk_id_unknown_returns_error() {
+        let r = make_record("claude-code", "abc", "y", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "trace_provenance",
+                    "arguments": {"chunk_id": "no-such-chunk:0"}
+                }),
+            ))
+            .await;
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("chunk not found"));
+    }
+
+    #[tokio::test]
+    async fn trace_provenance_requires_id_or_chunk_id() {
+        let r = make_record("claude-code", "abc", "y", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "trace_provenance", "arguments": {}}),
+            ))
+            .await;
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("requires either"));
     }
 
     #[tokio::test]
