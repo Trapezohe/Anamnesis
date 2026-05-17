@@ -533,16 +533,20 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             Ok(())
         }
         SourceCmd::List => {
-            let rows = store.list_sources_full()?;
+            // Round-9: show per-source counts alongside last_import so
+            // operators can spot "registered but empty" sources at a
+            // glance — same signal MCP agents get from list_sources.
+            let rows = store.list_sources_with_counts()?;
             if rows.is_empty() {
                 println!("no sources registered");
             } else {
                 println!(
-                    "{:<14} {:<14} {:<48} {}",
-                    "adapter", "instance", "location", "last_import"
+                    "{:<14} {:<14} {:<8} {:<8} {:<20} {}",
+                    "adapter", "instance", "records", "chunks", "last_import", "location"
                 );
                 for r in rows {
                     let last = r
+                        .source
                         .last_import_at
                         .map(|t| {
                             chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
@@ -551,11 +555,13 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
                         })
                         .unwrap_or_else(|| "<never>".into());
                     println!(
-                        "{:<14} {:<14} {:<48} {}",
-                        r.adapter,
-                        r.instance,
-                        r.location.unwrap_or_default(),
+                        "{:<14} {:<14} {:<8} {:<8} {:<20} {}",
+                        r.source.adapter,
+                        r.source.instance,
+                        r.record_count,
+                        r.chunk_count,
                         last,
+                        r.source.location.unwrap_or_default(),
                     );
                 }
             }
