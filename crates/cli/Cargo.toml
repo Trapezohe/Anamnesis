@@ -35,11 +35,15 @@ futures = { workspace = true }
 rusqlite = { workspace = true }
 
 [features]
-default = ["local-fastembed"]
+default = ["local-fastembed", "sse"]
 local-fastembed = ["anamnesis-embedder/local-fastembed", "anamnesis-mcp-server/local-fastembed"]
+# Wires `anamnesis serve --sse <port>` to the in-process MCP HTTP
+# transport. Off → CLI still builds, but `--sse` errors at runtime.
+sse = ["anamnesis-mcp-server/sse"]
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 rusqlite = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

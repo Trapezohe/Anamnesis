@@ -53,7 +53,13 @@ impl HttpServerConfig {
 }
 
 /// Build a router and serve until the process is killed or the future
-/// is dropped. Returns the bound address (useful for tests).
+/// is dropped.
+///
+/// Always prints the *actual* bound address to stderr (`anamnesis-mcp
+/// HTTP — listening on http://127.0.0.1:<port>`) after the listener is
+/// open — this is required for `--sse 0` ephemeral-port mode: tests and
+/// supervisors need a way to discover which port the kernel picked.
+/// Format is stable: `^anamnesis-mcp HTTP — listening on http://127\.0\.0\.1:(\d+)$`.
 pub async fn run(server: AnamnesisServer, config: HttpServerConfig) -> anyhow::Result<()> {
     let app_state = AppState::new(server, config.token);
     eprintln!(
@@ -65,7 +71,9 @@ pub async fn run(server: AnamnesisServer, config: HttpServerConfig) -> anyhow::R
     let app = build_router(Arc::new(app_state));
     let addr: SocketAddr = ([127, 0, 0, 1], config.port).into();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(addr = %addr, "anamnesis-mcp HTTP listening");
+    let bound = listener.local_addr()?;
+    eprintln!("anamnesis-mcp HTTP — listening on http://{bound}");
+    info!(addr = %bound, "anamnesis-mcp HTTP listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
