@@ -12,7 +12,7 @@ use anamnesis_adapter_codex::{codex_adapter, CodexDetector};
 use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
 use anamnesis_core::discovery::{DetectOpts, Discovery};
 use anamnesis_embedder::registry;
-use anamnesis_importer::ImportRunner;
+use anamnesis_importer::{ImportOptions, ImportService};
 use anamnesis_search::{pack, ContextBudget, HybridOpts, HybridSearcher, SearchMode};
 use anamnesis_store::Store;
 use anyhow::{anyhow, Context, Result};
@@ -976,75 +976,37 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     canonical_location: Option<&std::path::Path>,
     source_was_explicit: bool,
 ) -> Result<()> {
-    // PR-B: dry-run NEVER touches the source registry — `added_at` and
-    // `last_import_at` should reflect only real, persisted imports.
+    // Round-18 (§-1.5 PR-3): the side effects of an import — preserving
+    // registry `config_json`, stamping `last_import_at`, appending to
+    // `audit.log` — used to live inline here. They now live in
+    // `ImportService` so the MCP `tool_import_source` path produces the
+    // exact same system-state delta. The CLI keeps the local pieces
+    // that MCP shouldn't do: a) the human-readable progress line, b)
+    // running the embedding worker (which can take minutes — fine for
+    // CLI, but would block an MCP JSON-RPC request indefinitely).
+    let store = Store::open(db_path(data_dir))?;
+    let service = ImportService::new(&store, audit(data_dir));
+    let summary = service
+        .import(
+            adapter,
+            ImportOptions {
+                dry_run,
+                canonical_location: canonical_location.map(|p| p.display().to_string()),
+                source_was_explicit,
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("import: {e}"))?;
+
     if dry_run {
-        use anamnesis_core::adapter::ScanOpts;
-        use futures::StreamExt;
-        let mut stream = adapter.scan(ScanOpts::default());
-        let mut seen = 0usize;
-        while let Some(item) = stream.next().await {
-            if item.is_ok() {
-                seen += 1;
-            }
-        }
-        println!("dry-run: would import {seen} raw record(s)");
+        println!("dry-run: would import {} raw record(s)", summary.raw_seen);
         return Ok(());
     }
 
-    let store = Store::open(db_path(data_dir))?;
-    let descriptor = adapter.descriptor();
-
-    // PR-B: register the source BEFORE running the import so even a
-    // partial / erroring import shows up in `source list` — otherwise
-    // operators have no way to inspect which path the run was reading
-    // from. We only stamp `last_import_at` after success below.
-    //
-    // Round-17 (§19.3 PR-1): preserve any existing `location` /
-    // `config_json` (e.g. generic-mcp's URL and `{"token_env": "..."}`)
-    // when auto-re-registering. The previous code unconditionally wrote
-    // `config_json = NULL` here, which would clobber the operator's
-    // `source add --token-env` choice on every import; URL-based
-    // adapters also pass `canonical_location = None`, which would have
-    // erased their stored URL.
-    let existing = store.get_source(&descriptor.adapter, descriptor.instance.as_deref())?;
-    let new_location: Option<String> = canonical_location
-        .map(|p| p.display().to_string())
-        .or_else(|| existing.as_ref().and_then(|r| r.location.clone()));
-    let existing_config = existing.and_then(|r| r.config_json);
-    store.register_source(
-        &descriptor.adapter,
-        descriptor.instance.as_deref(),
-        new_location.as_deref(),
-        existing_config.as_deref(),
-    )?;
-
-    let summary = ImportRunner::new(adapter).run(&store).await?;
     println!(
         "import done: {} raw, {} upserted, {} chunks, {} errors",
         summary.raw_seen, summary.records_upserted, summary.chunks_written, summary.errors
     );
-
-    // PR-B: only stamp `last_import_at` when the run reached this point
-    // (ImportRunner::run only returns Err on store-level failures; per-
-    // record failures are counted in `summary.errors` and logged to
-    // `import_errors` but do NOT abort the run, so it's correct to mark
-    // the source as having been imported successfully).
-    store.update_last_import_at(&descriptor.adapter, descriptor.instance.as_deref())?;
-
-    audit(data_dir).record(anamnesis_core::AuditEntry::new(
-        "import",
-        serde_json::json!({
-            "adapter": descriptor.adapter,
-            "instance": descriptor.instance,
-            "raw_seen": summary.raw_seen,
-            "records_upserted": summary.records_upserted,
-            "chunks_written": summary.chunks_written,
-            "errors": summary.errors,
-            "location": new_location,
-            "source_was_explicit": source_was_explicit,
-        }),
-    ));
 
     if !no_embed {
         run_embed_worker(&store).await?;

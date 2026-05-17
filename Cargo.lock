@@ -203,6 +203,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -214,6 +215,7 @@ version = "0.0.1"
 dependencies = [
  "anamnesis-adapter-claude-code",
  "anamnesis-adapter-codex",
+ "anamnesis-adapter-generic-mcp",
  "anamnesis-adapter-mem0",
  "anamnesis-core",
  "anamnesis-embedder",
@@ -229,6 +231,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

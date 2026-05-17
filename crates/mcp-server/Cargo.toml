@@ -28,6 +28,7 @@ anamnesis-importer = { workspace = true }
 anamnesis-adapter-claude-code = { workspace = true }
 anamnesis-adapter-codex = { workspace = true }
 anamnesis-adapter-mem0 = { workspace = true }
+anamnesis-adapter-generic-mcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -50,3 +51,4 @@ tokio-stream = { version = "0.1", optional = true }
 tempfile = "3"
 chrono = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { workspace = true }
