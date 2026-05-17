@@ -298,7 +298,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Model(sub) => cmd_model(&data_dir, sub).await,
-        Command::Serve { sse } => cmd_serve(&data_dir, sse).await,
+        Command::Serve { sse } => cmd_serve(&data_dir, sse, config.server.allow_admin_tools).await,
         Command::Export {
             out,
             format,
@@ -318,7 +318,11 @@ async fn main() -> Result<()> {
 // dedicated `anamnesis-mcp` binary, but one less binary for users to wire up).
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn cmd_serve(data_dir: &std::path::Path, sse: Option<u16>) -> Result<()> {
+async fn cmd_serve(
+    data_dir: &std::path::Path,
+    sse: Option<u16>,
+    allow_admin_tools: bool,
+) -> Result<()> {
     if sse.is_some() {
         return Err(anyhow!(
             "SSE transport is not yet wired into `anamnesis serve` — see Phase 4. \
@@ -329,16 +333,29 @@ async fn cmd_serve(data_dir: &std::path::Path, sse: Option<u16>) -> Result<()> {
     let active_model = store.active_model().ok().flatten();
     let provider = open_active_provider_optional(data_dir, &store, active_model.as_deref());
     let server =
-        anamnesis_mcp_server::AnamnesisServer::new(store, provider, data_dir.to_path_buf());
+        anamnesis_mcp_server::AnamnesisServer::new(store, provider, data_dir.to_path_buf())
+            .with_admin_tools(allow_admin_tools);
     eprintln!(
-        "anamnesis serve (stdio) — active model: {}",
-        active_model.as_deref().unwrap_or("<unset>")
+        "anamnesis serve (stdio) — active model: {}, admin tools: {}",
+        active_model.as_deref().unwrap_or("<unset>"),
+        if allow_admin_tools {
+            "ENABLED"
+        } else {
+            "disabled"
+        },
     );
+    if allow_admin_tools {
+        eprintln!(
+            "  ⚠ admin tools enabled — `import_source` is callable. \
+             Run only with trusted clients."
+        );
+    }
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
         "serve.start",
         serde_json::json!({
             "transport": "stdio",
             "active_model": active_model,
+            "allow_admin_tools": allow_admin_tools,
         }),
     ));
     anamnesis_mcp_server::stdio::run(server).await

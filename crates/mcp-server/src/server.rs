@@ -33,9 +33,20 @@ pub const SERVER_NAME: &str = "anamnesis";
 /// Spec version we target — clients should validate compatibility.
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Server state. `Store` is `Send + Sync` (its connection sits behind an
-/// internal Mutex), so we can hold it directly and pass `&Store` to
-/// every handler without an extra wrapper.
+/// Set of admin-only tool names. These mutate state, touch arbitrary
+/// filesystem paths, or otherwise stray outside read-only memory access.
+/// Hidden from `tools/list` and rejected by `tools/call` unless
+/// `AnamnesisServer::allow_admin_tools` is true. See BLUEPRINT §17.5 PR-A.
+pub const ADMIN_TOOLS: &[&str] = &["import_source"];
+
+/// Was this tool tagged as admin?
+fn is_admin_tool(name: &str) -> bool {
+    ADMIN_TOOLS.contains(&name)
+}
+
+/// Stateful MCP server wrapping a `Store` and (optionally) an
+/// `EmbeddingProvider`. Built once and reused across all incoming
+/// requests on any transport (stdio, SSE/HTTP).
 pub struct AnamnesisServer {
     store: Store,
     provider: Option<Box<dyn EmbeddingProvider>>,
@@ -44,10 +55,15 @@ pub struct AnamnesisServer {
     pub data_dir: PathBuf,
     /// HOME override — same role as in CLI; lets tests stub paths.
     pub home_override: Option<PathBuf>,
+    /// Expose admin tools (currently `import_source`) over MCP.
+    /// Defaults to `false` — see `ADMIN_TOOLS` for the list.
+    allow_admin_tools: bool,
 }
 
 impl AnamnesisServer {
     /// Build a new server wrapping the given store + optional provider.
+    /// Admin tools are OFF by default; enable with `with_admin_tools(true)`
+    /// only when the server is reachable solely by trusted clients.
     pub fn new(
         store: Store,
         provider: Option<Box<dyn EmbeddingProvider>>,
@@ -58,6 +74,7 @@ impl AnamnesisServer {
             provider,
             data_dir,
             home_override: None,
+            allow_admin_tools: false,
         }
     }
 
@@ -65,6 +82,17 @@ impl AnamnesisServer {
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home_override = Some(home);
         self
+    }
+
+    /// Enable or disable admin tools (currently `import_source`).
+    pub fn with_admin_tools(mut self, allow: bool) -> Self {
+        self.allow_admin_tools = allow;
+        self
+    }
+
+    /// Read the current admin flag — useful for diagnostics and tests.
+    pub fn admin_tools_allowed(&self) -> bool {
+        self.allow_admin_tools
     }
 
     fn home(&self) -> PathBuf {
@@ -82,7 +110,7 @@ impl AnamnesisServer {
             "initialize" => JsonRpcResponse::ok(id, self.initialize_result()),
             "notifications/initialized" => JsonRpcResponse::ok(id, Value::Null),
             "ping" => JsonRpcResponse::ok(id, json!({})),
-            "tools/list" => JsonRpcResponse::ok(id, tools_list_payload()),
+            "tools/list" => JsonRpcResponse::ok(id, self.tools_list_payload()),
             "tools/call" => self.handle_tools_call(id, req.params).await,
             "resources/list" => JsonRpcResponse::ok(id, resources_list_payload()),
             "resources/read" => self.handle_resources_read(id, req.params).await,
@@ -112,6 +140,23 @@ impl AnamnesisServer {
             Some(n) => n.to_string(),
             None => return JsonRpcResponse::err(id, -32602, "missing tools/call.name"),
         };
+        // BLUEPRINT §17.5 PR-A — the load-bearing check.
+        //
+        // We don't only filter admin tools from `tools/list` because a
+        // client may have cached the schema (or hard-coded the name) and
+        // call `tools/call` directly. Rejecting at the dispatcher is the
+        // only thing that genuinely closes the hole.
+        if is_admin_tool(&name) && !self.allow_admin_tools {
+            return JsonRpcResponse::err(
+                id,
+                -32601,
+                format!(
+                    "tool {name:?} is an admin tool and disabled on this server \
+                     (set [server.mcp] allow_admin_tools = true in config to enable; \
+                     prefer running this operation via the CLI instead)"
+                ),
+            );
+        }
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
         let result = match name.as_str() {
             "search_memories" => self.tool_search_memories(args).await,
@@ -639,7 +684,31 @@ impl AnamnesisServer {
 // Tool / resource catalogues
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn tools_list_payload() -> Value {
+impl AnamnesisServer {
+    /// Build the `tools/list` payload, hiding admin tools (see
+    /// [`ADMIN_TOOLS`]) when `allow_admin_tools` is false. The dispatcher
+    /// in `handle_tools_call` enforces the same gate at call time — this
+    /// filter is *cosmetic* protection against discovery, never the only
+    /// line of defense.
+    fn tools_list_payload(&self) -> Value {
+        let mut payload = tools_list_payload_all();
+        if !self.allow_admin_tools {
+            if let Some(arr) = payload.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                arr.retain(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| !is_admin_tool(n))
+                        .unwrap_or(true)
+                });
+            }
+        }
+        payload
+    }
+}
+
+/// The full catalogue of MCP tools the server knows about, before any
+/// admin gating. Used as the seed by `AnamnesisServer::tools_list_payload`.
+fn tools_list_payload_all() -> Value {
     json!({
         "tools": [
             {
@@ -828,17 +897,47 @@ mod tests {
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
     }
 
-    #[tokio::test]
-    async fn tools_list_includes_all_five() {
-        let s = server_with_records(&[]);
-        let resp = s.handle(req("tools/list", Value::Null)).await;
-        let payload = resp.result.unwrap();
-        let names: Vec<&str> = payload["tools"]
+    fn tool_names_from(payload: &Value) -> Vec<String> {
+        payload["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tools_list_hides_admin_tools_by_default() {
+        // PR-A: import_source is admin-gated and admin defaults to OFF.
+        let s = server_with_records(&[]);
+        assert!(!s.admin_tools_allowed(), "admin must default to off");
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let names = tool_names_from(&resp.result.unwrap());
+        for expected in [
+            "search_memories",
+            "get_record",
+            "list_sources",
+            "trace_provenance",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing tool {expected}"
+            );
+        }
+        assert!(
+            !names.contains(&"import_source".to_string()),
+            "import_source MUST be hidden by default — found in tools/list",
+        );
+        assert_eq!(names.len(), 4, "expect exactly 4 non-admin tools");
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_all_five_when_admin_enabled() {
+        // PR-A: with admin enabled, the full catalogue is back.
+        let store = Store::open_in_memory().unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let names = tool_names_from(&resp.result.unwrap());
         assert_eq!(names.len(), 5);
         for expected in [
             "search_memories",
@@ -847,7 +946,65 @@ mod tests {
             "import_source",
             "trace_provenance",
         ] {
-            assert!(names.contains(&expected), "missing tool {expected}");
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing tool {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_source_call_rejected_when_admin_disabled() {
+        // Codex-flagged trap: clients can cache the schema and call
+        // tools/call directly without going through tools/list. The
+        // server-side reject is the load-bearing check.
+        let s = server_with_records(&[]);
+        assert!(!s.admin_tools_allowed());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "import_source",
+                    "arguments": {"adapter": "claude-code", "path": "/tmp/nonexistent"}
+                }),
+            ))
+            .await;
+        // MUST be an MCP error, not a 200 success with empty payload.
+        let err = resp.error.expect("call must error out when admin disabled");
+        assert_eq!(err.code, -32601);
+        assert!(
+            err.message.contains("admin tool"),
+            "error message should explain why: {}",
+            err.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn import_source_call_dispatches_when_admin_enabled() {
+        // Sanity: with admin enabled the dispatch path reaches the
+        // handler. We don't run a real import here (no fixtures) — we
+        // assert the gate doesn't reject before the handler runs by
+        // checking the response shape is NOT the gate-error shape.
+        let store = Store::open_in_memory().unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "import_source",
+                    "arguments": {"adapter": "claude-code", "path": "/tmp/nonexistent-anamnesis-pr-a-test"}
+                }),
+            ))
+            .await;
+        // Either it succeeded (handler ran and reported 0 records) or
+        // it returned a handler-level error — neither must be the
+        // -32601 admin-gate error.
+        if let Some(err) = resp.error {
+            assert_ne!(
+                err.code, -32601,
+                "must not be the admin-gate error when admin is enabled (got: {})",
+                err.message,
+            );
         }
     }
 

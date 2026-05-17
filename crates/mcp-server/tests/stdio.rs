@@ -72,7 +72,8 @@ fn binary_responds_to_initialize_and_tools_list() {
     assert_eq!(init["id"], 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "anamnesis");
 
-    // 2. tools/list — should return 5 tools.
+    // 2. tools/list — admin tools (`import_source`) are off by default,
+    //    so we expect exactly 4 (the read-only catalogue).
     send(
         &mut stdin,
         serde_json::json!({
@@ -89,7 +90,12 @@ fn binary_responds_to_initialize_and_tools_list() {
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
-    assert_eq!(names.len(), 5);
+    assert_eq!(
+        names.len(),
+        4,
+        "import_source should be hidden by default; got {names:?}"
+    );
+    assert!(!names.contains(&"import_source".to_string()));
     assert!(names.contains(&"search_memories".to_string()));
     assert!(names.contains(&"list_sources".to_string()));
 

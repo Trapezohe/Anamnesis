@@ -80,6 +80,14 @@ struct Cli {
     /// token is generated and printed to stderr on startup.
     #[arg(long, env = "ANAMNESIS_MCP_TOKEN")]
     token: Option<String>,
+    /// Expose admin tools (currently `import_source`) over MCP.
+    ///
+    /// Off by default — an MCP server should be a read-only memory
+    /// provider. Only enable this when every connected client is trusted
+    /// (the bearer-token-gated HTTP transport on loopback is the typical
+    /// case). See BLUEPRINT §17.5 PR-A.
+    #[arg(long, env = "ANAMNESIS_MCP_ALLOW_ADMIN")]
+    allow_admin_tools: bool,
 }
 
 #[tokio::main]
@@ -98,7 +106,15 @@ async fn main() -> Result<()> {
     let store = Store::open(&db_path).with_context(|| format!("open {}", db_path.display()))?;
     let active_model = store.active_model().ok().flatten();
     let provider = try_open_provider(&data_dir, active_model.as_deref());
-    let server = AnamnesisServer::new(store, provider, data_dir.clone());
+    let server = AnamnesisServer::new(store, provider, data_dir.clone())
+        .with_admin_tools(cli.allow_admin_tools);
+
+    if cli.allow_admin_tools {
+        tracing::warn!(
+            "admin tools enabled — `import_source` is callable over MCP. \
+             Only use this with trusted clients."
+        );
+    }
 
     if let Some(port) = cli.sse {
         run_http(server, port, cli.token).await
@@ -107,6 +123,7 @@ async fn main() -> Result<()> {
             version = env!("CARGO_PKG_VERSION"),
             data_dir = %data_dir.display(),
             active_model = active_model.as_deref().unwrap_or("<unset>"),
+            admin_tools = cli.allow_admin_tools,
             "anamnesis-mcp stdio server ready",
         );
         anamnesis_mcp_server::stdio::run(server).await

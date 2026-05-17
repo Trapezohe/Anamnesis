@@ -74,6 +74,15 @@ pub struct ServerConfig {
     /// when SSE is enabled).
     #[serde(default = "default_require_token")]
     pub require_token: bool,
+    /// Whether admin tools (`import_source`, etc.) are exposed over MCP.
+    ///
+    /// Disabled by default — an MCP server is a *memory provider*, not a
+    /// remote shell. Tools that mutate state, read arbitrary filesystem
+    /// paths, or otherwise step outside read-only memory access live
+    /// behind this flag. Set to `true` only if you trust every connected
+    /// MCP client. See BLUEPRINT §17.5 PR-A.
+    #[serde(default = "default_allow_admin_tools")]
+    pub allow_admin_tools: bool,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +90,7 @@ impl Default for ServerConfig {
         Self {
             allowed_clients: default_allowed_clients(),
             require_token: default_require_token(),
+            allow_admin_tools: default_allow_admin_tools(),
         }
     }
 }
@@ -90,6 +100,9 @@ fn default_allowed_clients() -> Vec<String> {
 }
 fn default_require_token() -> bool {
     true
+}
+fn default_allow_admin_tools() -> bool {
+    false
 }
 
 /// One pre-registered source entry.
