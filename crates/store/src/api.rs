@@ -669,6 +669,55 @@ impl Store {
         let row = stmt.query_row(params![id.0], record_from_row).optional()?;
         Ok(row)
     }
+
+    /// Fetch one chunk by its id.
+    ///
+    /// `chunk_id` is the synthetic `"{record_id}:{seq}"` string written
+    /// by `write_chunks`. We don't parse it here — instead we JOIN
+    /// `record_chunks` against `records` so the returned parent
+    /// `record_id` survives any future change to the chunk-id format
+    /// without callers having to update.
+    pub fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkLookup>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT rc.id, rc.record_id, rc.seq, rc.content, \
+                    rc.content_hash, rc.token_estimate \
+             FROM record_chunks rc \
+             WHERE rc.id = ?1",
+            params![chunk_id],
+            |r| {
+                Ok(ChunkLookup {
+                    chunk_id: r.get(0)?,
+                    record_id: RecordId(r.get(1)?),
+                    seq: r.get::<_, i64>(2)? as u32,
+                    content: r.get(3)?,
+                    content_hash: ContentHash(r.get(4)?),
+                    token_estimate: r.get::<_, i64>(5)? as u32,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+}
+
+/// One chunk row, joined with enough provenance for downstream tools
+/// (currently `trace_provenance`) to surface chunk-level debug info
+/// without a second round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkLookup {
+    /// The synthetic chunk id (`"{record_id}:{seq}"`).
+    pub chunk_id: String,
+    /// Parent record id.
+    pub record_id: RecordId,
+    /// Per-record chunk index.
+    pub seq: u32,
+    /// Chunk text content (original, NOT jieba-tokenized).
+    pub content: String,
+    /// `blake3` of the content — match key for embedding-job dedup.
+    pub content_hash: ContentHash,
+    /// Heuristic token count used by the chunker.
+    pub token_estimate: u32,
 }
 
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnamnesisRecord> {
