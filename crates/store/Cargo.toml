@@ -16,5 +16,6 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 parking_lot = "0.12"
+jieba-rs = "0.7"

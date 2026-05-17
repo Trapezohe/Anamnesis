@@ -9,11 +9,13 @@
 #![warn(missing_docs)]
 
 pub mod api;
+pub mod cjk;
 
 pub use api::{ChunkHit, PendingEmbeddingJob, SearchFilter, SourceRow, StoreStats};
 
 use std::path::Path;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
 use thiserror::Error;
 
@@ -22,7 +24,27 @@ use thiserror::Error;
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
     ("0002_phase1", include_str!("migrations/0002_phase1.sql")),
+    ("0003_cjk_fts", include_str!("migrations/0003_cjk_fts.sql")),
 ];
+
+/// Register the `tokenize_cjk(text)` SQLite scalar function on `conn`.
+///
+/// The function is called by the `chunks_fts` triggers (`0003_cjk_fts`)
+/// to turn record content into a jieba-segmented token stream before it
+/// hits the FTS index. Must be installed on EVERY connection before any
+/// trigger fires — the migration itself sets it up, and `Store::open`
+/// re-registers because each fresh `Connection` starts without it.
+fn register_cjk_function(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "tokenize_cjk",
+        1,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let text: String = ctx.get(0).unwrap_or_default();
+            Ok(crate::cjk::tokenize_indexing(&text))
+        },
+    )
+}
 
 /// Store-layer errors.
 #[derive(Debug, Error)]
@@ -58,21 +80,74 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        register_cjk_function(&conn)?;
         let store = Self {
             conn: parking_lot::Mutex::new(conn),
         };
         store.run_migrations()?;
+        store.reindex_fts_if_pending()?;
         Ok(store)
     }
 
     /// Open an in-memory store (useful for tests).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        register_cjk_function(&conn)?;
         let store = Self {
             conn: parking_lot::Mutex::new(conn),
         };
         store.run_migrations()?;
+        store.reindex_fts_if_pending()?;
         Ok(store)
+    }
+
+    /// If migration 0003 set the `chunks_fts_rebuild_pending` flag,
+    /// re-tokenize and re-insert every row from `record_chunks` into
+    /// `chunks_fts`, then clear the flag.
+    ///
+    /// This is the second half of the 0003 migration: the SQL part can
+    /// only drop the FTS data, because `tokenize_cjk` is per-connection
+    /// and not guaranteed to be installed at migration time on a fresh
+    /// DB. Doing the rebuild here keeps the work idempotent (no flag →
+    /// no-op) and bounded (flagged once per DB lifetime).
+    fn reindex_fts_if_pending(&self) -> Result<()> {
+        let pending: Option<String> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'chunks_fts_rebuild_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        if pending.as_deref() != Some("1") {
+            return Ok(());
+        }
+        tracing::info!("0003_cjk_fts: re-tokenising existing record_chunks into chunks_fts");
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // Wipe whatever's in chunks_fts (external-content mode means
+        // there's no automatic clear when triggers re-insert).
+        tx.execute(
+            "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all')",
+            [],
+        )?;
+        // Re-insert each chunk through the new tokenize_cjk trigger.
+        // We do it via UPDATE-noop on record_chunks so the AFTER UPDATE
+        // trigger fires consistently, which avoids encoding the
+        // tokenization logic in two places.
+        let n: usize = tx.execute(
+            "INSERT INTO chunks_fts(rowid, content)
+             SELECT rowid, tokenize_cjk(content) FROM record_chunks",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key = 'chunks_fts_rebuild_pending'",
+            [],
+        )?;
+        tx.commit()?;
+        tracing::info!(reindexed_rows = n, "0003_cjk_fts: chunks_fts rebuilt");
+        Ok(())
     }
 
     fn run_migrations(&self) -> Result<()> {
@@ -134,7 +209,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        assert_eq!(version, "3");
     }
 
     #[test]
