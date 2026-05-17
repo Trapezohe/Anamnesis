@@ -6,6 +6,31 @@
 //! overkill. If a memory file uses a richer YAML shape we cannot parse,
 //! we just leave those fields empty; the normalizer falls back to safe
 //! defaults.
+//!
+//! ## `type:` resolution (PR-G, BLUEPRINT §18.4 F2)
+//!
+//! We support **both** shapes Claude Code memory files use in the wild:
+//!
+//! ```yaml
+//! metadata:
+//!   type: reference        # Format A — current auto-generated shape (preferred)
+//! ```
+//!
+//! ```yaml
+//! type: feedback           # Format B — older / hand-written shape (fallback)
+//! ```
+//!
+//! Resolution order: `metadata.type` first, top-level `type` second.
+//! Either way, every other top-level key (e.g. `originSessionId`,
+//! `node_type`, custom annotations) is preserved verbatim in
+//! [`Frontmatter::extras`] so the normalizer can flow it into
+//! `record.metadata` without dropping provenance.
+
+use std::collections::BTreeMap;
+
+// Reserved top-level keys handled by the match in `parse_yaml` directly:
+// `name`, `description`, `type`, `metadata`. Anything else flows into
+// `Frontmatter::extras`.
 
 /// Parsed frontmatter fields we care about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -14,8 +39,14 @@ pub struct Frontmatter {
     pub name: Option<String>,
     /// `description:` one-line summary.
     pub description: Option<String>,
-    /// `metadata.type:` — one of {user, feedback, project, reference}.
+    /// Resolved memory type — one of {user, feedback, project, reference,
+    /// preference, skill}. Falls back from `metadata.type` to top-level
+    /// `type:`. See module docs.
     pub mem_type: Option<String>,
+    /// All other top-level scalar keys, preserved for the normalizer to
+    /// flow into `record.metadata`. Includes things like `originSessionId`,
+    /// `node_type`, etc. Sorted for stable test assertions.
+    pub extras: BTreeMap<String, String>,
 }
 
 /// Outcome of splitting a memory file.
@@ -88,6 +119,8 @@ fn find_close(s: &str) -> Option<usize> {
 
 fn parse_yaml(yaml: &str) -> Frontmatter {
     let mut out = Frontmatter::default();
+    let mut top_level_type: Option<String> = None;
+    let mut metadata_type: Option<String> = None;
     let mut in_metadata = false;
     for raw_line in yaml.lines() {
         let line = raw_line.trim_end();
@@ -102,23 +135,37 @@ fn parse_yaml(yaml: &str) -> Frontmatter {
                 match k {
                     "name" => out.name = Some(v),
                     "description" => out.description = Some(v),
+                    "type" => {
+                        // Format B — top-level type. Used as fallback when
+                        // metadata.type is absent (see module docs).
+                        top_level_type = Some(v);
+                    }
                     "metadata" => {
                         // Either `metadata: {...}` inline (skipped — too rare to
                         // parse without a real YAML lib) or a nested block.
                         in_metadata = v.is_empty();
                     }
-                    _ => {}
+                    _ => {
+                        // Preserve everything else for the normalizer to
+                        // flow into record.metadata. Skip empty values to
+                        // avoid noise.
+                        if !v.is_empty() {
+                            out.extras.insert(k.to_string(), v);
+                        }
+                    }
                 }
             }
         } else if in_metadata {
             // Indented metadata.* lines.
             if let Some((k, v)) = split_key_value(line.trim_start()) {
                 if k == "type" {
-                    out.mem_type = Some(v);
+                    metadata_type = Some(v);
                 }
             }
         }
     }
+    // Resolution order: metadata.type wins; top-level type is the fallback.
+    out.mem_type = metadata_type.or(top_level_type);
     out
 }
 
@@ -216,5 +263,101 @@ Body."#;
         let input = "---\nname: x\nmetadata:\n  type: user\n---\nhello\nworld\n";
         let s = split(input);
         assert_eq!(s.body, "hello\nworld\n");
+    }
+
+    // ─── PR-G: top-level `type:` + extras preservation ───
+
+    #[test]
+    fn top_level_type_is_used_when_no_metadata_block() {
+        // Format B in the wild: hand-written / older auto-memory.
+        let input = r#"---
+name: project-location
+description: prefer ~/Desktop over /tmp
+type: feedback
+originSessionId: 76a78a2d-e2af-4a15-9be4-f970d9e26e41
+---
+body"#;
+        let fm = split(input).frontmatter;
+        assert_eq!(
+            fm.mem_type.as_deref(),
+            Some("feedback"),
+            "top-level type: feedback must resolve when metadata.type is absent"
+        );
+        assert_eq!(
+            fm.extras.get("originSessionId").map(String::as_str),
+            Some("76a78a2d-e2af-4a15-9be4-f970d9e26e41"),
+            "originSessionId must be preserved for the normalizer"
+        );
+    }
+
+    #[test]
+    fn metadata_type_wins_over_top_level_type() {
+        // If a file has both (rare but possible), metadata.type is
+        // authoritative — that's the Claude Code auto-generated convention.
+        let input = r#"---
+name: x
+type: feedback
+metadata:
+  type: reference
+---
+body"#;
+        let fm = split(input).frontmatter;
+        assert_eq!(
+            fm.mem_type.as_deref(),
+            Some("reference"),
+            "metadata.type overrides top-level type"
+        );
+    }
+
+    #[test]
+    fn extras_capture_unknown_top_level_keys() {
+        let input = r#"---
+name: x
+description: y
+metadata:
+  type: reference
+originSessionId: abc-123
+node_type: memory
+custom_tag: foo
+---
+body"#;
+        let fm = split(input).frontmatter;
+        assert_eq!(fm.mem_type.as_deref(), Some("reference"));
+        let snapshot: Vec<_> = fm.extras.iter().collect();
+        // BTreeMap iteration is sorted, so we can assert exact contents.
+        assert_eq!(
+            snapshot,
+            vec![
+                (&"custom_tag".to_string(), &"foo".to_string()),
+                (&"node_type".to_string(), &"memory".to_string()),
+                (&"originSessionId".to_string(), &"abc-123".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reserved_keys_do_not_leak_into_extras() {
+        let input = r#"---
+name: x
+description: y
+type: feedback
+metadata:
+  type: feedback
+---
+body"#;
+        let fm = split(input).frontmatter;
+        assert!(
+            fm.extras.is_empty(),
+            "reserved keys must not show up in extras"
+        );
+    }
+
+    #[test]
+    fn unrecognized_type_value_passes_through_to_normalizer() {
+        // Parser doesn't validate against the enum — normalizer does.
+        // We just make sure the raw string round-trips.
+        let input = "---\ntype: weird-experimental\n---\nbody";
+        let fm = split(input).frontmatter;
+        assert_eq!(fm.mem_type.as_deref(), Some("weird-experimental"));
     }
 }
