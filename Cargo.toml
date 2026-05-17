@@ -12,6 +12,7 @@ members = [
     "crates/adapter-codex",
     "crates/adapter-generic-mcp",
     "crates/adapter-mem0",
+    "crates/adapter-letta",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version =
 anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.2" }
 anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.2" }
 anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.2" }
+anamnesis-adapter-letta = { path = "crates/adapter-letta", version = "0.0.2" }
 anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.2", default-features = false }
 
 # Serialization
