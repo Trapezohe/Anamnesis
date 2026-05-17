@@ -419,7 +419,7 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     let store = Store::open(&db)?;
     let stats = store.stats()?;
     let active = store.active_model()?;
-    let sources = store.list_sources()?;
+    let sources = store.list_sources_full()?;
     if json {
         let payload = serde_json::json!({
             "initialized": true,
@@ -434,10 +434,12 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
                 "jobs_pending": stats.jobs_pending,
                 "jobs_failed": stats.jobs_failed,
             },
-            "sources": sources.iter().map(|(a, i, loc)| serde_json::json!({
-                "adapter": a,
-                "instance": if i.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(i.clone()) },
-                "location": loc,
+            "sources": sources.iter().map(|r| serde_json::json!({
+                "adapter": r.adapter,
+                "instance": if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
+                "location": r.location,
+                "added_at": r.added_at,
+                "last_import_at": r.last_import_at,
             })).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -514,13 +516,30 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             Ok(())
         }
         SourceCmd::List => {
-            let rows = store.list_sources()?;
+            let rows = store.list_sources_full()?;
             if rows.is_empty() {
                 println!("no sources registered");
             } else {
-                println!("{:<14} {:<14} {}", "adapter", "instance", "location");
-                for (a, i, loc) in rows {
-                    println!("{:<14} {:<14} {}", a, i, loc.unwrap_or_default());
+                println!(
+                    "{:<14} {:<14} {:<48} {}",
+                    "adapter", "instance", "location", "last_import"
+                );
+                for r in rows {
+                    let last = r
+                        .last_import_at
+                        .map(|t| {
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                                .map(|d| d.format("%Y-%m-%dT%H:%MZ").to_string())
+                                .unwrap_or_else(|| t.to_string())
+                        })
+                        .unwrap_or_else(|| "<never>".into());
+                    println!(
+                        "{:<14} {:<14} {:<48} {}",
+                        r.adapter,
+                        r.instance,
+                        r.location.unwrap_or_default(),
+                        last,
+                    );
                 }
             }
             Ok(())
@@ -554,34 +573,110 @@ async fn cmd_import(
     path_override: Option<&std::path::Path>,
 ) -> Result<()> {
     let (adapter_id, instance) = split_target(target);
+
+    // Reject unknown adapters before doing any registry / filesystem work
+    // so the error message is "not wired" rather than the more confusing
+    // "no default path".
+    if !is_known_adapter(adapter_id) {
+        return Err(anyhow!(
+            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0"
+        ));
+    }
+
+    // PR-B (BLUEPRINT §18.4 F5): the source registry is the canonical
+    // truth for "where does X live". Resolution order:
+    //
+    //   1. --path P    → trusted override; we'll register/overwrite P
+    //                    so the registry catches up to the explicit user
+    //                    intent.
+    //   2. registry    → use the location the user registered earlier via
+    //                    `source add`.
+    //   3. fallback    → adapter default path; auto-registered on success
+    //                    so the next `import` is no longer ambiguous.
+    //
+    // We never silently fall back from a registered (but missing) path
+    // to the adapter default — that would mask a misconfiguration; the
+    // adapter's health check will report the failure instead.
+    let store_for_lookup = Store::open(db_path(data_dir))?;
+    let registered = store_for_lookup.get_source(adapter_id, instance)?;
+    let registered_location = registered.as_ref().and_then(|r| r.location.clone());
+    drop(store_for_lookup);
+
+    let (location, source_was_explicit) = match path_override {
+        Some(p) => (p.to_path_buf(), true),
+        None => match registered_location {
+            Some(loc) => (PathBuf::from(loc), true),
+            None => (default_path_for(adapter_id)?, false),
+        },
+    };
+
     match adapter_id {
         anamnesis_adapter_claude_code::ADAPTER_ID => {
-            let projects_root = path_override
-                .map(PathBuf::from)
-                .map_or_else(|| home_join(&[".claude", "projects"]), Ok)?;
             let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
-                projects_root,
+                projects_root: location.clone(),
                 instance: instance.map(str::to_owned),
             });
-            run_import(data_dir, &adapter, dry_run, no_embed).await
+            run_import(
+                data_dir,
+                &adapter,
+                dry_run,
+                no_embed,
+                Some(&location),
+                source_was_explicit,
+            )
+            .await
         }
         anamnesis_adapter_mem0::ADAPTER_ID => {
-            let db_path_for_mem0 = path_override
-                .map(PathBuf::from)
-                .map_or_else(|| home_join(&[".mem0", "db.sqlite"]), Ok)?;
-            let adapter = mem0_sqlite_adapter(db_path_for_mem0, instance);
-            run_import(data_dir, &adapter, dry_run, no_embed).await
+            let adapter = mem0_sqlite_adapter(location.clone(), instance);
+            run_import(
+                data_dir,
+                &adapter,
+                dry_run,
+                no_embed,
+                Some(&location),
+                source_was_explicit,
+            )
+            .await
         }
         anamnesis_adapter_codex::ADAPTER_ID => {
-            let root = path_override
-                .map(PathBuf::from)
-                .map_or_else(|| home_join(&[".codex"]), Ok)?;
-            let adapter = codex_adapter(root, instance);
-            run_import(data_dir, &adapter, dry_run, no_embed).await
+            let adapter = codex_adapter(location.clone(), instance);
+            run_import(
+                data_dir,
+                &adapter,
+                dry_run,
+                no_embed,
+                Some(&location),
+                source_was_explicit,
+            )
+            .await
         }
         other => Err(anyhow!(
             "adapter {other:?} not wired; supported: claude-code, codex, mem0"
         )),
+    }
+}
+
+/// Whether `cmd_import` knows how to drive this adapter id. Used as the
+/// up-front gate so unknown adapters get a clear "not wired" error before
+/// any registry / filesystem work happens.
+fn is_known_adapter(adapter_id: &str) -> bool {
+    matches!(
+        adapter_id,
+        anamnesis_adapter_claude_code::ADAPTER_ID
+            | anamnesis_adapter_mem0::ADAPTER_ID
+            | anamnesis_adapter_codex::ADAPTER_ID
+    )
+}
+
+/// Adapter default discovery paths — used when neither `--path` nor a
+/// registered location is available. Keep in sync with each adapter's
+/// detector. Callers must gate on `is_known_adapter` first.
+fn default_path_for(adapter_id: &str) -> Result<PathBuf> {
+    match adapter_id {
+        anamnesis_adapter_claude_code::ADAPTER_ID => home_join(&[".claude", "projects"]),
+        anamnesis_adapter_mem0::ADAPTER_ID => home_join(&[".mem0", "db.sqlite"]),
+        anamnesis_adapter_codex::ADAPTER_ID => home_join(&[".codex"]),
+        other => Err(anyhow!("no default path for adapter {other:?}")),
     }
 }
 
@@ -590,7 +685,11 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     adapter: &A,
     dry_run: bool,
     no_embed: bool,
+    canonical_location: Option<&std::path::Path>,
+    source_was_explicit: bool,
 ) -> Result<()> {
+    // PR-B: dry-run NEVER touches the source registry — `added_at` and
+    // `last_import_at` should reflect only real, persisted imports.
     if dry_run {
         use anamnesis_core::adapter::ScanOpts;
         use futures::StreamExt;
@@ -607,11 +706,31 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
 
     let store = Store::open(db_path(data_dir))?;
     let descriptor = adapter.descriptor();
+
+    // PR-B: register the source BEFORE running the import so even a
+    // partial / erroring import shows up in `source list` — otherwise
+    // operators have no way to inspect which path the run was reading
+    // from. We only stamp `last_import_at` after success below.
+    let location_str = canonical_location.map(|p| p.display().to_string());
+    store.register_source(
+        &descriptor.adapter,
+        descriptor.instance.as_deref(),
+        location_str.as_deref(),
+        None,
+    )?;
+
     let summary = ImportRunner::new(adapter).run(&store).await?;
     println!(
         "import done: {} raw, {} upserted, {} chunks, {} errors",
         summary.raw_seen, summary.records_upserted, summary.chunks_written, summary.errors
     );
+
+    // PR-B: only stamp `last_import_at` when the run reached this point
+    // (ImportRunner::run only returns Err on store-level failures; per-
+    // record failures are counted in `summary.errors` and logged to
+    // `import_errors` but do NOT abort the run, so it's correct to mark
+    // the source as having been imported successfully).
+    store.update_last_import_at(&descriptor.adapter, descriptor.instance.as_deref())?;
 
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
         "import",
@@ -622,6 +741,8 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
             "records_upserted": summary.records_upserted,
             "chunks_written": summary.chunks_written,
             "errors": summary.errors,
+            "location": location_str,
+            "source_was_explicit": source_was_explicit,
         }),
     ));
 
