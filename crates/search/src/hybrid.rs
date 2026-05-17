@@ -67,6 +67,11 @@ impl HybridOpts {
 }
 
 /// A merged hit returned by the hybrid searcher.
+///
+/// Carries enough breakdown for an MCP client / agent to understand
+/// *why* this chunk surfaced — was it FTS, vector, both? — and to
+/// chain into follow-up MCP tools like `trace_provenance` without a
+/// second round trip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedChunk {
     /// Chunk id (`"{record_id}:{seq}"`).
@@ -77,8 +82,15 @@ pub struct RankedChunk {
     pub seq: u32,
     /// The chunk text (for snippet rendering).
     pub content: String,
-    /// Final RRF score (sum of `1/(K+rank)` across hit lists).
+    /// Final RRF score (sum of `1/(K+rank)` across hit lists). This is
+    /// the value the packer uses for record-level ranking.
     pub score: f64,
+    /// The raw FTS bm25 score (already negated so larger = better) when
+    /// FTS contributed to this hit. `None` when only vector matched.
+    pub fts_score: Option<f64>,
+    /// The raw vector cosine when vector kNN contributed. `None` when
+    /// only FTS matched.
+    pub vector_score: Option<f64>,
     /// `true` if FTS contributed to this hit.
     pub from_fts: bool,
     /// `true` if vector search contributed to this hit.
@@ -189,7 +201,12 @@ pub mod rrf {
     use std::collections::HashMap;
 
     /// Merge two ranked hit lists via Reciprocal Rank Fusion.
-    /// Returns the top-`limit` items by combined score.
+    ///
+    /// Returns the top-`limit` items by combined RRF score. Each
+    /// returned `RankedChunk` also carries the raw per-modality scores
+    /// (`fts_score`, `vector_score`) so downstream consumers — MCP
+    /// agents in particular — can explain "why did this surface" without
+    /// a round trip back to the index.
     pub fn merge(fts: &[ChunkHit], vec: &[ChunkHit], limit: usize) -> Vec<RankedChunk> {
         let mut acc: HashMap<String, RankedChunk> = HashMap::new();
         for (rank, hit) in fts.iter().enumerate() {
@@ -201,10 +218,13 @@ pub mod rrf {
                     seq: hit.seq,
                     content: hit.content.clone(),
                     score: 0.0,
+                    fts_score: None,
+                    vector_score: None,
                     from_fts: false,
                     from_vec: false,
                 });
             entry.score += 1.0 / (RRF_K + rank as f64 + 1.0);
+            entry.fts_score = Some(hit.score);
             entry.from_fts = true;
         }
         for (rank, hit) in vec.iter().enumerate() {
@@ -216,10 +236,13 @@ pub mod rrf {
                     seq: hit.seq,
                     content: hit.content.clone(),
                     score: 0.0,
+                    fts_score: None,
+                    vector_score: None,
                     from_fts: false,
                     from_vec: false,
                 });
             entry.score += 1.0 / (RRF_K + rank as f64 + 1.0);
+            entry.vector_score = Some(hit.score);
             entry.from_vec = true;
         }
         let mut out: Vec<RankedChunk> = acc.into_values().collect();

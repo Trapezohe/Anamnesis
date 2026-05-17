@@ -1093,16 +1093,30 @@ async fn cmd_search(
         let payload = serde_json::json!({
             "query": query,
             "mode": mode_str,
-            "results": filtered.iter().map(|p| serde_json::json!({
-                "record_id": p.record.id.0,
-                "adapter": p.record.source.adapter,
-                "instance": p.record.source.instance,
-                "kind": format!("{:?}", p.record.kind).to_lowercase(),
-                "scope": format!("{:?}", p.record.scope).to_lowercase(),
-                "score": p.score,
-                "snippet": p.matched_chunks.first().map(|c| c.content.clone()).unwrap_or_default(),
-                "native_path": p.record.provenance.native_path,
-            })).collect::<Vec<_>>(),
+            // Round-8: same expanded wire format as the MCP server so
+            // CLI and MCP consumers can rely on identical JSON shapes.
+            "results": filtered.iter().map(|p| {
+                let best = p.matched_chunks.first();
+                serde_json::json!({
+                    "record_id": p.record.id.0,
+                    "trace_id": p.record.id.0,
+                    "chunk_id": best.map(|c| c.chunk_id.clone()),
+                    "adapter": p.record.source.adapter,
+                    "instance": p.record.source.instance,
+                    "kind": format!("{:?}", p.record.kind).to_lowercase(),
+                    "scope": format!("{:?}", p.record.scope).to_lowercase(),
+                    "score": p.score,
+                    "rrf_score": p.score,
+                    "fts_score": best.and_then(|c| c.fts_score),
+                    "vector_score": best.and_then(|c| c.vector_score),
+                    "from_fts": best.map(|c| c.from_fts).unwrap_or(false),
+                    "from_vec": best.map(|c| c.from_vec).unwrap_or(false),
+                    "snippet": best.map(|c| c.content.clone()).unwrap_or_default(),
+                    "native_path": p.record.provenance.native_path,
+                    "created_at": p.record.created_at.timestamp(),
+                    "updated_at": p.record.updated_at.map(|t| t.timestamp()),
+                })
+            }).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if filtered.is_empty() {
