@@ -148,6 +148,7 @@ dependencies = [
  "clap",
  "futures",
  "predicates",
+ "reqwest",
  "rusqlite",
  "serde_json",
  "tempfile",

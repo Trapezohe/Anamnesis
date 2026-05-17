@@ -126,13 +126,19 @@ enum Command {
         source: Option<String>,
     },
 
-    /// Run as an MCP server. Default mode = stdio; future flag --sse for
-    /// the network transport (Phase 4).
+    /// Run as an MCP server. Default = stdio; `--sse <port>` binds the
+    /// HTTP/JSON-RPC transport on `127.0.0.1:<port>` (use `0` for an
+    /// ephemeral port — the chosen port is printed to stderr).
     Serve {
-        /// Reserved for the SSE transport (not yet wired in this CLI;
-        /// use the anamnesis-mcp binary's --sse flag instead).
+        /// Bind the HTTP/JSON-RPC transport on `127.0.0.1:<port>`.
+        /// Requires the `sse` cargo feature (on by default).
         #[arg(long)]
         sse: Option<u16>,
+        /// Pre-shared bearer token for HTTP mode. If omitted a fresh
+        /// 64-char token is generated and printed to stderr on startup.
+        /// Stdio mode ignores this flag.
+        #[arg(long, env = "ANAMNESIS_MCP_TOKEN")]
+        token: Option<String>,
     },
 
     /// Verify database integrity. With --repair, rebuild the FTS index and
@@ -298,7 +304,9 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Model(sub) => cmd_model(&data_dir, sub).await,
-        Command::Serve { sse } => cmd_serve(&data_dir, sse, config.server.allow_admin_tools).await,
+        Command::Serve { sse, token } => {
+            cmd_serve(&data_dir, sse, token, config.server.allow_admin_tools).await
+        }
         Command::Export {
             out,
             format,
@@ -321,44 +329,93 @@ async fn main() -> Result<()> {
 async fn cmd_serve(
     data_dir: &std::path::Path,
     sse: Option<u16>,
+    token: Option<String>,
     allow_admin_tools: bool,
 ) -> Result<()> {
-    if sse.is_some() {
-        return Err(anyhow!(
-            "SSE transport is not yet wired into `anamnesis serve` — see Phase 4. \
-             Use the dedicated `anamnesis-mcp --sse` binary in the meantime."
-        ));
-    }
     let store = Store::open(db_path(data_dir))?;
     let active_model = store.active_model().ok().flatten();
     let provider = open_active_provider_optional(data_dir, &store, active_model.as_deref());
     let server =
         anamnesis_mcp_server::AnamnesisServer::new(store, provider, data_dir.to_path_buf())
             .with_admin_tools(allow_admin_tools);
-    eprintln!(
-        "anamnesis serve (stdio) — active model: {}, admin tools: {}",
-        active_model.as_deref().unwrap_or("<unset>"),
-        if allow_admin_tools {
-            "ENABLED"
-        } else {
-            "disabled"
-        },
-    );
-    if allow_admin_tools {
-        eprintln!(
-            "  ⚠ admin tools enabled — `import_source` is callable. \
-             Run only with trusted clients."
-        );
+
+    match sse {
+        Some(port) => {
+            eprintln!(
+                "anamnesis serve (http) — active model: {}, admin tools: {}",
+                active_model.as_deref().unwrap_or("<unset>"),
+                if allow_admin_tools {
+                    "ENABLED"
+                } else {
+                    "disabled"
+                },
+            );
+            if allow_admin_tools {
+                eprintln!(
+                    "  ⚠ admin tools enabled — `import_source` is callable over MCP. \
+                     Run only with trusted clients."
+                );
+            }
+            audit(data_dir).record(anamnesis_core::AuditEntry::new(
+                "serve.start",
+                serde_json::json!({
+                    "transport": "http",
+                    "port": port,
+                    "active_model": active_model,
+                    "allow_admin_tools": allow_admin_tools,
+                }),
+            ));
+            run_sse(server, port, token).await
+        }
+        None => {
+            eprintln!(
+                "anamnesis serve (stdio) — active model: {}, admin tools: {}",
+                active_model.as_deref().unwrap_or("<unset>"),
+                if allow_admin_tools {
+                    "ENABLED"
+                } else {
+                    "disabled"
+                },
+            );
+            if allow_admin_tools {
+                eprintln!(
+                    "  ⚠ admin tools enabled — `import_source` is callable. \
+                     Run only with trusted clients."
+                );
+            }
+            audit(data_dir).record(anamnesis_core::AuditEntry::new(
+                "serve.start",
+                serde_json::json!({
+                    "transport": "stdio",
+                    "active_model": active_model,
+                    "allow_admin_tools": allow_admin_tools,
+                }),
+            ));
+            anamnesis_mcp_server::stdio::run(server).await
+        }
     }
-    audit(data_dir).record(anamnesis_core::AuditEntry::new(
-        "serve.start",
-        serde_json::json!({
-            "transport": "stdio",
-            "active_model": active_model,
-            "allow_admin_tools": allow_admin_tools,
-        }),
-    ));
-    anamnesis_mcp_server::stdio::run(server).await
+}
+
+#[cfg(feature = "sse")]
+async fn run_sse(
+    server: anamnesis_mcp_server::AnamnesisServer,
+    port: u16,
+    token: Option<String>,
+) -> Result<()> {
+    let config = anamnesis_mcp_server::sse::HttpServerConfig { port, token };
+    anamnesis_mcp_server::sse::run(server, config).await
+}
+
+#[cfg(not(feature = "sse"))]
+async fn run_sse(
+    _server: anamnesis_mcp_server::AnamnesisServer,
+    _port: u16,
+    _token: Option<String>,
+) -> Result<()> {
+    Err(anyhow!(
+        "this `anamnesis` build lacks the `sse` cargo feature; \
+         rebuild with `--features sse` (on by default)."
+    ))
 }
 
 #[cfg(feature = "local-fastembed")]
