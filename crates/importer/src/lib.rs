@@ -155,8 +155,13 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         for record in records {
             let chunks = self.chunker.chunk(&record.id, &record.content);
             match store.upsert_record(&record, &chunks, raw_payload_json.as_deref()) {
-                Ok((_, n_chunks)) => {
-                    summary.records_upserted += 1;
+                Ok((n_records, n_chunks)) => {
+                    // `store.upsert_record` returns (0, 0) for no-op
+                    // dedup (raw_hash unchanged) — see the fast-path
+                    // comment on `upsert_record`. Reflect that in the
+                    // summary so re-imports honestly report "1 raw,
+                    // 0 upserted" rather than falsely claiming work.
+                    summary.records_upserted += n_records;
                     summary.chunks_written += n_chunks;
                 }
                 Err(e) => {
@@ -331,14 +336,31 @@ mod tests {
 
     #[tokio::test]
     async fn import_is_idempotent() {
+        // Round-7 contract change: `upsert_record` now returns (0, 0) when
+        // raw_hash is unchanged, so the second run honestly reports
+        // "saw the same 2 raw records, wrote zero". The row count remains
+        // 2 (idempotency holds), but the summary stops claiming work it
+        // didn't do — which was the round-6 dogfood finding.
         let store = Store::open_in_memory().unwrap();
         let adapter = FakeAdapter::new(vec![pair("a", "alpha"), pair("b", "beta")]);
         let s1 = ImportRunner::new(&adapter).run(&store).await.unwrap();
+        assert_eq!(s1.records_upserted, 2);
+        assert_eq!(s1.chunks_written, 2);
         let s2 = ImportRunner::new(&adapter).run(&store).await.unwrap();
-        assert_eq!(s1, s2);
-        // Two runs should not double the row count.
+        assert_eq!(s2.raw_seen, 2, "second run still scans both raws");
+        assert_eq!(
+            s2.records_upserted, 0,
+            "no record rewrite when raw_hash unchanged"
+        );
+        assert_eq!(
+            s2.chunks_written, 0,
+            "no chunk DELETE/INSERT when raw_hash unchanged"
+        );
+        assert_eq!(s2.errors, 0);
+        // Two runs do not double the row count (idempotency on disk).
         let stats = store.stats().unwrap();
         assert_eq!(stats.records, 2);
+        assert_eq!(stats.chunks, 2);
     }
 
     #[tokio::test]
