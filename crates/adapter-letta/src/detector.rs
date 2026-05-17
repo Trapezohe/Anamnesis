@@ -120,13 +120,16 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].adapter, "letta");
         assert_eq!(found[0].confidence, Confidence::High);
-        assert!(found[0]
-            .local_path
-            .as_ref()
-            .unwrap()
-            .display()
-            .to_string()
-            .ends_with(".letta/letta.db"));
+        // Path-separator-agnostic check so the test passes on
+        // Windows (`\letta.db`) and unix-likes (`/letta.db`) alike.
+        let p = found[0].local_path.as_ref().unwrap();
+        assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("letta.db"));
+        assert_eq!(
+            p.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some(".letta")
+        );
     }
 
     #[tokio::test]
