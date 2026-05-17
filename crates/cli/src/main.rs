@@ -1046,7 +1046,19 @@ async fn cmd_search(
         _ => Some(open_active_provider(data_dir, &store)?),
     };
 
-    let hits = run_search(&store, query, limit, mode, provider.as_ref()).await?;
+    // PR-C: build the SQL-level filter from the same CLI knobs the
+    // post-filter used to consume. We turn `Kind` / `Scope` back into
+    // their lower-case string form to match how the store writes them.
+    let store_filter = anamnesis_store::SearchFilter {
+        source: source.map(str::to_owned),
+        instance: None,
+        kind: kind_filter.map(|k| format!("{k:?}").to_lowercase()),
+        scope: scope_filter.map(|s| format!("{s:?}").to_lowercase()),
+        time_from: None,
+        time_to: None,
+    };
+
+    let hits = run_search(&store, query, &store_filter, limit, mode, provider.as_ref()).await?;
 
     let packed = pack(
         &store,
@@ -1107,8 +1119,13 @@ async fn cmd_search(
             );
             if let Some(c) = p.matched_chunks.first() {
                 let snippet = c.content.replace('\n', " ");
-                let snippet = if snippet.len() > 180 {
-                    format!("{}…", &snippet[..180])
+                // Truncate on a char boundary so CJK / em-dash snippets
+                // don't panic mid-codepoint. 180 chars (not bytes) is a
+                // sensible terminal width for one-line previews.
+                let snippet = if snippet.chars().count() > 180 {
+                    let mut s: String = snippet.chars().take(180).collect();
+                    s.push('…');
+                    s
                 } else {
                     snippet
                 };
@@ -1122,6 +1139,7 @@ async fn cmd_search(
 async fn run_search(
     store: &Store,
     query: &str,
+    filter: &anamnesis_store::SearchFilter,
     limit: u32,
     mode: SearchMode,
     provider: Option<&ProviderHandle>,
@@ -1131,18 +1149,22 @@ async fn run_search(
         candidate_pool: (limit * 4).max(limit),
         mode,
     };
+    // PR-C: `search_filtered` pushes the filter into the SQL recall
+    // stage so the candidate pool can't be dominated by a majority
+    // adapter. The old post-RRF filter (still applied below as a safety
+    // net) becomes a no-op rather than the only line of defense.
     match provider {
         Some(handle) => match handle {
             #[cfg(feature = "local-fastembed")]
             ProviderHandle::Local(p) => Ok(HybridSearcher::new(p.as_ref())
-                .search(store, query, &opts)
+                .search_filtered(store, query, filter, &opts)
                 .await?),
             ProviderHandle::None => Ok(HybridSearcher::<DummyProvider>::fulltext_only()
-                .search(store, query, &opts)
+                .search_filtered(store, query, filter, &opts)
                 .await?),
         },
         None => Ok(HybridSearcher::<DummyProvider>::fulltext_only()
-            .search(store, query, &opts)
+            .search_filtered(store, query, filter, &opts)
             .await?),
     }
 }

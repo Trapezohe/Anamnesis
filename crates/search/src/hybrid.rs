@@ -16,7 +16,7 @@ use anamnesis_core::embedding::EmbeddingProvider;
 use anamnesis_core::embedding::EmbeddingTask;
 use anamnesis_core::error::{Error, Result};
 use anamnesis_core::model::RecordId;
-use anamnesis_store::Store;
+use anamnesis_store::{SearchFilter, Store};
 
 /// RRF constant. Published heuristic, robust against rank outliers.
 pub const RRF_K: f64 = 60.0;
@@ -109,11 +109,29 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
         Self { provider: None }
     }
 
-    /// Run the search.
+    /// Run the search with no filter (`SearchFilter::default`).
     pub async fn search(
         &self,
         store: &Store,
         query: &str,
+        opts: &HybridOpts,
+    ) -> Result<Vec<RankedChunk>> {
+        self.search_filtered(store, query, &SearchFilter::default(), opts)
+            .await
+    }
+
+    /// Run the search with the given filter pushed into the SQL recall
+    /// stage.
+    ///
+    /// This is the load-bearing entry point for PR-C (BLUEPRINT §17.5).
+    /// `filter` shapes the candidate pool *before* `LIMIT` truncates it,
+    /// so e.g. `source = "mem0"` returns mem0 chunks even when the
+    /// overall corpus is dominated by another adapter.
+    pub async fn search_filtered(
+        &self,
+        store: &Store,
+        query: &str,
+        filter: &SearchFilter,
         opts: &HybridOpts,
     ) -> Result<Vec<RankedChunk>> {
         let effective_mode = if self.provider.is_none() {
@@ -126,7 +144,7 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
 
         let fts_hits = if matches!(effective_mode, SearchMode::Fulltext | SearchMode::Hybrid) {
             store
-                .search_chunks_fts(query, pool)
+                .search_chunks_fts(query, filter, pool)
                 .map_err(|e| Error::Other(format!("store fts: {e}")))?
         } else {
             Vec::new()
@@ -138,7 +156,7 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
                 .ok_or_else(|| Error::Other("Vector/Hybrid mode requires a provider".into()))?;
             let qvec = provider.embed_query(query).await?;
             store
-                .search_chunks_vec(&qvec, &provider.model_id().0, pool)
+                .search_chunks_vec(&qvec, &provider.model_id().0, filter, pool)
                 .map_err(|e| Error::Other(format!("store vec: {e}")))?
         } else {
             Vec::new()

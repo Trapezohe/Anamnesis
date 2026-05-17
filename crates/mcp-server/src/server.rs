@@ -230,6 +230,14 @@ impl AnamnesisServer {
             .get("source")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+        let kind = args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -245,6 +253,19 @@ impl AnamnesisServer {
             _ => SearchMode::Hybrid,
         };
 
+        // PR-C: push every filter into the SQL recall stage so a
+        // minority-source query (e.g. `source = "mem0"` against a
+        // claude-code-dominated corpus) is not silently emptied by
+        // post-RRF filtering.
+        let filter = anamnesis_store::SearchFilter {
+            source: source.clone(),
+            instance: None,
+            kind,
+            scope,
+            time_from: None,
+            time_to: None,
+        };
+
         let store = &self.store;
         let opts = HybridOpts {
             limit,
@@ -253,11 +274,11 @@ impl AnamnesisServer {
         };
         let hits = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
-                .search(store, query, &opts)
+                .search_filtered(store, query, &filter, &opts)
                 .await
                 .map_err(|e| format!("search: {e}"))?,
             None => HybridSearcher::<NoProvider>::fulltext_only()
-                .search(store, query, &opts.fulltext_fallback())
+                .search_filtered(store, query, &filter, &opts.fulltext_fallback())
                 .await
                 .map_err(|e| format!("search: {e}"))?,
         };
@@ -270,7 +291,11 @@ impl AnamnesisServer {
             },
         )
         .map_err(|e| format!("pack: {e}"))?;
-        let filtered: Vec<_> = if let Some(src) = source {
+        // Post-filter is now a defense-in-depth no-op: the SQL stage
+        // already excluded non-matching adapters from the candidate
+        // pool. We keep it so adding new filter dimensions to the MCP
+        // surface stays a one-line change here.
+        let filtered: Vec<_> = if let Some(src) = source.as_deref() {
             packed
                 .into_iter()
                 .filter(|p| p.record.source.adapter == src)
