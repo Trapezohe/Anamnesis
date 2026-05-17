@@ -657,6 +657,25 @@ fn enqueue_jobs(tx: &Transaction<'_>, chunks: &[Chunk], model_id: &str, now: i64
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl Store {
+    /// Return the most recently created record ids, newest first.
+    ///
+    /// Used by MCP `resources/list` to enumerate concrete record URIs
+    /// — generic-mcp loopback (Anamnesis → Anamnesis) needs real URIs
+    /// to consume, not just `anamnesis://record/{id}` templates that
+    /// the adapter (correctly) filters out.
+    ///
+    /// `limit` is bounded — the resource catalogue is meant to be a
+    /// window into the store, not a full dump. 100 is a reasonable
+    /// default for "what's recent enough to be worth surfacing".
+    pub fn list_recent_record_ids(&self, limit: u32) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT id FROM records ORDER BY created_at DESC LIMIT ?1")?;
+        let rows = stmt
+            .query_map(params![limit], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Fetch a record by id.
     pub fn get_record(&self, id: &RecordId) -> Result<Option<AnamnesisRecord>> {
         let conn = self.conn.lock();

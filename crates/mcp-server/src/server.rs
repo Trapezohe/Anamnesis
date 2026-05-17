@@ -112,7 +112,7 @@ impl AnamnesisServer {
             "ping" => JsonRpcResponse::ok(id, json!({})),
             "tools/list" => JsonRpcResponse::ok(id, self.tools_list_payload()),
             "tools/call" => self.handle_tools_call(id, req.params).await,
-            "resources/list" => JsonRpcResponse::ok(id, resources_list_payload()),
+            "resources/list" => JsonRpcResponse::ok(id, self.resources_list_payload()),
             "resources/read" => self.handle_resources_read(id, req.params).await,
             "prompts/list" => JsonRpcResponse::ok(id, prompts_list_payload()),
             "prompts/get" => self.handle_prompts_get(id, req.params).await,
@@ -951,30 +951,91 @@ fn tools_list_payload_all() -> Value {
     })
 }
 
-fn resources_list_payload() -> Value {
-    json!({
-        "resources": [
-            {
-                "uri": "anamnesis://record/{id}",
-                "name": "Anamnesis record",
-                "description": "Fetch one record as JSON.",
-                "mimeType": "application/json"
-            },
-            {
-                "uri": "anamnesis://source/{adapter}",
-                "name": "Anamnesis source summary",
-                "description": "Source description + recent 5 records.",
-                "mimeType": "application/json"
-            },
-            {
-                "uri": "anamnesis://timeline/{YYYY-MM-DD}",
-                "name": "Anamnesis timeline",
-                "description": "All records captured on a UTC day.",
-                "mimeType": "application/json"
-            }
-        ]
-    })
+impl AnamnesisServer {
+    /// Build the MCP `resources/list` payload.
+    ///
+    /// Round-13: the previous static catalogue only emitted the three
+    /// template URIs (`anamnesis://record/{id}`, etc.). A consuming MCP
+    /// client — including the loopback case where Anamnesis itself is
+    /// the consumer via `generic-mcp` — has no way to resolve `{id}` and
+    /// the adapter correctly drops template URIs (see
+    /// `crates/adapter-generic-mcp/src/lib.rs::scan`). The result was
+    /// always zero records on the wire even though the upstream server
+    /// had data.
+    ///
+    /// Fix: emit concrete URIs for the `RESOURCES_LIST_RECENT_LIMIT`
+    /// most recent records under `resources`, and move the templates
+    /// into `resourceTemplates` (the MCP spec's dedicated slot for
+    /// URI templates with `{}` placeholders). Existing clients that
+    /// only read `resources` now see real records to fetch; new
+    /// clients that understand `resourceTemplates` keep their schema-
+    /// discovery story.
+    fn resources_list_payload(&self) -> Value {
+        let recent: Vec<String> = self
+            .store
+            .list_recent_record_ids(RESOURCES_LIST_RECENT_LIMIT)
+            .unwrap_or_default();
+        let mut resources: Vec<Value> = recent
+            .iter()
+            .map(|id| {
+                json!({
+                    "uri": format!("anamnesis://record/{id}"),
+                    "name": format!("record {}", &id[..id.len().min(12)]),
+                    "description": "One AnamnesisRecord as JSON.",
+                    "mimeType": "application/json",
+                })
+            })
+            .collect();
+        // Templates kept in the response (under a separate key per MCP
+        // spec) so schema-discovery still works for clients that want
+        // to learn the URI shapes.
+        let templates = static_resource_templates();
+        // Some clients still only read `resources` — for back-compat
+        // we ALSO inline the templates there. The generic-mcp adapter
+        // filters templates out, so this duplication is harmless to it
+        // and helpful for less sophisticated consumers.
+        for t in templates.as_array().into_iter().flatten() {
+            resources.push(t.clone());
+        }
+        json!({
+            "resources": resources,
+            "resourceTemplates": templates,
+        })
+    }
 }
+
+/// Cap on how many concrete record URIs to emit in `resources/list`.
+/// Sized to be useful as a discoverability window without forcing the
+/// server to dump the whole store on every list call.
+pub const RESOURCES_LIST_RECENT_LIMIT: u32 = 100;
+
+fn static_resource_templates() -> Value {
+    json!([
+        {
+            "uri": "anamnesis://record/{id}",
+            "name": "Anamnesis record",
+            "description": "Fetch one record as JSON.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": "anamnesis://source/{adapter}",
+            "name": "Anamnesis source summary",
+            "description": "Source description + recent 5 records.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": "anamnesis://timeline/{YYYY-MM-DD}",
+            "name": "Anamnesis timeline",
+            "description": "All records captured on a UTC day.",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+// (The old static-only `resources_list_payload` was deleted in round-13
+// — `AnamnesisServer::resources_list_payload` above replaces it.
+// Templates moved into `static_resource_templates`; concrete records
+// are now enumerated dynamically from the store.)
 
 /// Placeholder type — only used as a generic argument for HybridSearcher
 /// when no provider is wired. The fulltext_only path never invokes its
