@@ -354,10 +354,62 @@ impl AnamnesisServer {
         let rec = store
             .get_record(&RecordId(id.to_string()))
             .map_err(|e| format!("store: {e}"))?;
-        match rec {
-            Some(r) => serde_json::to_value(&r).map_err(|e| format!("serialize: {e}")),
-            None => Ok(Value::Null),
-        }
+        let Some(r) = rec else {
+            // Missing record → null. The same shape `search_memories`
+            // would emit for a no-hit query, so agents can branch
+            // uniformly.
+            return Ok(Value::Null);
+        };
+
+        // Round-11: emit a normalised, agent-decision-ready payload
+        // instead of the raw serde of `AnamnesisRecord`. Same naming
+        // convention as the `search_memories` wire format (PR-#16):
+        // lower-case enums, JSON null for absent instance, surface
+        // chunk/embedding readiness so the agent can decide whether
+        // hybrid retrieval will hit this record right now.
+        let summary = store
+            .record_summary(&r.id)
+            .map_err(|e| format!("store: {e}"))?
+            .ok_or_else(|| "record vanished between lookup and summary".to_string())?;
+
+        Ok(json!({
+            "record_id": r.id.0,
+            // trace_id alias mirrors the search wire format — agents
+            // can pass it straight back to `trace_provenance`.
+            "trace_id": r.id.0,
+            "adapter": r.source.adapter,
+            // Default-instance records serialise their `instance` as
+            // JSON null (the SQL stores "" but that's an implementation
+            // detail; PR-#17 fixed the same thing for `list_sources`).
+            "instance": match &r.source.instance {
+                Some(s) if !s.is_empty() => Value::String(s.clone()),
+                _ => Value::Null,
+            },
+            "kind": format!("{:?}", r.kind).to_lowercase(),
+            "scope": format!("{:?}", r.scope).to_lowercase(),
+            "content": r.content,
+            "tags": r.tags,
+            "metadata": r.metadata,
+            "native_id": r.provenance.native_id,
+            "native_path": r.provenance.native_path,
+            "raw_hash": r.provenance.raw_hash,
+            "captured_at": r.provenance.captured_at.timestamp(),
+            "created_at": r.created_at.timestamp(),
+            "updated_at": r.updated_at.map(|t| t.timestamp()),
+            "schema_version": r.schema_version,
+            // Readiness — the load-bearing piece. An agent that wants
+            // to ensure vector retrieval will hit this record can
+            // assert `chunk_count == embedded_chunk_count` and
+            // `active_model` matches expectations.
+            "chunk_count": summary.chunk_count,
+            "embedded_chunk_count": summary.embedded_chunk_count,
+            "active_model": summary.active_model,
+            // Source-vector breadcrumb only. We do NOT return the
+            // vector itself — source embeddings are provenance, not
+            // retrieval (BLUEPRINT §6.6.1).
+            "source_embedding_model": summary.source_embedding_model,
+            "source_embedding_dim": summary.source_embedding_dim,
+        }))
     }
 
     async fn tool_list_sources(&self) -> Result<Value, String> {
@@ -1385,6 +1437,112 @@ mod tests {
             ))
             .await;
         assert_eq!(miss.result.unwrap()["structuredContent"], Value::Null);
+    }
+
+    /// Round-11: `get_record` wire format. The agent contract must
+    /// match `search_memories` (PR-#16) for the overlapping fields and
+    /// add chunk/embedding readiness so the agent can decide whether
+    /// hybrid retrieval will actually hit this record right now.
+    #[tokio::test]
+    async fn get_record_emits_normalized_payload_with_readiness() {
+        // `make_record` defaults kind=Fact, scope=User, instance=None.
+        let r = make_record("claude-code", "abc", "hello world", 1700000000);
+        let id = r.id.0.clone();
+        let s = server_with_records(&[r]);
+
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "get_record", "arguments": {"id": id.clone()}}),
+            ))
+            .await;
+        let p = &resp.result.unwrap()["structuredContent"];
+
+        // Identity / agent-chain fields.
+        assert_eq!(p["record_id"], id);
+        assert_eq!(
+            p["trace_id"], id,
+            "trace_id alias mirrors search_memories so agents can hand it back to trace_provenance"
+        );
+
+        // Normalised enums — lower-case strings, not Debug-style Capitalised.
+        assert_eq!(p["kind"], "fact", "kind must be lower-case");
+        assert_eq!(p["scope"], "user", "scope must be lower-case");
+
+        // Default-instance serialises as null on the wire.
+        assert_eq!(
+            p["instance"],
+            Value::Null,
+            "default instance must be JSON null, not empty string"
+        );
+
+        // Content + provenance.
+        assert_eq!(p["content"], "hello world");
+        assert_eq!(p["adapter"], "claude-code");
+        assert_eq!(p["native_id"], "abc");
+
+        // Readiness — the round-11 load-bearing piece.
+        assert!(
+            p["chunk_count"].as_u64().unwrap() >= 1,
+            "the upserted record has at least one chunk"
+        );
+        // No active model was set by the test helper, so the embedded
+        // count is 0 and active_model is null. Tested separately below.
+        assert_eq!(p["embedded_chunk_count"], 0);
+        assert_eq!(p["active_model"], Value::Null);
+
+        // Source-vector breadcrumb absent on a synthetic record.
+        assert_eq!(p["source_embedding_model"], Value::Null);
+        assert_eq!(p["source_embedding_dim"], Value::Null);
+
+        // Time fields use unix-epoch numbers, not RFC3339 strings.
+        assert_eq!(p["created_at"].as_i64(), Some(1700000000));
+    }
+
+    #[tokio::test]
+    async fn get_record_embedded_chunk_count_tracks_active_model() {
+        // The "is this record ready for vector search?" signal only
+        // counts embeddings under the CURRENTLY-ACTIVE model. An
+        // embedding produced under a previous model must not count.
+        //
+        // We walk the real path (set model → upsert → claim → complete →
+        // switch model) so the test is end-to-end honest — no hand-rolled
+        // SQL bypassing the store API.
+        let r = make_record("claude-code", "x", "a", 1700000000);
+        let id = r.id.0.clone();
+        let store = Store::open_in_memory().unwrap();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+
+        // First: a stale model — set it active, upsert (enqueues
+        // jobs under it), claim, complete (writes chunk_embeddings).
+        store.set_active_model("stale-model").unwrap();
+        store.upsert_record(&r, &chunks, None).unwrap();
+        let job = store
+            .claim_next_job("stale-model")
+            .unwrap()
+            .expect("upsert must enqueue at least one job");
+        store.complete_job(&job, &[0.1, 0.2, 0.3]).unwrap();
+
+        // Now switch to a different active model. The freshly-written
+        // chunk_embeddings row stays — but it's now stale.
+        store.set_active_model("active-model").unwrap();
+        store
+            .register_source("claude-code", None, Some("/tmp/x"), None)
+            .unwrap();
+
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "get_record", "arguments": {"id": id}}),
+            ))
+            .await;
+        let p = &resp.result.unwrap()["structuredContent"];
+        assert_eq!(p["active_model"], "active-model");
+        assert_eq!(
+            p["embedded_chunk_count"], 0,
+            "embeddings under stale-model must NOT count toward active-model readiness"
+        );
     }
 
     #[tokio::test]

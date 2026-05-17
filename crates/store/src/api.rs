@@ -670,6 +670,82 @@ impl Store {
         Ok(row)
     }
 
+    /// Per-record summary an MCP consumer needs to decide what to do
+    /// with a hit (or with `get_record` output) without a second
+    /// round trip: how many chunks live behind this record, how many
+    /// are embedded under the *active* model, and whether the source
+    /// adapter included its own pre-existing embedding for provenance.
+    ///
+    /// Returns `None` when no record with `id` exists. The active-model
+    /// chunk count is deliberately scoped: an embedding produced under
+    /// a previous model (e.g. before `anamnesis model use`) does NOT
+    /// count toward "ready for vector search right now". This matches
+    /// the contract `search_chunks_vec` enforces (it filters on the
+    /// caller's `model_id`).
+    pub fn record_summary(&self, id: &RecordId) -> Result<Option<RecordSummary>> {
+        let conn = self.conn.lock();
+
+        // Cheap probe — does the record exist?
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM records WHERE id = ?1", params![id.0], |_| {
+                Ok(true)
+            })
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Ok(None);
+        }
+
+        let chunk_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM record_chunks WHERE record_id = ?1",
+            params![id.0],
+            |r| r.get(0),
+        )?;
+
+        // Active model — None when the user has never set one.
+        let active_model: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'active_embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        // Chunks that have a fresh embedding under the active model.
+        // Returns 0 when active_model is None or no embeddings exist.
+        let embedded_chunk_count: i64 = match active_model.as_deref() {
+            Some(model) => conn.query_row(
+                "SELECT COUNT(*) FROM chunk_embeddings e \
+                 JOIN record_chunks rc ON rc.id = e.chunk_id \
+                 WHERE rc.record_id = ?1 AND e.model_id = ?2",
+                params![id.0, model],
+                |r| r.get(0),
+            )?,
+            None => 0,
+        };
+
+        // Source-vector presence — never the vector itself; just a
+        // tiny breadcrumb so the agent knows mem0's OpenAI embeddings
+        // (etc.) are on file as provenance.
+        let (source_model, source_dim): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT source_embedding_model, source_embedding_dim \
+                 FROM raw_artifacts WHERE record_id = ?1",
+                params![id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None));
+
+        Ok(Some(RecordSummary {
+            chunk_count: chunk_count as u64,
+            embedded_chunk_count: embedded_chunk_count as u64,
+            active_model,
+            source_embedding_model: source_model,
+            source_embedding_dim: source_dim.map(|d| d as u32),
+        }))
+    }
+
     /// Fetch one chunk by its id.
     ///
     /// `chunk_id` is the synthetic `"{record_id}:{seq}"` string written
@@ -699,6 +775,29 @@ impl Store {
         .optional()
         .map_err(Into::into)
     }
+}
+
+/// Lightweight per-record summary an MCP / CLI consumer needs to decide
+/// what to do with a `get_record` result without a second round trip.
+/// Computed by `Store::record_summary`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordSummary {
+    /// Number of chunks behind this record.
+    pub chunk_count: u64,
+    /// Number of chunks that have a fresh embedding under the *active*
+    /// embedding model. Equal to `chunk_count` when the record is
+    /// fully ready for vector search; less when the embedder hasn't
+    /// caught up; `0` when no active model is configured.
+    pub embedded_chunk_count: u64,
+    /// The currently-active embedding model id (e.g.
+    /// `"local:default:1"`). `None` when no model is set.
+    pub active_model: Option<String>,
+    /// If the source adapter shipped a pre-existing embedding for this
+    /// record's raw payload, this is its model id (informational only —
+    /// source vectors NEVER reach retrieval per BLUEPRINT §6.6.1).
+    pub source_embedding_model: Option<String>,
+    /// Dimensionality of the source embedding, when present.
+    pub source_embedding_dim: Option<u32>,
 }
 
 /// One chunk row, joined with enough provenance for downstream tools
