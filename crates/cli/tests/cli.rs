@@ -431,6 +431,63 @@ fn search_kind_filter_restricts_to_kind() {
         .stdout(contains("no results"));
 }
 
+/// Round-12: the human-readable `anamnesis search` card surfaces every
+/// JSON wire field an agent would see — kind/scope/score breakdown/
+/// timestamps/ids — so an operator running the CLI by hand has the
+/// same context an MCP agent has after `search_memories`.
+#[test]
+fn search_card_surfaces_wire_fields_for_human_readers() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let mem0_db = dir.path().join("mem0.sqlite");
+    let conn = Connection::open(&mem0_db).unwrap();
+    conn.execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL);")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO memories VALUES('a','platypusBanjoComet card test')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Run the search and inspect stdout for each surfaced field.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "platypusBanjoComet", "--mode", "fulltext"])
+        .assert()
+        .success()
+        .stdout(
+            contains("rrf=")
+                .and(contains("fts="))
+                .and(contains("vec="))
+                .and(contains("(fact, user)"))
+                .and(contains("created="))
+                .and(contains("record_id="))
+                .and(contains("chunk_id="))
+                .and(contains("trace_id="))
+                .and(contains("native_path="))
+                .and(contains("snippet:"))
+                .and(contains("platypusBanjoComet")),
+        );
+}
+
 #[test]
 fn discover_lists_mem0_when_db_exists() {
     use rusqlite::Connection;
