@@ -351,6 +351,8 @@ mod tests {
             seq,
             content: content.into(),
             score,
+            fts_score: Some(score),
+            vector_score: None,
             from_fts: true,
             from_vec: false,
         }

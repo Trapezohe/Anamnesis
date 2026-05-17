@@ -303,17 +303,45 @@ impl AnamnesisServer {
         } else {
             packed
         };
+        // Round-8 wire format. Each result carries enough for an
+        // MCP agent to:
+        //   - chain into `trace_provenance` (use `trace_id` = `record_id`)
+        //   - understand *why* a hit surfaced (`from_fts` / `from_vec`,
+        //     plus the per-modality raw scores)
+        //   - sort / threshold / filter on the client side (`rrf_score`,
+        //     `fts_score`, `vector_score`)
+        //   - render time-aware UI (`created_at`, `updated_at`)
+        //
+        // `score` is kept as an alias for `rrf_score` so older agents
+        // that pinned the previous field name don't break.
         Ok(json!({
-            "results": filtered.iter().map(|p| json!({
-                "record_id": p.record.id.0,
-                "adapter": p.record.source.adapter,
-                "instance": p.record.source.instance,
-                "kind": format!("{:?}", p.record.kind).to_lowercase(),
-                "scope": format!("{:?}", p.record.scope).to_lowercase(),
-                "score": p.score,
-                "snippet": p.matched_chunks.first().map(|c| c.content.clone()).unwrap_or_default(),
-                "native_path": p.record.provenance.native_path,
-            })).collect::<Vec<_>>()
+            "results": filtered.iter().map(|p| {
+                let best = p.matched_chunks.first();
+                json!({
+                    "record_id": p.record.id.0,
+                    // Alias the record id as `trace_id` so an agent that
+                    // already holds a result can call
+                    // `trace_provenance({"id": trace_id})` without
+                    // remembering the field-mapping convention.
+                    "trace_id": p.record.id.0,
+                    "chunk_id": best.map(|c| c.chunk_id.clone()),
+                    "adapter": p.record.source.adapter,
+                    "instance": p.record.source.instance,
+                    "kind": format!("{:?}", p.record.kind).to_lowercase(),
+                    "scope": format!("{:?}", p.record.scope).to_lowercase(),
+                    // Score breakdown.
+                    "score": p.score,            // back-compat alias
+                    "rrf_score": p.score,
+                    "fts_score": best.and_then(|c| c.fts_score),
+                    "vector_score": best.and_then(|c| c.vector_score),
+                    "from_fts": best.map(|c| c.from_fts).unwrap_or(false),
+                    "from_vec": best.map(|c| c.from_vec).unwrap_or(false),
+                    "snippet": best.map(|c| c.content.clone()).unwrap_or_default(),
+                    "native_path": p.record.provenance.native_path,
+                    "created_at": p.record.created_at.timestamp(),
+                    "updated_at": p.record.updated_at.map(|t| t.timestamp()),
+                })
+            }).collect::<Vec<_>>()
         }))
     }
 
@@ -1080,6 +1108,75 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("platypusBanjoComet"));
+    }
+
+    /// Round-8: wire-format hardening. Lock the JSON shape an MCP agent
+    /// receives from `search_memories` — every field the consumer might
+    /// chain on (trace_id for `trace_provenance`, score breakdown for
+    /// explain-why, time fields for UI) must be present.
+    #[tokio::test]
+    async fn search_memories_wire_format_carries_full_schema() {
+        let r = make_record(
+            "claude-code",
+            "wire-test",
+            "lorem ipsum dolor sit amet uniqueWireToken",
+            1700000000,
+        );
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {"query": "uniqueWireToken", "mode": "fulltext", "limit": 5}
+                }),
+            ))
+            .await;
+        let result = resp.result.unwrap();
+        let results = result["structuredContent"]["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "expected at least one hit");
+        let hit = &results[0];
+
+        // Identity / provenance chain (agent uses these to call
+        // trace_provenance or get_record without remapping).
+        assert!(hit.get("record_id").and_then(|v| v.as_str()).is_some());
+        assert_eq!(hit["trace_id"], hit["record_id"]);
+        assert!(hit.get("chunk_id").and_then(|v| v.as_str()).is_some());
+
+        // Classification (agent decides whether to surface this hit).
+        for f in ["adapter", "kind", "scope"] {
+            assert!(
+                hit.get(f).and_then(|v| v.as_str()).is_some(),
+                "missing {f} in wire format"
+            );
+        }
+
+        // Score breakdown — must NOT be silently null when modality
+        // contributed.
+        assert!(hit["score"].as_f64().is_some(), "score must be numeric");
+        assert!(
+            hit["rrf_score"].as_f64().is_some(),
+            "rrf_score must be numeric"
+        );
+        assert_eq!(
+            hit["score"], hit["rrf_score"],
+            "`score` is kept as a back-compat alias for `rrf_score`"
+        );
+        assert_eq!(
+            hit["from_fts"],
+            json!(true),
+            "fulltext mode hit must flag from_fts"
+        );
+        assert!(
+            hit["fts_score"].as_f64().is_some(),
+            "fts_score must be populated when from_fts is true"
+        );
+
+        // Time fields (agent can render recency / filter on time).
+        assert!(hit["created_at"].as_i64().is_some());
+
+        // Snippet present.
+        assert!(hit["snippet"].as_str().unwrap().contains("uniqueWireToken"));
     }
 
     #[tokio::test]
