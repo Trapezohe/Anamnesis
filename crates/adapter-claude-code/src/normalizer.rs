@@ -8,9 +8,10 @@ use anamnesis_core::model::{
     AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
 };
 use anamnesis_core::RawRecord;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::frontmatter;
+use crate::session;
 
 /// Payload `payload_kind` tag for a memory markdown file.
 pub const PAYLOAD_KIND_MEMORY: &str = "memory_md";
@@ -18,13 +19,25 @@ pub const PAYLOAD_KIND_MEMORY: &str = "memory_md";
 pub const PAYLOAD_KIND_SESSION: &str = "session_jsonl";
 
 /// Build a `RawRecord` for a memory markdown file.
-pub fn raw_memory(path: &Path, body: String, instance: Option<&str>) -> RawRecord {
+///
+/// `mtime` (when supplied) is preserved in the payload so the normalizer
+/// can use it for `created_at` instead of "now" — see PR-I (BLUEPRINT
+/// §18.4 F4).
+pub fn raw_memory(
+    path: &Path,
+    body: String,
+    mtime: Option<DateTime<Utc>>,
+    instance: Option<&str>,
+) -> RawRecord {
     let native_id = synth_native_id(instance, "memory", path);
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "payload_kind": PAYLOAD_KIND_MEMORY,
         "path": path.display().to_string(),
         "content": body,
     });
+    if let Some(m) = mtime {
+        payload["mtime"] = serde_json::Value::String(m.to_rfc3339());
+    }
     RawRecord {
         native_id,
         native_path: Some(path.display().to_string()),
@@ -33,21 +46,54 @@ pub fn raw_memory(path: &Path, body: String, instance: Option<&str>) -> RawRecor
     }
 }
 
-/// Build a `RawRecord` for a session JSONL file. `body` is the full file
-/// content rendered as a single string (the scanner pre-flattens messages).
-pub fn raw_session(path: &Path, body: String, instance: Option<&str>) -> RawRecord {
+/// Build a `RawRecord` for a session JSONL file.
+///
+/// `jsonl_text` is parsed into structured turns now (rather than dumped
+/// as a raw string) so the normalizer can render readable markdown and
+/// the chunker can split on turn boundaries. See PR-H (BLUEPRINT §18.4 F3).
+///
+/// `mtime` is the file modification time. The normalizer prefers
+/// `first_ts` from the parsed session, falling back to `mtime`, then to
+/// the import timestamp.
+pub fn raw_session(
+    path: &Path,
+    jsonl_text: &str,
+    mtime: Option<DateTime<Utc>>,
+    instance: Option<&str>,
+) -> RawRecord {
     let native_id = synth_native_id(instance, "session", path);
-    let payload = serde_json::json!({
+    let parsed = session::parse_jsonl(jsonl_text);
+    let mut payload = serde_json::json!({
         "payload_kind": PAYLOAD_KIND_SESSION,
         "path": path.display().to_string(),
-        "content": body,
+        "messages": parsed.messages,
+        "message_count": parsed.messages.len(),
     });
+    if let Some(t) = parsed.first_ts {
+        payload["first_ts"] = serde_json::Value::String(t.to_rfc3339());
+    }
+    if let Some(t) = parsed.last_ts {
+        payload["last_ts"] = serde_json::Value::String(t.to_rfc3339());
+    }
+    if let Some(m) = mtime {
+        payload["mtime"] = serde_json::Value::String(m.to_rfc3339());
+    }
     RawRecord {
         native_id,
         native_path: Some(path.display().to_string()),
         payload,
         captured_at: Utc::now(),
     }
+}
+
+/// Parse an RFC3339 timestamp from a payload string field. Returns `None`
+/// for absent or malformed values; the caller falls back to `captured_at`.
+fn payload_ts(payload: &serde_json::Value, key: &str) -> Option<DateTime<Utc>> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
 }
 
 fn synth_native_id(instance: Option<&str>, kind: &str, path: &Path) -> String {
@@ -65,15 +111,17 @@ pub fn normalize(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamnesis
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::InvalidRecord("missing payload_kind".into()))?
         .to_string();
-    let content = raw
-        .payload
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::InvalidRecord("missing content".into()))?
-        .to_string();
     match payload_kind.as_str() {
-        PAYLOAD_KIND_MEMORY => Ok(vec![normalize_memory(&raw, instance, &content)]),
-        PAYLOAD_KIND_SESSION => Ok(vec![normalize_session(&raw, instance, content)]),
+        PAYLOAD_KIND_MEMORY => {
+            let content = raw
+                .payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::InvalidRecord("memory payload missing content".into()))?
+                .to_string();
+            Ok(vec![normalize_memory(&raw, instance, &content)])
+        }
+        PAYLOAD_KIND_SESSION => Ok(vec![normalize_session(&raw, instance)?]),
         other => Err(Error::InvalidRecord(format!(
             "unknown payload_kind: {other}"
         ))),
@@ -106,6 +154,10 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
         metadata.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
 
+    // PR-I: prefer file mtime over import wall clock for `created_at` so
+    // time-window queries and recency boosts actually carry signal.
+    let created_at = payload_ts(&raw.payload, "mtime").unwrap_or(raw.captured_at);
+
     AnamnesisRecord {
         id,
         source: SourceDescriptor {
@@ -117,7 +169,7 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
         embedding: None,
         scope,
         kind,
-        created_at: raw.captured_at,
+        created_at,
         updated_at: None,
         tags: tags.into_iter().filter(|t| !t.is_empty()).collect(),
         metadata,
@@ -131,27 +183,65 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
     }
 }
 
-fn normalize_session(raw: &RawRecord, instance: Option<&str>, content: String) -> AnamnesisRecord {
+fn normalize_session(raw: &RawRecord, instance: Option<&str>) -> Result<AnamnesisRecord> {
+    // PR-H: reconstruct turns from payload.messages → readable markdown.
+    // The scanner already parsed JSONL; here we just render and hash.
+    let messages_value = raw
+        .payload
+        .get("messages")
+        .ok_or_else(|| Error::InvalidRecord("session payload missing messages".into()))?;
+    let messages: Vec<session::SessionMessage> = serde_json::from_value(messages_value.clone())
+        .map_err(|e| Error::InvalidRecord(format!("malformed session messages: {e}")))?;
+    let first_ts = payload_ts(&raw.payload, "first_ts");
+    let last_ts = payload_ts(&raw.payload, "last_ts");
+    let mtime = payload_ts(&raw.payload, "mtime");
+
+    let parsed = session::ParsedSession {
+        messages,
+        first_ts,
+        last_ts,
+    };
+    let content = session::render_markdown(&parsed);
     let raw_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
     let id = RecordId::from_parts(crate::ADAPTER_ID, instance, &raw.native_id);
-    AnamnesisRecord {
+
+    // Many sessions are empty after filtering (only file-history-snapshot /
+    // permission-mode rows). Drop them at the boundary — we don't want
+    // empty Episode records polluting the index.
+    let content_owned = content;
+
+    // PR-I: created_at = first message ts → mtime → captured_at;
+    //        updated_at = last message ts → mtime when first_ts present.
+    let created_at = first_ts.or(mtime).unwrap_or(raw.captured_at);
+    let updated_at = last_ts.or_else(|| if first_ts.is_some() { mtime } else { None });
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "source_file".into(),
+        serde_json::Value::String(raw.native_path.clone().unwrap_or_default()),
+    );
+    if let Some(n) = raw.payload.get("message_count").and_then(|v| v.as_u64()) {
+        metadata.insert(
+            "message_count".into(),
+            serde_json::Value::Number(serde_json::Number::from(n)),
+        );
+    }
+
+    Ok(AnamnesisRecord {
         id,
         source: SourceDescriptor {
             adapter: crate::ADAPTER_ID.into(),
             instance: instance.map(str::to_owned),
             version: env!("CARGO_PKG_VERSION").into(),
         },
-        content,
+        content: content_owned,
         embedding: None,
         scope: Scope::Session,
         kind: Kind::Episode,
-        created_at: raw.captured_at,
-        updated_at: None,
+        created_at,
+        updated_at,
         tags: Vec::new(),
-        metadata: serde_json::Map::from_iter([(
-            "source_file".into(),
-            serde_json::Value::String(raw.native_path.clone().unwrap_or_default()),
-        )]),
+        metadata,
         provenance: Provenance {
             native_id: raw.native_id.clone(),
             native_path: raw.native_path.clone(),
@@ -159,7 +249,7 @@ fn normalize_session(raw: &RawRecord, instance: Option<&str>, content: String) -
             raw_hash,
         },
         schema_version: SCHEMA_VERSION,
-    }
+    })
 }
 
 /// Map Claude Code memory frontmatter `type` to `(Kind, Scope)`.
@@ -210,7 +300,7 @@ mod tests {
     #[test]
     fn raw_memory_constructor_shape() {
         let p = fixture_path("user_role");
-        let raw = raw_memory(&p, "body".into(), Some("default"));
+        let raw = raw_memory(&p, "body".into(), None, Some("default"));
         assert_eq!(
             raw.native_path.as_deref(),
             Some(p.display().to_string()).as_deref()
@@ -223,7 +313,7 @@ mod tests {
     #[test]
     fn raw_session_constructor_shape() {
         let p = fixture_path("session-xyz");
-        let raw = raw_session(&p, "lots of text".into(), None);
+        let raw = raw_session(&p, "lots of text", None, None);
         assert!(raw.native_id.starts_with("default|session|"));
         assert_eq!(raw.payload["payload_kind"], PAYLOAD_KIND_SESSION);
     }
@@ -232,7 +322,7 @@ mod tests {
     fn normalize_memory_user_frontmatter() {
         let path = fixture_path("user_role");
         let body = "---\nname: user-prefers-vim\ndescription: vim everywhere\nmetadata:\n  type: user\n---\nUser prefers vim.";
-        let raw = raw_memory(&path, body.into(), Some("default"));
+        let raw = raw_memory(&path, body.into(), None, Some("default"));
         let recs = normalize(raw, Some("default")).unwrap();
         assert_eq!(recs.len(), 1);
         let r = &recs[0];
@@ -250,7 +340,7 @@ mod tests {
     fn normalize_memory_feedback_keeps_scope_user() {
         let path = fixture_path("feedback_x");
         let body = "---\nname: x\nmetadata:\n  type: feedback\n---\ndon't do Y";
-        let raw = raw_memory(&path, body.into(), None);
+        let raw = raw_memory(&path, body.into(), None, None);
         let r = &normalize(raw, None).unwrap()[0];
         assert_eq!(r.kind, Kind::Feedback);
         assert_eq!(r.scope, Scope::User);
@@ -260,7 +350,7 @@ mod tests {
     fn normalize_memory_project_scope() {
         let path = fixture_path("p");
         let body = "---\nname: p\nmetadata:\n  type: project\n---\nx";
-        let r = &normalize(raw_memory(&path, body.into(), None), None).unwrap()[0];
+        let r = &normalize(raw_memory(&path, body.into(), None, None), None).unwrap()[0];
         assert_eq!(r.kind, Kind::Fact);
         assert_eq!(r.scope, Scope::Project);
     }
@@ -269,26 +359,81 @@ mod tests {
     fn normalize_memory_without_frontmatter_falls_back_to_unknown() {
         let path = fixture_path("naked");
         let body = "just markdown body, no frontmatter";
-        let r = &normalize(raw_memory(&path, body.into(), None), None).unwrap()[0];
+        let r = &normalize(raw_memory(&path, body.into(), None, None), None).unwrap()[0];
         assert_eq!(r.kind, Kind::Unknown);
         assert_eq!(r.scope, Scope::Ephemeral);
         assert_eq!(r.content, body);
     }
 
     #[test]
-    fn normalize_session_is_episode() {
+    fn normalize_session_renders_readable_markdown() {
+        // PR-H: JSONL is the real Claude Code shape (typed outer rows with
+        // a `message` envelope). After PR-H, content is human-readable
+        // markdown, not raw JSON bytes.
         let path = fixture_path("session-abc");
-        let body = r#"{"role":"user","content":"hi"}
-{"role":"assistant","content":"hey"}"#;
+        let body = [
+            r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-05-17T03:14:00Z","uuid":"u1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hey"}]},"timestamp":"2026-05-17T03:14:05Z","uuid":"a1"}"#,
+        ]
+        .join("\n");
         let recs = normalize(
-            raw_session(&path, body.into(), Some("default")),
+            raw_session(&path, &body, None, Some("default")),
             Some("default"),
         )
         .unwrap();
         let r = &recs[0];
         assert_eq!(r.kind, Kind::Episode);
         assert_eq!(r.scope, Scope::Session);
-        assert!(r.content.contains("\"role\":\"user\""));
+        assert!(
+            r.content.contains("**user**"),
+            "rendered markdown must contain `**user**` header"
+        );
+        assert!(r.content.contains("hi"));
+        assert!(r.content.contains("hey"));
+        assert!(
+            !r.content.contains("\"role\":\"user\""),
+            "raw JSON bytes must NOT leak into the rendered content"
+        );
+        // PR-I: created_at derives from first message timestamp.
+        assert_eq!(
+            r.created_at.to_rfc3339(),
+            "2026-05-17T03:14:00+00:00",
+            "created_at must come from first message timestamp"
+        );
+        assert_eq!(
+            r.updated_at.map(|t| t.to_rfc3339()),
+            Some("2026-05-17T03:14:05+00:00".to_string()),
+            "updated_at must come from last message timestamp"
+        );
+        // message_count metadata for analytics.
+        assert_eq!(
+            r.metadata.get("message_count").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn normalize_session_falls_back_to_mtime_when_no_message_timestamps() {
+        // Session with messages that have no timestamps — should use mtime.
+        let path = fixture_path("session-no-ts");
+        let mtime = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let body = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
+        let raw = raw_session(&path, body, Some(mtime), None);
+        let r = &normalize(raw, None).unwrap()[0];
+        assert_eq!(r.created_at, mtime);
+    }
+
+    #[test]
+    fn normalize_memory_uses_mtime_for_created_at() {
+        let path = fixture_path("mtime_test");
+        let mtime = chrono::DateTime::parse_from_rfc3339("2025-12-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let body = "---\nname: x\nmetadata:\n  type: user\n---\nbody";
+        let r = &normalize(raw_memory(&path, body.into(), Some(mtime), None), None).unwrap()[0];
+        assert_eq!(r.created_at, mtime, "memory created_at = file mtime");
     }
 
     #[test]
@@ -324,7 +469,7 @@ mod tests {
         // Unknown before PR-G because `type:` was at the top level.
         let path = fixture_path("feedback_project_location");
         let body = "---\nname: 项目目录放桌面\ndescription: 不要默认放 /tmp\ntype: feedback\noriginSessionId: 76a78a2d-e2af-4a15-9be4-f970d9e26e41\n---\n为新项目克隆或搭建工作目录时，默认放在 ~/Desktop。";
-        let raw = raw_memory(&path, body.into(), Some("default"));
+        let raw = raw_memory(&path, body.into(), None, Some("default"));
         let r = &normalize(raw, Some("default")).unwrap()[0];
         assert_eq!(
             r.kind,
@@ -343,7 +488,7 @@ mod tests {
     fn normalize_memory_preserves_unknown_keys_in_metadata() {
         let path = fixture_path("reference");
         let body = "---\nname: env-cargo-path\nmetadata:\n  type: reference\n  node_type: memory\nweird_custom_field: keep-me\n---\nbody";
-        let raw = raw_memory(&path, body.into(), None);
+        let raw = raw_memory(&path, body.into(), None, None);
         let r = &normalize(raw, None).unwrap()[0];
         assert_eq!(r.kind, Kind::Reference);
         // node_type lives inside metadata: block; our minimal parser only
@@ -361,14 +506,14 @@ mod tests {
     #[test]
     fn record_id_is_deterministic_and_instance_scoped() {
         let path = fixture_path("a");
-        let raw1 = raw_memory(&path, "body".into(), Some("workspace-a"));
-        let raw2 = raw_memory(&path, "body".into(), Some("workspace-a"));
+        let raw1 = raw_memory(&path, "body".into(), None, Some("workspace-a"));
+        let raw2 = raw_memory(&path, "body".into(), None, Some("workspace-a"));
         // Same native_id (we synth deterministically), so id collides too.
         let r1 = &normalize(raw1, Some("workspace-a")).unwrap()[0];
         let r2 = &normalize(raw2, Some("workspace-a")).unwrap()[0];
         assert_eq!(r1.id, r2.id);
         // Different instance → different id.
-        let raw3 = raw_memory(&path, "body".into(), Some("workspace-b"));
+        let raw3 = raw_memory(&path, "body".into(), None, Some("workspace-b"));
         let r3 = &normalize(raw3, Some("workspace-b")).unwrap()[0];
         assert_ne!(r1.id, r3.id);
     }

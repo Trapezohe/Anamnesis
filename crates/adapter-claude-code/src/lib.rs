@@ -27,6 +27,7 @@ pub mod detector;
 pub mod frontmatter;
 pub mod normalizer;
 pub mod scanner;
+pub mod session;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -120,7 +121,15 @@ fn collect_raw_records(cfg: &ClaudeCodeConfig) -> Vec<RawRecord> {
     for proj in scans {
         for mem in proj.memory_files {
             match std::fs::read_to_string(&mem) {
-                Ok(body) => out.push(normalizer::raw_memory(&mem, body, cfg.instance.as_deref())),
+                Ok(body) => {
+                    let mtime = file_mtime(&mem);
+                    out.push(normalizer::raw_memory(
+                        &mem,
+                        body,
+                        mtime,
+                        cfg.instance.as_deref(),
+                    ));
+                }
                 Err(e) => {
                     tracing::warn!(
                         path = %mem.display(),
@@ -132,11 +141,15 @@ fn collect_raw_records(cfg: &ClaudeCodeConfig) -> Vec<RawRecord> {
         }
         for sess in proj.jsonl_files {
             match std::fs::read_to_string(&sess) {
-                Ok(body) => out.push(normalizer::raw_session(
-                    &sess,
-                    body,
-                    cfg.instance.as_deref(),
-                )),
+                Ok(body) => {
+                    let mtime = file_mtime(&sess);
+                    out.push(normalizer::raw_session(
+                        &sess,
+                        &body,
+                        mtime,
+                        cfg.instance.as_deref(),
+                    ));
+                }
                 Err(e) => {
                     tracing::warn!(
                         path = %sess.display(),
@@ -150,6 +163,15 @@ fn collect_raw_records(cfg: &ClaudeCodeConfig) -> Vec<RawRecord> {
     out
 }
 
+/// Read a file's modification time as `DateTime<Utc>`. Returns `None`
+/// when `metadata()` fails or the platform doesn't expose mtime — the
+/// normalizer falls back to `captured_at` in that case.
+fn file_mtime(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let m = meta.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(m))
+}
+
 /// Convenience: read a single memory file into a `RawRecord` (used by
 /// the importer when re-importing one file outside the streaming scan).
 pub fn read_memory_file(path: &std::path::Path, instance: Option<&str>) -> Result<RawRecord> {
@@ -157,7 +179,8 @@ pub fn read_memory_file(path: &std::path::Path, instance: Option<&str>) -> Resul
         adapter: ADAPTER_ID.into(),
         message: format!("read {}: {e}", path.display()),
     })?;
-    Ok(normalizer::raw_memory(path, body, instance))
+    let mtime = file_mtime(path);
+    Ok(normalizer::raw_memory(path, body, mtime, instance))
 }
 
 #[cfg(test)]
