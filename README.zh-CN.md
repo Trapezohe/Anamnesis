@@ -2,10 +2,6 @@
   <img src="./banner.png" alt="Anamnesis banner" width="920">
 </p>
 
-<p align="center">
-  <img src="./logo.png" alt="Anamnesis logo" width="96">
-</p>
-
 <h1 align="center">Anamnesis · 搜魂术</h1>
 
 <p align="center">

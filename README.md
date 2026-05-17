@@ -2,10 +2,6 @@
   <img src="./banner.png" alt="Anamnesis banner" width="920">
 </p>
 
-<p align="center">
-  <img src="./logo.png" alt="Anamnesis logo" width="96">
-</p>
-
 <h1 align="center">Anamnesis</h1>
 
 <p align="center">
