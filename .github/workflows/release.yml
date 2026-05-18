@@ -147,16 +147,30 @@ jobs:
           script: |
             const tag = context.ref.startsWith('refs/tags/')
               ? context.ref.replace('refs/tags/', '')
-              : context.payload.inputs.tag;
+              : context.payload.inputs?.tag;
             if (!tag) {
               core.setFailed('no tag in context — neither tag push nor workflow_dispatch input');
               return;
             }
-            const { data: rel } = await github.rest.repos.getReleaseByTag({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag,
-            });
+            // GitHub's `GET /repos/{o}/{r}/releases/tags/{tag}` only returns
+            // *published* releases — a draft created by softprops/action-gh-release
+            // (which we always produce, since we publish atomically only after every
+            // build job has uploaded its archive) is invisible to it and the call
+            // 404s. Walk the full release list instead, filtering by `tag_name`.
+            // `paginate.iterator` handles the >100-release case without us
+            // having to track cursors manually.
+            let rel = null;
+            for await (const page of github.paginate.iterator(
+              github.rest.repos.listReleases,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            )) {
+              const found = page.data.find(r => r.tag_name === tag);
+              if (found) { rel = found; break; }
+            }
+            if (!rel) {
+              core.setFailed(`no release found with tag_name=${tag} (draft or published)`);
+              return;
+            }
             if (!rel.draft) {
               core.info(`release ${tag} is already published; nothing to do`);
               return;
