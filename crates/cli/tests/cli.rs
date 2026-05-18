@@ -1549,3 +1549,160 @@ fn doctor_strict_json_still_prints_then_errors() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["ok"], false);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round 51: doctor --since staleness filter
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn doctor_since_marks_never_imported_as_stale() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    // Real empty projects dir → adapter health() = ok.
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            projects.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--since", "7d"])
+        .assert()
+        .success()
+        .stdout(contains("STALE").and(contains("1 stale")));
+}
+
+#[test]
+fn doctor_strict_staleness_exits_nonzero() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            projects.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    // No --since-staleness → exit 0 even with --since.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--since", "7d"])
+        .assert()
+        .success();
+    // With --strict-staleness, the never-imported source trips exit 1.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--since", "7d", "--strict-staleness"])
+        .assert()
+        .failure()
+        .stderr(contains("stale under --strict-staleness"));
+}
+
+#[test]
+fn doctor_since_units_parse_correctly() {
+    // `1m` (1 minute) is short — the never-imported row should still
+    // flag stale, but more importantly `0d` should NOT flag stale.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            projects.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    // `1m` accepted as minutes.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--since", "1m"])
+        .assert()
+        .success()
+        .stdout(contains("1 stale"));
+    // Bare seconds also accepted.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--since", "60"])
+        .assert()
+        .success()
+        .stdout(contains("1 stale"));
+}
+
+#[test]
+fn doctor_since_rejects_malformed_value() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--since", "not-a-duration"])
+        .assert()
+        .failure()
+        .stderr(contains("--since must be of the form"));
+}
+
+#[test]
+fn doctor_json_includes_stale_field_when_since_set() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            projects.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--json", "--since", "7d"])
+        .output()
+        .unwrap();
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = arr.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["stale"], true);
+}
