@@ -757,6 +757,86 @@ impl Store {
         Ok(row)
     }
 
+    /// Direct children of `parent` — records whose
+    /// `provenance.derived_from == parent`. Hits the
+    /// `idx_records_derived_from` partial index (see migration 0004).
+    ///
+    /// Limit is clamped to `[1, MAX_LIST_LIMIT]` to match the rest of
+    /// the listing API. Pass a high limit if you genuinely want every
+    /// child — the partial index keeps the query cheap.
+    ///
+    /// Used by `anamnesis lineage` to show the §-1.5 PR-6 audit trail
+    /// (which Facts/Preferences/Skills got distilled out of a given
+    /// Episode).
+    pub fn list_derivations(&self, parent: &RecordId, limit: u32) -> Result<Vec<AnamnesisRecord>> {
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, adapter, instance, content, scope, kind, \
+                    created_at, updated_at, tags, metadata, \
+                    native_id, native_path, captured_at, raw_hash, schema_version, \
+                    derived_from \
+             FROM records \
+             WHERE derived_from = ?1 \
+             ORDER BY created_at ASC, id ASC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![parent.0, limit], record_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Walk `start` → `start.derived_from` → `…` up to the root of the
+    /// lineage chain. The returned `Vec` is ordered child-first: index 0
+    /// is `start` itself, the last element is the root (a record whose
+    /// `derived_from` is `None`, or the deepest record still in the store
+    /// — broken parents are tolerated but reported via the second tuple
+    /// element).
+    ///
+    /// Cycle-safe: if a malformed write ever creates `A → B → A`, the
+    /// walk stops at the second encounter and the cycle is signaled as
+    /// `Err(StoreError::Corruption)` so callers can surface the
+    /// corruption instead of silently truncating.
+    ///
+    /// Returns `Ok(None)` when `start` itself doesn't exist.
+    pub fn lineage_chain(&self, start: &RecordId) -> Result<Option<LineageChain>> {
+        let mut chain: Vec<AnamnesisRecord> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(start.clone());
+        let mut missing_parent: Option<RecordId> = None;
+
+        while let Some(cur) = cursor {
+            if !seen.insert(cur.0.clone()) {
+                return Err(StoreError::Corruption(format!(
+                    "lineage cycle detected at {}",
+                    cur.0
+                )));
+            }
+            match self.get_record(&cur)? {
+                Some(record) => {
+                    let next = record.provenance.derived_from.clone();
+                    chain.push(record);
+                    cursor = next;
+                }
+                None => {
+                    // Parent record is missing. If this is the first hop,
+                    // the caller's `start` doesn't exist — return None.
+                    if chain.is_empty() {
+                        return Ok(None);
+                    }
+                    missing_parent = Some(cur);
+                    break;
+                }
+            }
+        }
+
+        Ok(Some(LineageChain {
+            records: chain,
+            missing_parent,
+        }))
+    }
+
     /// Per-record summary an MCP consumer needs to decide what to do
     /// with a hit (or with `get_record` output) without a second
     /// round trip: how many chunks live behind this record, how many
@@ -885,6 +965,30 @@ pub struct RecordSummary {
     pub source_embedding_model: Option<String>,
     /// Dimensionality of the source embedding, when present.
     pub source_embedding_dim: Option<u32>,
+}
+
+/// Result of `Store::lineage_chain` — an ordered walk from a starting
+/// record up to the root of its `provenance.derived_from` chain.
+///
+/// `records[0]` is the record the caller asked about (the leaf). The
+/// last element is whichever ancestor terminated the walk:
+///
+/// - if it has `provenance.derived_from == None`, it's the true root;
+/// - if `missing_parent` is `Some`, the walk stopped because that
+///   parent id wasn't in the store (e.g. it was deleted, or the
+///   derived record was created with a dangling lineage reference).
+///   The chain is still usable; callers can surface the dangling id.
+///
+/// Cycles cause `Store::lineage_chain` to return `Err`, not a truncated
+/// `LineageChain`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineageChain {
+    /// Records from leaf to root (or as far up as the chain is intact).
+    pub records: Vec<AnamnesisRecord>,
+    /// If the walk stopped because a parent `RecordId` wasn't in the
+    /// store, this is that missing id. `None` when the walk reached a
+    /// real root (a record with `derived_from = None`).
+    pub missing_parent: Option<RecordId>,
 }
 
 /// One chunk row, joined with enough provenance for downstream tools
@@ -2300,6 +2404,127 @@ mod tests {
             Some(&parent_id.0),
             "derived record's lineage must point at the source Episode after round-trip"
         );
+    }
+
+    #[test]
+    fn list_derivations_returns_only_direct_children() {
+        let store = Store::open_in_memory().unwrap();
+        let parent = make_record("claude-code", "ep-1", "raw conversation", Kind::Episode);
+        let pid = parent.id.clone();
+        let pc = Chunker::default().chunk(&parent.id, &parent.content);
+        store.upsert_record(&parent, &pc, None).unwrap();
+
+        let mut child_a = make_record("extractor", "fact-a", "user lives in Paris", Kind::Fact);
+        child_a.provenance.derived_from = Some(pid.clone());
+        let c_a = Chunker::default().chunk(&child_a.id, &child_a.content);
+        store.upsert_record(&child_a, &c_a, None).unwrap();
+
+        let mut child_b = make_record("extractor", "pref-a", "prefers Rust", Kind::Preference);
+        child_b.provenance.derived_from = Some(pid.clone());
+        let c_b = Chunker::default().chunk(&child_b.id, &child_b.content);
+        store.upsert_record(&child_b, &c_b, None).unwrap();
+
+        // Sibling that is NOT derived from parent — must not appear.
+        let unrelated = make_record("claude-code", "ep-2", "different episode", Kind::Episode);
+        let cu = Chunker::default().chunk(&unrelated.id, &unrelated.content);
+        store.upsert_record(&unrelated, &cu, None).unwrap();
+
+        let children = store.list_derivations(&pid, 50).unwrap();
+        assert_eq!(children.len(), 2);
+        let kinds: std::collections::HashSet<_> = children.iter().map(|r| r.kind).collect();
+        assert!(kinds.contains(&Kind::Fact));
+        assert!(kinds.contains(&Kind::Preference));
+    }
+
+    #[test]
+    fn lineage_chain_walks_to_root() {
+        let store = Store::open_in_memory().unwrap();
+        // Episode (root) → Fact (mid) → Skill (leaf).
+        let root = make_record("claude-code", "ep-1", "raw conv", Kind::Episode);
+        let root_id = root.id.clone();
+        let rc = Chunker::default().chunk(&root.id, &root.content);
+        store.upsert_record(&root, &rc, None).unwrap();
+
+        let mut mid = make_record("extractor", "fact-a", "Paris is capital", Kind::Fact);
+        mid.provenance.derived_from = Some(root_id.clone());
+        let mid_id = mid.id.clone();
+        let mc = Chunker::default().chunk(&mid.id, &mid.content);
+        store.upsert_record(&mid, &mc, None).unwrap();
+
+        let mut leaf = make_record("extractor", "skill-a", "how to check capital", Kind::Skill);
+        leaf.provenance.derived_from = Some(mid_id.clone());
+        let leaf_id = leaf.id.clone();
+        let lc = Chunker::default().chunk(&leaf.id, &leaf.content);
+        store.upsert_record(&leaf, &lc, None).unwrap();
+
+        let chain = store.lineage_chain(&leaf_id).unwrap().unwrap();
+        assert_eq!(chain.records.len(), 3);
+        assert_eq!(chain.records[0].id.0, leaf_id.0);
+        assert_eq!(chain.records[1].id.0, mid_id.0);
+        assert_eq!(chain.records[2].id.0, root_id.0);
+        assert!(chain.missing_parent.is_none());
+    }
+
+    #[test]
+    fn lineage_chain_missing_parent_is_signaled() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId("never-stored-record".into());
+        let mut orphan = make_record("extractor", "orphan", "dangling fact", Kind::Fact);
+        orphan.provenance.derived_from = Some(phantom.clone());
+        let oid = orphan.id.clone();
+        let oc = Chunker::default().chunk(&orphan.id, &orphan.content);
+        store.upsert_record(&orphan, &oc, None).unwrap();
+
+        let chain = store.lineage_chain(&oid).unwrap().unwrap();
+        assert_eq!(chain.records.len(), 1);
+        assert_eq!(chain.records[0].id.0, oid.0);
+        assert_eq!(chain.missing_parent.unwrap().0, phantom.0);
+    }
+
+    #[test]
+    fn lineage_chain_returns_none_for_unknown_start() {
+        let store = Store::open_in_memory().unwrap();
+        let chain = store
+            .lineage_chain(&RecordId("does-not-exist".into()))
+            .unwrap();
+        assert!(chain.is_none());
+    }
+
+    #[test]
+    fn lineage_chain_detects_cycle_and_errors() {
+        // Build A → B → A via direct DB writes. The high-level API
+        // can't construct this (insertion order forbids it) but a
+        // corrupted file or future bug could — make sure the walk
+        // bails loudly instead of looping forever.
+        let store = Store::open_in_memory().unwrap();
+        let a = make_record("extractor", "a", "node a", Kind::Fact);
+        let b = make_record("extractor", "b", "node b", Kind::Fact);
+        let aid = a.id.clone();
+        let bid = b.id.clone();
+        let ac = Chunker::default().chunk(&a.id, &a.content);
+        let bc = Chunker::default().chunk(&b.id, &b.content);
+        store.upsert_record(&a, &ac, None).unwrap();
+        store.upsert_record(&b, &bc, None).unwrap();
+        // Hand-write the cycle.
+        store
+            .conn()
+            .execute(
+                "UPDATE records SET derived_from = ?1 WHERE id = ?2",
+                params![bid.0, aid.0],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE records SET derived_from = ?1 WHERE id = ?2",
+                params![aid.0, bid.0],
+            )
+            .unwrap();
+        let err = store.lineage_chain(&aid).unwrap_err();
+        match err {
+            StoreError::Corruption(msg) => assert!(msg.contains("cycle")),
+            other => panic!("expected Corruption, got {other:?}"),
+        }
     }
 
     #[test]

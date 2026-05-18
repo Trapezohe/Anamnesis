@@ -12,8 +12,8 @@ pub mod api;
 pub mod cjk;
 
 pub use api::{
-    ChunkHit, ChunkLookup, PendingEmbeddingJob, RecordSummary, SearchFilter, SourceRow,
-    SourceWithCounts, StoreStats, MAX_LIST_LIMIT,
+    ChunkHit, ChunkLookup, LineageChain, PendingEmbeddingJob, RecordSummary, SearchFilter,
+    SourceRow, SourceWithCounts, StoreStats, MAX_LIST_LIMIT,
 };
 
 use std::path::Path;
@@ -66,6 +66,12 @@ pub enum StoreError {
         /// Version found on disk.
         found: u32,
     },
+
+    /// Invariant we expect SQLite + the migration set to uphold was
+    /// violated — e.g. a `provenance.derived_from` chain cycle. These
+    /// are loud rather than silent so corruption surfaces fast.
+    #[error("store corruption: {0}")]
+    Corruption(String),
 }
 
 /// Crate result.
