@@ -294,6 +294,30 @@ enum Command {
 
     /// Run pending schema migrations (no-op after init).
     Migrate,
+
+    /// §-2.5 per-source health check. Probes each registered source's
+    /// `MemoryAdapter::health()` and surfaces what's reachable, what's
+    /// stale, and any adapter-specific notes (e.g. ghast's encrypted
+    /// profile DB).
+    ///
+    /// With `--include-unregistered`, also runs the detectors for the
+    /// 14 first-class adapters so you can see what's available on
+    /// the machine but not yet registered.
+    Doctor {
+        /// Restrict to one adapter id (and optional instance).
+        #[arg(long)]
+        source: Option<String>,
+        /// Match a specific instance within `--source`.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Also run the discovery detectors for adapters with no
+        /// registered source, so you can see what's installed locally.
+        #[arg(long)]
+        include_unregistered: bool,
+        /// Emit JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -558,6 +582,21 @@ async fn main() -> Result<()> {
             let _ = Store::open(db_path(&data_dir))?;
             println!("migrations applied");
             Ok(())
+        }
+        Command::Doctor {
+            source,
+            instance,
+            include_unregistered,
+            json,
+        } => {
+            cmd_doctor(
+                &data_dir,
+                source.as_deref(),
+                instance.as_deref(),
+                include_unregistered,
+                json,
+            )
+            .await
         }
     }
 }
@@ -2458,6 +2497,314 @@ fn read_audit_log(data_dir: &std::path::Path) -> Result<Vec<serde_json::Value>> 
 }
 
 /// `anamnesis audit list` / `anamnesis audit show <target>`.
+/// `anamnesis doctor` — §-2.5 per-source health check.
+///
+/// For each registered source, instantiates the adapter at its
+/// configured location and calls `MemoryAdapter::health().await`. Also
+/// folds in the store's per-source record/chunk counts and
+/// `last_import_at` so the output answers two questions at a glance:
+///
+///   1. Is the upstream still reachable? (the adapter's `health()` ok)
+///   2. Is what's in the store fresh? (record_count + last_import_at)
+///
+/// With `--include-unregistered`, also runs the discovery detectors so
+/// the output names adapters that *could* be wired up but aren't yet.
+async fn cmd_doctor(
+    data_dir: &std::path::Path,
+    filter_source: Option<&str>,
+    filter_instance: Option<&str>,
+    include_unregistered: bool,
+    json: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let registered = store.list_sources_with_counts()?;
+
+    let mut rows = Vec::new();
+    for swc in &registered {
+        let src = &swc.source;
+        if let Some(name) = filter_source {
+            if src.adapter != name {
+                continue;
+            }
+        }
+        if let Some(inst) = filter_instance {
+            if src.instance != inst {
+                continue;
+            }
+        }
+        let health = run_adapter_health(src).await;
+        rows.push(DoctorRow {
+            adapter: src.adapter.clone(),
+            instance: instance_label(&src.instance),
+            location: src.location.clone(),
+            registered: true,
+            ok: health.as_ref().map(|h| h.ok).unwrap_or(false),
+            detail: match &health {
+                Some(h) => h.detail.clone(),
+                None => "adapter not wired into doctor; see `import` dispatch".to_string(),
+            },
+            record_count: Some(swc.record_count),
+            chunk_count: Some(swc.chunk_count),
+            last_import_at: src.last_import_at,
+        });
+    }
+
+    if include_unregistered {
+        // Probe every detector. Any (adapter, instance=None) that
+        // doesn't already appear in `registered` is appended as an
+        // unregistered candidate row.
+        let registered_pairs: std::collections::HashSet<(String, String)> = registered
+            .iter()
+            .map(|s| (s.source.adapter.clone(), s.source.instance.clone()))
+            .collect();
+        let detected = run_all_detectors().await;
+        for d in detected {
+            // Detector results don't carry an instance (always None).
+            // Treat them as the default-instance row for that adapter.
+            let key = (d.adapter.clone(), String::new());
+            if registered_pairs.contains(&key) {
+                continue;
+            }
+            if let Some(name) = filter_source {
+                if d.adapter != name {
+                    continue;
+                }
+            }
+            rows.push(DoctorRow {
+                adapter: d.adapter,
+                instance: "(default)".into(),
+                location: Some(d.location),
+                registered: false,
+                ok: matches!(d.confidence, anamnesis_core::Confidence::High),
+                detail: d.note.unwrap_or_else(|| "detector hit".to_string()),
+                record_count: d.estimated_records,
+                chunk_count: None,
+                last_import_at: None,
+            });
+        }
+    }
+
+    if json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "adapter": r.adapter,
+                    "instance": r.instance,
+                    "location": r.location,
+                    "registered": r.registered,
+                    "ok": r.ok,
+                    "detail": r.detail,
+                    "record_count": r.record_count,
+                    "chunk_count": r.chunk_count,
+                    "last_import_at": r.last_import_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!(
+            "No registered sources{}. Run `anamnesis discover` and `anamnesis source add` first.",
+            if include_unregistered {
+                " — and no detectors found anything either"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Anamnesis doctor — per-source health check{}",
+        if include_unregistered {
+            " (incl. unregistered detector hits)"
+        } else {
+            ""
+        }
+    );
+    println!();
+    for row in &rows {
+        let tag = if !row.registered {
+            "?"
+        } else if row.ok {
+            "✓"
+        } else {
+            "✗"
+        };
+        let title = if row.instance == "(default)" {
+            row.adapter.clone()
+        } else {
+            format!("{} :: {}", row.adapter, row.instance)
+        };
+        let status = if row.registered {
+            if row.ok {
+                "registered, healthy"
+            } else {
+                "registered, NOT HEALTHY"
+            }
+        } else {
+            "NOT REGISTERED (detected locally)"
+        };
+        println!("[{tag}] {title}  — {status}");
+        if let Some(loc) = &row.location {
+            println!("    location          : {loc}");
+        }
+        if let Some(count) = row.record_count {
+            print!("    records in store  : {count}");
+            if let Some(ts) = row.last_import_at {
+                let when = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| ts.to_string());
+                print!(" · last_import_at: {when}");
+            }
+            println!();
+        }
+        if let Some(chunks) = row.chunk_count {
+            println!("    chunks            : {chunks}");
+        }
+        println!("    detail            : {}", row.detail);
+        println!();
+    }
+    let ok_count = rows.iter().filter(|r| r.registered && r.ok).count();
+    let bad_count = rows.iter().filter(|r| r.registered && !r.ok).count();
+    let unreg_count = rows.iter().filter(|r| !r.registered).count();
+    println!("Summary: {ok_count} healthy, {bad_count} unhealthy, {unreg_count} unregistered.");
+    Ok(())
+}
+
+struct DoctorRow {
+    adapter: String,
+    instance: String,
+    location: Option<String>,
+    registered: bool,
+    ok: bool,
+    detail: String,
+    record_count: Option<u64>,
+    chunk_count: Option<u64>,
+    last_import_at: Option<i64>,
+}
+
+fn instance_label(instance: &str) -> String {
+    if instance.is_empty() {
+        "(default)".into()
+    } else {
+        instance.to_string()
+    }
+}
+
+/// Build the adapter for a registered source and call `.health().await`.
+/// Returns `None` when the adapter id isn't one we recognize (so the
+/// caller can render a friendly "not wired" message).
+async fn run_adapter_health(
+    src: &anamnesis_store::SourceRow,
+) -> Option<anamnesis_core::adapter::HealthStatus> {
+    use anamnesis_core::adapter::MemoryAdapter;
+    let location_path = src.location.as_deref().map(std::path::PathBuf::from);
+    let instance = if src.instance.is_empty() {
+        None
+    } else {
+        Some(src.instance.as_str())
+    };
+
+    match src.adapter.as_str() {
+        anamnesis_adapter_claude_code::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".claude", "projects"]).unwrap_or_default());
+            let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
+                projects_root: path,
+                instance: instance.map(str::to_owned),
+            });
+            Some(adapter.health().await)
+        }
+        anamnesis_adapter_codex::ADAPTER_ID => {
+            let path = location_path.unwrap_or_else(|| home_join(&[".codex"]).unwrap_or_default());
+            Some(codex_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_mem0::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".mem0", "db.sqlite"]).unwrap_or_default());
+            Some(mem0_sqlite_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_letta::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".letta", "letta.db"]).unwrap_or_default());
+            Some(letta_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_hermes::ADAPTER_ID => {
+            let path = location_path.unwrap_or_else(|| home_join(&[".hermes"]).unwrap_or_default());
+            Some(hermes_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_openclaw::ADAPTER_ID => {
+            let path =
+                location_path.unwrap_or_else(|| home_join(&[".openclaw"]).unwrap_or_default());
+            Some(openclaw_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_ghast::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&["Documents", "ghast_desktop"]).unwrap_or_default());
+            Some(ghast_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_tdai::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".openclaw", "memory-tdai"]).unwrap_or_default());
+            Some(tdai_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_openviking::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".openviking", "data"]).unwrap_or_default());
+            Some(openviking_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_mempalace::ADAPTER_ID => {
+            let path =
+                location_path.unwrap_or_else(|| home_join(&[".mempalace"]).unwrap_or_default());
+            Some(mempalace_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_memori::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".memori", "memori.db"]).unwrap_or_default());
+            Some(memori_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_memos::ADAPTER_ID => {
+            let path = location_path.unwrap_or_else(|| home_join(&[".memos"]).unwrap_or_default());
+            Some(memos_adapter(path, instance).health().await)
+        }
+        anamnesis_adapter_memary::ADAPTER_ID => {
+            let path = location_path
+                .unwrap_or_else(|| home_join(&[".memary", "data"]).unwrap_or_default());
+            Some(memary_adapter(path, instance).health().await)
+        }
+        // generic-mcp: needs URL + optional token-from-env. Skip
+        // here — the adapter constructs a long-lived MCP session
+        // and exposing that to doctor without spinning one up just
+        // for a health probe would be expensive. Return None so the
+        // caller renders "not wired into doctor".
+        _ => None,
+    }
+}
+
+/// Run every detector we know about. Single place to keep this list in
+/// sync with `cmd_discover` and the §-2.5 adapter roster.
+async fn run_all_detectors() -> Vec<anamnesis_core::discovery::DetectedSource> {
+    let discovery = Discovery::new()
+        .register(Box::new(ClaudeCodeDetector::new()))
+        .register(Box::new(Mem0SqliteDetector::new()))
+        .register(Box::new(CodexDetector::new()))
+        .register(Box::new(LettaSqliteDetector::new()))
+        .register(Box::new(HermesDetector::new()))
+        .register(Box::new(OpenClawDetector::new()))
+        .register(Box::new(GhastDetector::new()))
+        .register(Box::new(TdaiDetector::new()))
+        .register(Box::new(OpenVikingDetector::new()))
+        .register(Box::new(MempalaceDetector::new()))
+        .register(Box::new(MemoriDetector::new()))
+        .register(Box::new(MemosDetector::new()))
+        .register(Box::new(MemaryDetector::new()));
+    discovery.detect_all(&DetectOpts::default()).await
+}
+
 fn cmd_audit(data_dir: &std::path::Path, sub: AuditCmd) -> Result<()> {
     let entries = read_audit_log(data_dir)?;
     match sub {
