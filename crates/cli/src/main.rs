@@ -208,6 +208,16 @@ enum Command {
         /// the OpenAI default.
         #[arg(long, env = "OPENAI_API_BASE")]
         api_base: Option<String>,
+        /// Safety cap: refuse to start Stage 2 if Stage 1 surfaced
+        /// more than this many candidates. Default 100. Bypass with
+        /// a higher value once you've eyeballed `--dry-run` output.
+        #[arg(long, default_value_t = 100)]
+        max_llm_calls: usize,
+        /// Skip the interactive `Proceed? [y/N]` prompt before any
+        /// real LLM call. Required when running non-interactively
+        /// (CI / scripts). Has no effect with `--provider mock`.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Show the `provenance.derived_from` lineage of a record. Walks
@@ -454,6 +464,8 @@ async fn main() -> Result<()> {
             provider,
             model,
             api_base,
+            max_llm_calls,
+            yes,
         } => {
             cmd_extract(
                 &data_dir,
@@ -468,6 +480,8 @@ async fn main() -> Result<()> {
                 &provider,
                 &model,
                 api_base.as_deref(),
+                max_llm_calls,
+                yes,
             )
             .await
         }
@@ -1894,6 +1908,8 @@ async fn cmd_extract(
     provider_id: &str,
     model: &str,
     api_base: Option<&str>,
+    max_llm_calls: usize,
+    yes: bool,
 ) -> Result<()> {
     let target_kind = anamnesis_extractor::ExtractKind::parse(kind_str).ok_or_else(|| {
         anyhow!("unknown extract kind {kind_str:?}; supported: fact, preference, feedback, skill")
@@ -1910,6 +1926,7 @@ async fn cmd_extract(
         // §-1.5 #6: "运行前向用户展示'将使用模型 X 做 N 次 LLM 调用'".
         // Stage 2 runs through whichever provider the user picked.
         return run_stage2_path(
+            data_dir,
             &store,
             &candidates,
             target_kind,
@@ -1919,6 +1936,8 @@ async fn cmd_extract(
             provider_id,
             model,
             api_base,
+            max_llm_calls,
+            yes,
         )
         .await;
     }
@@ -2034,6 +2053,7 @@ async fn cmd_extract(
 /// instant a single record gets written.
 #[allow(clippy::too_many_arguments)]
 async fn run_stage2_path(
+    data_dir: &std::path::Path,
     store: &Store,
     candidates: &[anamnesis_extractor::Candidate],
     target_kind: anamnesis_extractor::ExtractKind,
@@ -2043,8 +2063,25 @@ async fn run_stage2_path(
     provider_id: &str,
     model: &str,
     api_base: Option<&str>,
+    max_llm_calls: usize,
+    yes: bool,
 ) -> Result<()> {
     use anamnesis_extractor::cost_preview_line;
+
+    // §-1.5 #6 safety cap — refuse before constructing the provider so
+    // we don't even instantiate an HTTP client when over-budget.
+    if candidates.len() > max_llm_calls {
+        return Err(anyhow!(
+            "Stage 1 surfaced {} candidates which exceeds --max-llm-calls={}. \
+             Either re-run with `--limit {}` to bound the input, \
+             or `--max-llm-calls {}` if you really want that many.",
+            candidates.len(),
+            max_llm_calls,
+            max_llm_calls,
+            candidates.len(),
+        ));
+    }
+
     let (provider, banner) = build_provider(provider_id, model, api_base)?;
 
     // §-1.5 #6 plan banner — always printed BEFORE any provider call.
@@ -2062,6 +2099,26 @@ async fn run_stage2_path(
         eprintln!();
     }
 
+    // Interactive confirmation gate. Mock is offline+deterministic →
+    // no surprise → no prompt. `--yes` skips for scripts. JSON mode
+    // also skips (calling code is non-interactive by construction).
+    let needs_confirm = provider_id != "mock" && !yes && !json;
+    if needs_confirm {
+        eprintln!(
+            "About to send {} LLM request(s). Proceed? [y/N]",
+            candidates.len()
+        );
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).ok();
+        let answer = buf.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            return Err(anyhow!(
+                "aborted by user — pass `--yes` to skip this prompt in scripts"
+            ));
+        }
+    }
+
+    let run_started_at = chrono::Utc::now();
     let report =
         anamnesis_extractor::run_stage2(provider.as_ref(), candidates, target_kind, instance)
             .await?;
@@ -2075,6 +2132,33 @@ async fn run_stage2_path(
         let chunks = chunker.chunk(&record.id, &record.content);
         store.upsert_record(record, &chunks, None)?;
         written += 1;
+    }
+
+    // §-1.5 #6 audit trail: write one JSONL line per Stage 2 run to
+    // `<data_dir>/audit/stage2.jsonl`. Lets `anamnesis lineage` users
+    // cross-reference WHICH extract run produced a given record, and
+    // makes it possible to dump cost / token / error stats over time.
+    let run_finished_at = chrono::Utc::now();
+    let audit_entry = serde_json::json!({
+        "ts_started": run_started_at.to_rfc3339(),
+        "ts_finished": run_finished_at.to_rfc3339(),
+        "stage": "stage2",
+        "provider_id": provider_id,
+        "provider_model": provider.model_id(),
+        "target_kind": target_kind.as_str(),
+        "candidates_total_scanned": total_seen,
+        "candidates_processed": candidates.len(),
+        "records_written": written,
+        "records_skipped": report.skipped,
+        "estimated_input_tokens": report.estimated_input_tokens,
+        "errors": report.errors,
+        "derived_record_ids": report.records.iter().map(|r| r.id.0.clone()).collect::<Vec<_>>(),
+        "source_record_ids": report.records.iter()
+            .filter_map(|r| r.provenance.derived_from.as_ref().map(|p| p.0.clone()))
+            .collect::<Vec<_>>(),
+    });
+    if let Err(e) = append_stage2_audit(data_dir, &audit_entry) {
+        eprintln!("⚠ audit log write failed: {e}");
     }
 
     if json {
@@ -2212,6 +2296,27 @@ fn build_openai_provider(
          which is on by default. Rebuild with `cargo build --features openai-provider` \
          (or `--all-features`) and try again."
     ))
+}
+
+/// Append one Stage 2 audit entry to `<data_dir>/audit/stage2.jsonl`.
+///
+/// One file (not per-run) so `jq -s '.' stage2.jsonl` slurps the whole
+/// history; per-run timestamps live in the entry. Append-only; we
+/// never rewrite or compact this file from inside the CLI. Operators
+/// who want rotation can wire it to logrotate externally.
+fn append_stage2_audit(data_dir: &std::path::Path, entry: &serde_json::Value) -> Result<()> {
+    let dir = data_dir.join("audit");
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create audit dir: {e}"))?;
+    let path = dir.join("stage2.jsonl");
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+    let line = serde_json::to_string(entry).map_err(|e| anyhow!("serialize: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+    Ok(())
 }
 
 fn load_episode_records(
