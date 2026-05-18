@@ -735,16 +735,26 @@ jobs:
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
           crate=anamnesis-adapter-generic-mcp
-          # generic-mcp's dev-dependencies include anamnesis-mcp-server (for the
-          # loopback integration test). mcp-server publishes AFTER this step, so
-          # at this point it isn't on crates.io yet — cargo's local-verify build
-          # would fail "no matching package named anamnesis-mcp-server". Skip
-          # verify; dev-deps aren't shipped in the .crate package anyway.
-          publish_flags="--no-verify"
+          # generic-mcp's dev-dependencies include `anamnesis-mcp-server` and
+          # `anamnesis-store` for the loopback integration test. mcp-server
+          # publishes AFTER this step, so cargo's pre-publish dep-resolution
+          # fails ("no matching package named anamnesis-mcp-server"). Even
+          # --no-verify doesn't help — manifest validation runs first.
+          #
+          # Workaround: comment out the two internal dev-deps just for this
+          # publish call, then restore. dev-dependencies are NEVER shipped
+          # in the .crate package (they're not part of the public API), so
+          # what we publish is identical in either form.
+          cp crates/adapter-generic-mcp/Cargo.toml /tmp/generic-mcp-Cargo.toml.bak
+          sed -i 's/^anamnesis-mcp-server = /# anamnesis-mcp-server = /' crates/adapter-generic-mcp/Cargo.toml
+          sed -i 's/^anamnesis-store = /# anamnesis-store = /' crates/adapter-generic-mcp/Cargo.toml
+          publish_flags="--no-verify --allow-dirty"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run $publish_flags -p $crate || true
+            cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
           else
             out=$(cargo publish $publish_flags -p $crate 2>&1) || true
+            cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
             echo "$out"
             if echo "$out" | grep -qE 'already uploaded|already exists'; then
               echo "✓ $crate is already on crates.io — skipping (idempotent)"
