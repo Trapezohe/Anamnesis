@@ -31,6 +31,8 @@
 #![warn(missing_docs)]
 
 pub mod gate;
+#[cfg(feature = "openai-provider")]
+pub mod openai;
 pub mod prompt;
 pub mod provider;
 pub mod stage2;
@@ -38,6 +40,8 @@ pub mod stage2;
 use anamnesis_core::model::{AnamnesisRecord, Kind, RecordId};
 
 pub use gate::{default_gate, DefaultGate, Stage1Gate, Stage1Score};
+#[cfg(feature = "openai-provider")]
+pub use openai::{OpenAiProvider, DEFAULT_API_BASE, DEFAULT_TEMPERATURE, DEFAULT_TIMEOUT_SECS};
 pub use prompt::build_prompt;
 pub use provider::{cost_preview_line, LlmProvider, MockProvider};
 pub use stage2::{

@@ -380,6 +380,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

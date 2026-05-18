@@ -186,12 +186,28 @@ enum Command {
         /// Emit JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
-        /// Opt-out of the (currently required) dry-run mode. Stage 2 is
-        /// not yet implemented; passing this flag will simply error.
-        /// It exists as a placeholder so the CLI surface stays stable
-        /// once Stage 2 lands and starts honoring it.
+        /// Opt-out of dry-run mode and actually run Stage 2 against the
+        /// configured provider. With `--provider mock` (default) this
+        /// is a no-network no-op that exercises the persistence
+        /// pipeline. With `--provider openai` it makes real HTTP
+        /// requests after printing the cost preview.
         #[arg(long)]
         no_dry_run: bool,
+        /// Stage-2 LLM provider: `mock` (default; deterministic, no
+        /// network) or `openai` (real OpenAI-compatible HTTP, needs
+        /// the `openai-provider` cargo feature).
+        #[arg(long, default_value = "mock")]
+        provider: String,
+        /// Model identifier passed to the provider (e.g.
+        /// `gpt-4o-mini`, `llama3.2:3b`). Ignored for `mock`.
+        #[arg(long, default_value = "gpt-4o-mini")]
+        model: String,
+        /// OpenAI-compatible API base URL (e.g.
+        /// `https://api.openai.com/v1`, `http://localhost:11434/v1`
+        /// for Ollama). Falls back to `OPENAI_API_BASE` env, then
+        /// the OpenAI default.
+        #[arg(long, env = "OPENAI_API_BASE")]
+        api_base: Option<String>,
     },
 
     /// Show the `provenance.derived_from` lineage of a record. Walks
@@ -435,6 +451,9 @@ async fn main() -> Result<()> {
             explain,
             json,
             no_dry_run,
+            provider,
+            model,
+            api_base,
         } => {
             cmd_extract(
                 &data_dir,
@@ -446,6 +465,9 @@ async fn main() -> Result<()> {
                 explain,
                 json,
                 !no_dry_run,
+                &provider,
+                &model,
+                api_base.as_deref(),
             )
             .await
         }
@@ -1869,6 +1891,9 @@ async fn cmd_extract(
     explain: bool,
     json: bool,
     dry_run: bool,
+    provider_id: &str,
+    model: &str,
+    api_base: Option<&str>,
 ) -> Result<()> {
     let target_kind = anamnesis_extractor::ExtractKind::parse(kind_str).ok_or_else(|| {
         anyhow!("unknown extract kind {kind_str:?}; supported: fact, preference, feedback, skill")
@@ -1883,10 +1908,19 @@ async fn cmd_extract(
 
     if !dry_run {
         // §-1.5 #6: "运行前向用户展示'将使用模型 X 做 N 次 LLM 调用'".
-        // The configured provider defaults to MockProvider here — the
-        // real OpenAI-compatible provider is gated behind a follow-up
-        // PR and a feature flag. Either way we print the plan first.
-        return run_stage2_path(&store, &candidates, target_kind, instance, total_seen, json).await;
+        // Stage 2 runs through whichever provider the user picked.
+        return run_stage2_path(
+            &store,
+            &candidates,
+            target_kind,
+            instance,
+            total_seen,
+            json,
+            provider_id,
+            model,
+            api_base,
+        )
+        .await;
     }
 
     if json {
@@ -1993,12 +2027,12 @@ async fn cmd_extract(
 /// is what we target in Phase 1.
 /// `anamnesis extract --no-dry-run` execution path.
 ///
-/// Today this uses the deterministic `MockProvider` — the real OpenAI-
-/// compatible provider is the next PR in the §-1.5 sequence. Even with
-/// the mock, the path runs end-to-end: prints the cost preview, calls
-/// the provider, parses results, writes derived records to the store
-/// with `provenance.derived_from = source_episode_id`. That makes the
-/// `anamnesis lineage` audit trail meaningful immediately.
+/// Builds the configured `LlmProvider` (mock or openai), prints the
+/// §-1.5 #6 cost preview, runs Stage 2, and persists every derived
+/// record with `provenance.derived_from = source_episode_id`. The
+/// `anamnesis lineage <derived-id>` audit trail starts working the
+/// instant a single record gets written.
+#[allow(clippy::too_many_arguments)]
 async fn run_stage2_path(
     store: &Store,
     candidates: &[anamnesis_extractor::Candidate],
@@ -2006,30 +2040,31 @@ async fn run_stage2_path(
     instance: Option<&str>,
     total_seen: usize,
     json: bool,
+    provider_id: &str,
+    model: &str,
+    api_base: Option<&str>,
 ) -> Result<()> {
-    use anamnesis_extractor::{cost_preview_line, LlmProvider, MockProvider};
-    let provider = MockProvider::default_instance();
+    use anamnesis_extractor::cost_preview_line;
+    let (provider, banner) = build_provider(provider_id, model, api_base)?;
 
     // §-1.5 #6 plan banner — always printed BEFORE any provider call.
     let estimated_tokens: usize = candidates
         .iter()
         .map(|c| {
             let prompt = anamnesis_extractor::build_prompt(target_kind, &c.record.content);
-            <MockProvider as anamnesis_extractor::LlmProvider>::estimate_tokens(&provider, &prompt)
+            provider.estimate_tokens(&prompt)
         })
         .sum();
     let preview = cost_preview_line(provider.model_id(), candidates.len(), estimated_tokens);
     if !json {
         eprintln!("{preview}");
-        eprintln!(
-            "Stage 2 will run via the built-in MockProvider — \
-             zero network requests, deterministic output."
-        );
+        eprintln!("{banner}");
         eprintln!();
     }
 
     let report =
-        anamnesis_extractor::run_stage2(&provider, candidates, target_kind, instance).await?;
+        anamnesis_extractor::run_stage2(provider.as_ref(), candidates, target_kind, instance)
+            .await?;
 
     // Persist every derived record. Chunker is needed because
     // upsert_record demands at least one chunk row for the FTS index.
@@ -2111,6 +2146,72 @@ async fn run_stage2_path(
 
 fn preview_text(s: &str, max_chars: usize) -> String {
     preview(s, max_chars)
+}
+
+/// Build the `LlmProvider` the user requested. Returns the provider
+/// plus a short human-readable banner the cost preview prints right
+/// after the "Stage 2 plan: …" line.
+///
+/// Provider selection rules:
+/// - `mock`  → `MockProvider::default_instance()` (no network)
+/// - `openai` → `OpenAiProvider::new(model)` configured from
+///   `OPENAI_API_KEY` (env) and `--api-base` / `OPENAI_API_BASE`
+///   (default `https://api.openai.com/v1`).
+///
+/// Unknown ids return an error before any candidate is processed.
+fn build_provider(
+    provider_id: &str,
+    model: &str,
+    api_base: Option<&str>,
+) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
+    match provider_id {
+        "mock" => Ok((
+            Box::new(anamnesis_extractor::MockProvider::default_instance()),
+            "Stage 2 will run via the built-in MockProvider — zero network requests, \
+             deterministic output."
+                .into(),
+        )),
+        "openai" => build_openai_provider(model, api_base),
+        other => Err(anyhow!(
+            "unknown --provider {other:?}; supported: mock, openai"
+        )),
+    }
+}
+
+#[cfg(feature = "openai-provider")]
+fn build_openai_provider(
+    model: &str,
+    api_base: Option<&str>,
+) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
+    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+        anyhow!(
+            "OPENAI_API_KEY environment variable is required for `--provider openai`. \
+             Set it before running, or use `--provider mock`."
+        )
+    })?;
+    let mut p = anamnesis_extractor::OpenAiProvider::new(model).with_api_key(api_key);
+    if let Some(base) = api_base {
+        p = p.with_api_base(base);
+    }
+    let banner = format!(
+        "Stage 2 will run via OpenAI-compatible provider at {} (model={}). \
+         Each candidate is one HTTP POST.",
+        p.api_base(),
+        p.model_name(),
+    );
+    Ok((Box::new(p), banner))
+}
+
+#[cfg(not(feature = "openai-provider"))]
+fn build_openai_provider(
+    _model: &str,
+    _api_base: Option<&str>,
+) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
+    Err(anyhow!(
+        "`--provider openai` requires the `openai-provider` cargo feature, \
+         which is on by default. Rebuild with `cargo build --features openai-provider` \
+         (or `--all-features`) and try again."
+    ))
 }
 
 fn load_episode_records(

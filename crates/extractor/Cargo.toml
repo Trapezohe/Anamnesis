@@ -8,6 +8,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Real OpenAI-compatible HTTP provider. Off by default — when on,
+# pulls `reqwest` so consumers that don't need it (e.g. tests, the
+# MockProvider path) stay dep-light.
+openai-provider = ["dep:reqwest"]
+
 [dependencies]
 anamnesis-core = { workspace = true }
 async-trait = { workspace = true }
@@ -17,6 +23,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# Gated behind the `openai-provider` feature so the MockProvider build
+# stays minimal. `rustls-tls` (not the system openssl) so static
+# builds and cross-compilation keep working.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
