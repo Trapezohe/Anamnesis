@@ -26,7 +26,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -37,27 +37,27 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
-anamnesis-core = { path = "crates/core", version = "0.0.2" }
-anamnesis-store = { path = "crates/store", version = "0.0.2" }
-anamnesis-embedder = { path = "crates/embedder", version = "0.0.2", default-features = false }
-anamnesis-search = { path = "crates/search", version = "0.0.2" }
-anamnesis-importer = { path = "crates/importer", version = "0.0.2" }
-anamnesis-extractor = { path = "crates/extractor", version = "0.0.2" }
-anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.2" }
-anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.2" }
-anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.2" }
-anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.0.2" }
-anamnesis-adapter-letta = { path = "crates/adapter-letta", version = "0.0.2" }
-anamnesis-adapter-hermes = { path = "crates/adapter-hermes", version = "0.0.2" }
-anamnesis-adapter-openclaw = { path = "crates/adapter-openclaw", version = "0.0.2" }
-anamnesis-adapter-ghast = { path = "crates/adapter-ghast", version = "0.0.2" }
-anamnesis-adapter-tdai = { path = "crates/adapter-tdai", version = "0.0.2" }
-anamnesis-adapter-openviking = { path = "crates/adapter-openviking", version = "0.0.2" }
-anamnesis-adapter-mempalace = { path = "crates/adapter-mempalace", version = "0.0.2" }
-anamnesis-adapter-memori = { path = "crates/adapter-memori", version = "0.0.2" }
-anamnesis-adapter-memos = { path = "crates/adapter-memos", version = "0.0.2" }
-anamnesis-adapter-memary = { path = "crates/adapter-memary", version = "0.0.2" }
-anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.2", default-features = false }
+anamnesis-core = { path = "crates/core", version = "0.1.0" }
+anamnesis-store = { path = "crates/store", version = "0.1.0" }
+anamnesis-embedder = { path = "crates/embedder", version = "0.1.0", default-features = false }
+anamnesis-search = { path = "crates/search", version = "0.1.0" }
+anamnesis-importer = { path = "crates/importer", version = "0.1.0" }
+anamnesis-extractor = { path = "crates/extractor", version = "0.1.0" }
+anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.1.0" }
+anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.1.0" }
+anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.1.0" }
+anamnesis-adapter-mem0 = { path = "crates/adapter-mem0", version = "0.1.0" }
+anamnesis-adapter-letta = { path = "crates/adapter-letta", version = "0.1.0" }
+anamnesis-adapter-hermes = { path = "crates/adapter-hermes", version = "0.1.0" }
+anamnesis-adapter-openclaw = { path = "crates/adapter-openclaw", version = "0.1.0" }
+anamnesis-adapter-ghast = { path = "crates/adapter-ghast", version = "0.1.0" }
+anamnesis-adapter-tdai = { path = "crates/adapter-tdai", version = "0.1.0" }
+anamnesis-adapter-openviking = { path = "crates/adapter-openviking", version = "0.1.0" }
+anamnesis-adapter-mempalace = { path = "crates/adapter-mempalace", version = "0.1.0" }
+anamnesis-adapter-memori = { path = "crates/adapter-memori", version = "0.1.0" }
+anamnesis-adapter-memos = { path = "crates/adapter-memos", version = "0.1.0" }
+anamnesis-adapter-memary = { path = "crates/adapter-memary", version = "0.1.0" }
+anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.1.0", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

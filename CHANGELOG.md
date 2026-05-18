@@ -6,6 +6,47 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 _Nothing yet — open the next iteration here._
 
+## [0.1.0] — 2026-05-18 — First stable adapter-contract release
+
+The "every adapter is contract-validated" milestone. With 14 first-class
+adapters all passing the shared `MemoryAdapter` invariant suite — plus
+the host-client on-ramp (`anamnesis mcp config`) and the per-source
+health surface (`doctor`) wired through both CLI and MCP — Anamnesis
+crosses from "useful in principle" to "safe to wire into a Claude
+Desktop / Cursor / ghast / Continue / Windsurf install." That is what
+0.1.0 marks.
+
+### Added — Client on-ramp & ops
+
+- **`anamnesis mcp config [--name --transport --sse-port --token-env --binary]`**
+  emits the standard `mcpServers` JSON every host client consumes.
+  Defaults to stdio + the absolute path of the running binary so GUI
+  hosts that don't inherit shell PATH find the binary. SSE mode emits
+  `${env:NAME}` placeholders so tokens never land in any config file.
+  (#63)
+- **`docs/INTEGRATIONS.md`** — copy-pasteable setup walk-through for
+  Claude Desktop, Cursor, ghast, Continue, Windsurf, and SSE mode. (#63)
+- **`docs/demo/quickstart.sh`** — POSIX E2E smoke test. `init` →
+  `mcp config` → stdio handshake (`initialize` + `tools/list`) →
+  5-tool catalogue assertion (`search_memories`, `get_record`,
+  `list_sources`, `trace_provenance`, `doctor`). (#63)
+- **`doctor` MCP tool** — per-source health + staleness probe over
+  JSON-RPC, complementing the existing `anamnesis doctor` CLI. (#62)
+
+### Added — Quality / coverage
+
+- **`AdapterContract` coverage for every first-class adapter.** Before
+  0.1.0 only 3 adapters (claude-code, codex, mem0) ran the shared
+  `MemoryAdapter` contract suite. After: all 14 do — 22 new tests
+  covering descriptor stability, scan idempotency, native_id presence,
+  pure normalize, schema_version correctness, raw_hash non-triviality,
+  instance → RecordId propagation, and health-message contract. (#64)
+
+### Notes
+
+- No breaking API changes from 0.0.2.
+- No new runtime dependencies; all new tests use existing dev-deps.
+
 ## [0.0.2] — 2026-05-18 — Phase 2 → 3 transition
 
 First **tagged release with pre-built binaries** for macOS / Linux /

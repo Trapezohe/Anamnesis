@@ -63,7 +63,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "anamnesis-adapter-claude-code"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-codex"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-generic-mcp"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "anamnesis-mcp-server",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-ghast"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-hermes"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-letta"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-mem0"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-memary"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-memori"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-memos"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-mempalace"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-openclaw"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-openviking"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-adapter-tdai"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-cli"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-adapter-claude-code",
  "anamnesis-adapter-codex",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-core"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-embedder"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "anamnesis-store",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-extractor"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "async-trait",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-importer"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "anamnesis-store",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-mcp-server"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-adapter-claude-code",
  "anamnesis-adapter-codex",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-search"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "anamnesis-store",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "anamnesis-store"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "chrono",
