@@ -1706,3 +1706,78 @@ fn doctor_json_includes_stale_field_when_since_set() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["stale"], true);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round 52: doctor generic-mcp live probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn doctor_generic_mcp_unreachable_url_is_unhealthy() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "generic-mcp",
+            "--url",
+            "http://127.0.0.1:1/nope-doctor-test",
+            "--token-env",
+            "DOCTOR_GENERIC_MCP_TOK",
+        ])
+        .assert()
+        .success();
+    // Provide the token so we get past env-resolution and actually
+    // attempt the HTTP probe — which then fails for a dead address.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .env("DOCTOR_GENERIC_MCP_TOK", "stub-token")
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(
+            contains("generic-mcp")
+                .and(contains("NOT HEALTHY"))
+                .and(contains("upstream MCP unreachable")),
+        );
+}
+
+#[test]
+fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "generic-mcp",
+            "--url",
+            "http://127.0.0.1:1/whatever",
+            "--token-env",
+            "DOCTOR_GENERIC_MCP_NOSUCH",
+        ])
+        .assert()
+        .success();
+    // No env var set → token resolution fails before the HTTP probe.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .env_remove("DOCTOR_GENERIC_MCP_NOSUCH")
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(
+            contains("generic-mcp")
+                .and(contains("token resolution failed"))
+                .and(contains("DOCTOR_GENERIC_MCP_NOSUCH")),
+        );
+}
