@@ -150,6 +150,7 @@ fn seed_synthetic_search_record(data_dir: &std::path::Path) -> (&'static str, St
             native_path: Some(format!("/p/{native_id}")),
             captured_at: Utc::now(),
             raw_hash: format!("h-{native_id}"),
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     };

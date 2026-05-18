@@ -114,6 +114,7 @@ fn normalize_identity(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anam
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])
@@ -205,6 +206,7 @@ fn normalize_drawer(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamne
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])

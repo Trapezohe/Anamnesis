@@ -1461,6 +1461,7 @@ mod tests {
                 native_path: Some(format!("/p/{native_id}")),
                 captured_at: Utc.timestamp_opt(created_ts, 0).unwrap(),
                 raw_hash: "h".into(),
+                derived_from: None,
             },
             schema_version: SCHEMA_VERSION,
         }
@@ -1660,6 +1661,7 @@ mod tests {
                 native_path: None,
                 captured_at: chrono::Utc.timestamp_opt(1700000000, 0).unwrap(),
                 raw_hash: "h-wire".into(),
+                derived_from: None,
             },
             schema_version: anamnesis_core::SCHEMA_VERSION,
         };

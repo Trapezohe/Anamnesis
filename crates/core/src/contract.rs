@@ -265,6 +265,7 @@ mod tests {
                     native_path: raw.native_path,
                     captured_at: raw.captured_at,
                     raw_hash: format!("h-{}", raw.native_id),
+                    derived_from: None,
                 },
                 schema_version: SCHEMA_VERSION,
             }])
@@ -361,6 +362,7 @@ mod tests {
                     native_path: None,
                     captured_at: Utc::now(),
                     raw_hash: "h".into(),
+                    derived_from: None,
                 },
                 schema_version: 999,
             }])
@@ -425,6 +427,7 @@ mod tests {
                     native_path: None,
                     captured_at: Utc::now(),
                     raw_hash: "h".into(),
+                    derived_from: None,
                 },
                 schema_version: SCHEMA_VERSION,
             }])
