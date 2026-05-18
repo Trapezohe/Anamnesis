@@ -144,6 +144,12 @@ enum Command {
     #[command(subcommand)]
     Model(ModelCmd),
 
+    /// Browse the §-1.5 PR-6 Stage 2 audit log
+    /// (`<data_dir>/audit/stage2.jsonl`). Use `list` for an overview,
+    /// `show <line-no>` to pretty-print one run.
+    #[command(subcommand)]
+    Audit(AuditCmd),
+
     /// Export records as JSONL or CSV.
     Export {
         /// Output file path (default: stdout).
@@ -331,6 +337,29 @@ enum ModelCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AuditCmd {
+    /// List every Stage 2 extraction run, newest first.
+    List {
+        /// Maximum number of runs to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one specific run by its 1-based line number in the audit
+    /// log (use `list` to find numbers). Pass `last` for the most
+    /// recent run.
+    Show {
+        /// Line number (1-based) or `last`.
+        target: String,
+        /// Emit JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn init_tracing(level: &str) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
@@ -492,6 +521,7 @@ async fn main() -> Result<()> {
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
         Command::Model(sub) => cmd_model(&data_dir, sub).await,
+        Command::Audit(sub) => cmd_audit(&data_dir, sub),
         Command::Serve { sse, token } => {
             cmd_serve(&data_dir, sse, token, config.server.allow_admin_tools).await
         }
@@ -2304,6 +2334,282 @@ fn build_openai_provider(
 /// history; per-run timestamps live in the entry. Append-only; we
 /// never rewrite or compact this file from inside the CLI. Operators
 /// who want rotation can wire it to logrotate externally.
+/// Read the entire audit log into memory and return one JSON value per
+/// line. Lines that fail to parse are skipped with a `tracing::warn`
+/// so a single corrupted entry doesn't make the whole log unreadable.
+fn read_audit_log(data_dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    let path = data_dir.join("audit").join("stage2.jsonl");
+    if !path.is_file() {
+        return Ok(vec![]);
+    }
+    let body =
+        std::fs::read_to_string(&path).map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                tracing::warn!(
+                    line_no = i + 1,
+                    path = %path.display(),
+                    error = %e,
+                    "audit log: skipping unparseable line"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `anamnesis audit list` / `anamnesis audit show <target>`.
+fn cmd_audit(data_dir: &std::path::Path, sub: AuditCmd) -> Result<()> {
+    let entries = read_audit_log(data_dir)?;
+    match sub {
+        AuditCmd::List { limit, json } => audit_list(&entries, limit, json),
+        AuditCmd::Show { target, json } => audit_show(&entries, &target, json),
+    }
+}
+
+fn audit_list(entries: &[serde_json::Value], limit: usize, json: bool) -> Result<()> {
+    let mut rows: Vec<(usize, &serde_json::Value)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i + 1, e))
+        .collect();
+    rows.reverse(); // newest first
+    rows.truncate(limit);
+
+    if json {
+        let payload: Vec<_> = rows
+            .iter()
+            .map(|(line_no, entry)| {
+                serde_json::json!({
+                    "line_no": line_no,
+                    "ts_started": entry.get("ts_started"),
+                    "provider_id": entry.get("provider_id"),
+                    "provider_model": entry.get("provider_model"),
+                    "target_kind": entry.get("target_kind"),
+                    "candidates_processed": entry.get("candidates_processed"),
+                    "records_written": entry.get("records_written"),
+                    "records_skipped": entry.get("records_skipped"),
+                    "errors_count": entry
+                        .get("errors")
+                        .and_then(|e| e.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                    "estimated_input_tokens": entry.get("estimated_input_tokens"),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!(
+            "No Stage 2 audit entries yet. Run \
+             `anamnesis extract --no-dry-run` to populate the log."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<5}  {:<25}  {:<14}  {:<14}  {:<8}  {:>5}  {:>5}  {:>6}",
+        "#", "started", "provider", "model", "kind", "made", "skip", "tokens"
+    );
+    for (line_no, entry) in &rows {
+        let ts = entry
+            .get("ts_started")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let pid = entry
+            .get("provider_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let model = entry
+            .get("provider_model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let kind = entry
+            .get("target_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let made = entry
+            .get("records_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let skip = entry
+            .get("records_skipped")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let tokens = entry
+            .get("estimated_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // Truncate ts to seconds for compactness.
+        let ts_short = ts.get(..19).unwrap_or(ts);
+        println!(
+            "{:<5}  {:<25}  {:<14}  {:<14}  {:<8}  {:>5}  {:>5}  {:>6}",
+            line_no,
+            ts_short,
+            truncate_for_column(pid, 14),
+            truncate_for_column(model, 14),
+            truncate_for_column(kind, 8),
+            made,
+            skip,
+            tokens,
+        );
+    }
+    println!();
+    println!(
+        "{} entries shown (newest first). Use `anamnesis audit show <#>` for details.",
+        rows.len()
+    );
+    Ok(())
+}
+
+fn audit_show(entries: &[serde_json::Value], target: &str, json: bool) -> Result<()> {
+    let line_no = if target.eq_ignore_ascii_case("last") {
+        if entries.is_empty() {
+            return Err(anyhow!("audit log is empty — nothing to show"));
+        }
+        entries.len()
+    } else {
+        target.parse::<usize>().map_err(|_| {
+            anyhow!("unrecognized target {target:?}; pass a 1-based line number or `last`")
+        })?
+    };
+    if line_no == 0 || line_no > entries.len() {
+        return Err(anyhow!(
+            "line number {line_no} out of range; audit log has {} entries",
+            entries.len()
+        ));
+    }
+    let entry = &entries[line_no - 1];
+    if json {
+        println!("{}", serde_json::to_string_pretty(entry)?);
+        return Ok(());
+    }
+    println!("Stage 2 audit entry #{line_no}:");
+    println!(
+        "  ts_started     : {}",
+        entry
+            .get("ts_started")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "  ts_finished    : {}",
+        entry
+            .get("ts_finished")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "  provider_id    : {}",
+        entry
+            .get("provider_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "  provider_model : {}",
+        entry
+            .get("provider_model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "  target_kind    : {}",
+        entry
+            .get("target_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "  candidates_total_scanned : {}",
+        entry
+            .get("candidates_total_scanned")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
+        "  candidates_processed     : {}",
+        entry
+            .get("candidates_processed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
+        "  records_written          : {}",
+        entry
+            .get("records_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
+        "  records_skipped          : {}",
+        entry
+            .get("records_skipped")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
+        "  estimated_input_tokens   : {}",
+        entry
+            .get("estimated_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    if let Some(errors) = entry.get("errors").and_then(|v| v.as_array()) {
+        if !errors.is_empty() {
+            println!("  errors ({}):", errors.len());
+            for e in errors {
+                println!("    ▸ {}", e.as_str().unwrap_or("?"));
+            }
+        }
+    }
+    if let Some(derived) = entry.get("derived_record_ids").and_then(|v| v.as_array()) {
+        println!("  derived record ids ({}):", derived.len());
+        for (i, d) in derived.iter().enumerate() {
+            if i >= 10 {
+                println!(
+                    "    … {} more (use --json for the full list)",
+                    derived.len() - 10
+                );
+                break;
+            }
+            println!("    ▸ {}", d.as_str().unwrap_or("?"));
+        }
+    }
+    if let Some(sources) = entry.get("source_record_ids").and_then(|v| v.as_array()) {
+        println!("  source record ids ({}):", sources.len());
+        for (i, s) in sources.iter().enumerate() {
+            if i >= 10 {
+                println!(
+                    "    … {} more (use --json for the full list)",
+                    sources.len() - 10
+                );
+                break;
+            }
+            println!("    ▸ {}", s.as_str().unwrap_or("?"));
+        }
+    }
+    Ok(())
+}
+
+fn truncate_for_column(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 fn append_stage2_audit(data_dir: &std::path::Path, entry: &serde_json::Value) -> Result<()> {
     let dir = data_dir.join("audit");
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create audit dir: {e}"))?;
