@@ -57,12 +57,9 @@ pub struct Stage2Report {
     pub estimated_input_tokens: usize,
 }
 
-/// Run Stage 2 over a slice of Stage 1 candidates.
-///
-/// The driver is async and intentionally **sequential**: even a small
-/// concurrency level here pushes you into rate-limit territory on
-/// hosted providers without giving the user a chance to inspect
-/// progress. Concurrency can come in a follow-up PR behind a flag.
+/// Run Stage 2 over a slice of Stage 1 candidates. Calls the provider
+/// sequentially (concurrency = 1) — see [`run_stage2_concurrent`] for
+/// the parallel variant.
 ///
 /// Takes `&dyn LlmProvider` (not a generic `&P`) so the CLI can pick
 /// `Box<dyn LlmProvider>` at runtime based on `--provider`.
@@ -72,30 +69,89 @@ pub async fn run_stage2(
     target_kind: ExtractKind,
     instance: Option<&str>,
 ) -> Result<Stage2Report> {
-    let mut report = Stage2Report::default();
-    for candidate in candidates {
-        let prompt = prompt::build_prompt(target_kind, &candidate.record.content);
-        report.estimated_input_tokens += provider.estimate_tokens(&prompt);
-        let raw = match provider.complete(&prompt).await {
-            Ok(s) => s,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("{}: {e}", candidate.record.id.0));
-                continue;
+    run_stage2_concurrent(provider, candidates, target_kind, instance, 1).await
+}
+
+/// Like [`run_stage2`] but runs up to `concurrency` provider calls in
+/// flight at once. `concurrency = 1` is equivalent to `run_stage2` and
+/// also the safe default — paid providers rate-limit aggressively, so
+/// callers should only crank this up when they've checked the
+/// provider's TPM/RPM budget.
+///
+/// Output ordering is non-deterministic when `concurrency > 1`, but
+/// the *set* of emitted records is identical to the sequential run
+/// (derived `RecordId`s are deterministic in `(source_id, kind, item_index)`,
+/// so a re-import via `Store::upsert_record` is idempotent regardless
+/// of order).
+pub async fn run_stage2_concurrent(
+    provider: &dyn LlmProvider,
+    candidates: &[Candidate],
+    target_kind: ExtractKind,
+    instance: Option<&str>,
+    concurrency: usize,
+) -> Result<Stage2Report> {
+    use futures::stream::{self, StreamExt};
+    let concurrency = concurrency.max(1);
+    if candidates.is_empty() {
+        return Ok(Stage2Report::default());
+    }
+
+    let outputs: Vec<TaskOutput> = stream::iter(candidates.iter().enumerate())
+        .map(|(idx, candidate)| async move {
+            let prompt = prompt::build_prompt(target_kind, &candidate.record.content);
+            let tokens = provider.estimate_tokens(&prompt);
+            match provider.complete(&prompt).await {
+                Ok(raw) => TaskOutput {
+                    idx,
+                    tokens,
+                    outcome: TaskOutcome::Ok(parse_extracted_items(&raw)),
+                },
+                Err(e) => TaskOutput {
+                    idx,
+                    tokens,
+                    outcome: TaskOutcome::Err(format!("{}: {e}", candidate.record.id.0)),
+                },
             }
-        };
-        let items = parse_extracted_items(&raw);
-        if items.is_empty() {
-            report.skipped += 1;
-            continue;
-        }
-        for (i, item) in items.iter().enumerate() {
-            let rec = build_derived_record(candidate, target_kind, item, i, instance);
-            report.records.push(rec);
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    // Re-sort by original candidate index so the `records` Vec is
+    // stable across concurrency settings. Tests rely on this.
+    let mut outputs = outputs;
+    outputs.sort_by_key(|o| o.idx);
+
+    let mut report = Stage2Report::default();
+    for output in outputs {
+        report.estimated_input_tokens += output.tokens;
+        let candidate = &candidates[output.idx];
+        match output.outcome {
+            TaskOutcome::Err(msg) => report.errors.push(msg),
+            TaskOutcome::Ok(items) => {
+                if items.is_empty() {
+                    report.skipped += 1;
+                    continue;
+                }
+                for (i, item) in items.iter().enumerate() {
+                    let rec = build_derived_record(candidate, target_kind, item, i, instance);
+                    report.records.push(rec);
+                }
+            }
         }
     }
     Ok(report)
+}
+
+struct TaskOutput {
+    idx: usize,
+    tokens: usize,
+    outcome: TaskOutcome,
+}
+
+enum TaskOutcome {
+    Ok(Vec<ExtractedItem>),
+    Err(String),
 }
 
 /// Parse the model's raw response into a list of [`ExtractedItem`]s.
@@ -394,5 +450,43 @@ mod tests {
         assert!(report.records.is_empty());
         assert_eq!(report.skipped, 0);
         assert_eq!(report.estimated_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn run_stage2_concurrent_matches_sequential_record_set() {
+        // Same candidates, same provider, concurrency=1 and concurrency=8
+        // must produce the same SET of derived `RecordId`s. The driver
+        // re-sorts task outputs by candidate index, so the `Vec<Record>`
+        // ordering should also match exactly.
+        let provider = MockProvider::default_instance();
+        let candidates: Vec<_> = (0..6)
+            .map(|i| fake_candidate(&format!("episode {i}: substantive enough content")))
+            .collect();
+        let seq = run_stage2_concurrent(&provider, &candidates, ExtractKind::Fact, None, 1)
+            .await
+            .unwrap();
+        let par = run_stage2_concurrent(&provider, &candidates, ExtractKind::Fact, None, 4)
+            .await
+            .unwrap();
+        let seq_ids: Vec<_> = seq.records.iter().map(|r| r.id.0.clone()).collect();
+        let par_ids: Vec<_> = par.records.iter().map(|r| r.id.0.clone()).collect();
+        assert_eq!(
+            seq_ids, par_ids,
+            "record order must be deterministic across concurrency"
+        );
+        assert_eq!(seq.skipped, par.skipped);
+        assert_eq!(seq.estimated_input_tokens, par.estimated_input_tokens);
+    }
+
+    #[tokio::test]
+    async fn run_stage2_concurrent_clamps_zero_to_one() {
+        // `concurrency = 0` would deadlock `buffer_unordered`. The driver
+        // must clamp to 1 before the stream is built.
+        let provider = MockProvider::default_instance();
+        let candidates = vec![fake_candidate("one")];
+        let report = run_stage2_concurrent(&provider, &candidates, ExtractKind::Fact, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(report.records.len(), 1);
     }
 }

@@ -224,6 +224,12 @@ enum Command {
         /// (CI / scripts). Has no effect with `--provider mock`.
         #[arg(long)]
         yes: bool,
+        /// Max concurrent provider calls in flight. Default 1
+        /// (sequential). Crank up only when you've checked the
+        /// provider's rate-limit budget — paid providers throttle
+        /// aggressively.
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
     },
 
     /// Show the `provenance.derived_from` lineage of a record. Walks
@@ -495,6 +501,7 @@ async fn main() -> Result<()> {
             api_base,
             max_llm_calls,
             yes,
+            concurrency,
         } => {
             cmd_extract(
                 &data_dir,
@@ -511,6 +518,7 @@ async fn main() -> Result<()> {
                 api_base.as_deref(),
                 max_llm_calls,
                 yes,
+                concurrency,
             )
             .await
         }
@@ -1940,6 +1948,7 @@ async fn cmd_extract(
     api_base: Option<&str>,
     max_llm_calls: usize,
     yes: bool,
+    concurrency: usize,
 ) -> Result<()> {
     let target_kind = anamnesis_extractor::ExtractKind::parse(kind_str).ok_or_else(|| {
         anyhow!("unknown extract kind {kind_str:?}; supported: fact, preference, feedback, skill")
@@ -1968,6 +1977,7 @@ async fn cmd_extract(
             api_base,
             max_llm_calls,
             yes,
+            concurrency,
         )
         .await;
     }
@@ -2095,6 +2105,7 @@ async fn run_stage2_path(
     api_base: Option<&str>,
     max_llm_calls: usize,
     yes: bool,
+    concurrency: usize,
 ) -> Result<()> {
     use anamnesis_extractor::cost_preview_line;
 
@@ -2149,9 +2160,14 @@ async fn run_stage2_path(
     }
 
     let run_started_at = chrono::Utc::now();
-    let report =
-        anamnesis_extractor::run_stage2(provider.as_ref(), candidates, target_kind, instance)
-            .await?;
+    let report = anamnesis_extractor::run_stage2_concurrent(
+        provider.as_ref(),
+        candidates,
+        target_kind,
+        instance,
+        concurrency,
+    )
+    .await?;
 
     // Persist every derived record. Chunker is needed because
     // upsert_record demands at least one chunk row for the FTS index.
@@ -2176,6 +2192,7 @@ async fn run_stage2_path(
         "provider_id": provider_id,
         "provider_model": provider.model_id(),
         "target_kind": target_kind.as_str(),
+        "concurrency": concurrency,
         "candidates_total_scanned": total_seen,
         "candidates_processed": candidates.len(),
         "records_written": written,
