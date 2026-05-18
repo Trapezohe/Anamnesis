@@ -1335,3 +1335,116 @@ fn extract_default_max_retries_is_three() {
     let entry: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
     assert_eq!(entry["max_retries"].as_u64(), Some(3));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §-2.5 — `anamnesis doctor` per-source health check (Round 49)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn doctor_no_sources_is_friendly() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(contains("No registered sources"));
+}
+
+#[test]
+fn doctor_reports_unhealthy_when_path_missing() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            "/tmp/anamnesis-doctor-nonexistent-path",
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(
+            contains("claude-code")
+                .and(contains("NOT HEALTHY"))
+                .and(contains("projects_root not found")),
+        );
+}
+
+#[test]
+fn doctor_json_shape_includes_adapter_and_ok() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "mem0",
+            "--path",
+            "/tmp/anamnesis-doctor-nope.sqlite",
+        ])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = payload.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["adapter"], "mem0");
+    assert_eq!(arr[0]["registered"], true);
+    assert!(arr[0]["detail"].is_string());
+}
+
+#[test]
+fn doctor_filter_source_narrows_output() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/a"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/b.sqlite"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--source", "mem0", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = payload.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "--source should filter to one row");
+    assert_eq!(arr[0]["adapter"], "mem0");
+}
