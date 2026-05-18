@@ -1,0 +1,293 @@
+name: publish-crates
+
+# Manual-only crates.io publish in topological order. Defaults to
+# dry-run; flip the input to `false` for the real upload.
+#
+# Prereqs (one-time):
+#   1. Create a crates.io account, log in
+#      https://crates.io/settings/tokens, create a token with the
+#      `publish-new` + `publish-update` scopes.
+#   2. In the repo: Settings → Secrets and variables → Actions →
+#      `CARGO_REGISTRY_TOKEN` with the token value.
+#
+# Order matters: cargo refuses to publish a crate when any internal
+# dep it pulls from the same workspace isn't yet on crates.io. Each
+# real publish sleeps 30 s to let the registry index propagate before
+# the next dependent crate is uploaded.
+#
+# A failed step does NOT roll back earlier uploads. Re-running a
+# specific step is safe (cargo publish refuses to overwrite an
+# existing version), so you can rerun the workflow from where it
+# failed without bumping the version.
+#
+# Dry-run note: `cargo publish --dry-run` for tier-2+ crates also
+# fails until tier-1 is *really* on crates.io, because dry-run goes
+# through the same index lookup. So:
+#   - tier-1 (anamnesis-core) can be dry-run safely now
+#   - tier-2+ dry-runs only become meaningful after the first real
+#     publish has happened
+# The workflow runs all tiers regardless; non-tier-1 dry-runs will
+# show the "no matching package" error until the real publish ladder
+# has been climbed once.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = cargo publish --dry-run, false = real upload"
+        required: true
+        default: "true"
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish (topological order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # ───────────────────────────────────────────────────────────────
+      # Tier 1 — no internal deps.
+      # ───────────────────────────────────────────────────────────────
+      - name: anamnesis-core
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-core
+          else
+            cargo publish -p anamnesis-core
+            sleep 30
+          fi
+
+      # ───────────────────────────────────────────────────────────────
+      # Tier 2 — depends on core.
+      # ───────────────────────────────────────────────────────────────
+      - name: anamnesis-store
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-store || true
+          else
+            cargo publish -p anamnesis-store
+            sleep 30
+          fi
+
+      - name: anamnesis-embedder
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-embedder || true
+          else
+            cargo publish -p anamnesis-embedder
+            sleep 30
+          fi
+
+      # ───────────────────────────────────────────────────────────────
+      # Tier 3 — depend on store and/or embedder and/or core.
+      # ───────────────────────────────────────────────────────────────
+      - name: anamnesis-search
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-search || true
+          else
+            cargo publish -p anamnesis-search
+            sleep 30
+          fi
+
+      - name: anamnesis-extractor
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-extractor || true
+          else
+            cargo publish -p anamnesis-extractor
+            sleep 30
+          fi
+
+      - name: anamnesis-importer
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-importer || true
+          else
+            cargo publish -p anamnesis-importer
+            sleep 30
+          fi
+
+      # ───────────────────────────────────────────────────────────────
+      # Tier 4 — 14 adapters. Each depends only on `anamnesis-core`,
+      # so any order works once Tier 1 is published.
+      # ───────────────────────────────────────────────────────────────
+      - name: anamnesis-adapter-claude-code
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-claude-code || true
+          else
+            cargo publish -p anamnesis-adapter-claude-code
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-codex
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-codex || true
+          else
+            cargo publish -p anamnesis-adapter-codex
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-mem0
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-mem0 || true
+          else
+            cargo publish -p anamnesis-adapter-mem0
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-letta
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-letta || true
+          else
+            cargo publish -p anamnesis-adapter-letta
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-hermes
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-hermes || true
+          else
+            cargo publish -p anamnesis-adapter-hermes
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-openclaw
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-openclaw || true
+          else
+            cargo publish -p anamnesis-adapter-openclaw
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-ghast
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-ghast || true
+          else
+            cargo publish -p anamnesis-adapter-ghast
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-tdai
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-tdai || true
+          else
+            cargo publish -p anamnesis-adapter-tdai
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-openviking
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-openviking || true
+          else
+            cargo publish -p anamnesis-adapter-openviking
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-mempalace
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-mempalace || true
+          else
+            cargo publish -p anamnesis-adapter-mempalace
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-memori
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-memori || true
+          else
+            cargo publish -p anamnesis-adapter-memori
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-memos
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-memos || true
+          else
+            cargo publish -p anamnesis-adapter-memos
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-memary
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-memary || true
+          else
+            cargo publish -p anamnesis-adapter-memary
+            sleep 30
+          fi
+
+      - name: anamnesis-adapter-generic-mcp
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-adapter-generic-mcp || true
+          else
+            cargo publish -p anamnesis-adapter-generic-mcp
+            sleep 30
+          fi
+
+      # ───────────────────────────────────────────────────────────────
+      # Tier 5 — depend on every adapter.
+      # ───────────────────────────────────────────────────────────────
+      - name: anamnesis-mcp-server
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-mcp-server || true
+          else
+            cargo publish -p anamnesis-mcp-server
+            sleep 30
+          fi
+
+      # ───────────────────────────────────────────────────────────────
+      # Tier 6 — depends on everything.
+      # ───────────────────────────────────────────────────────────────
+      - name: anamnesis-cli
+        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p anamnesis-cli || true
+          else
+            cargo publish -p anamnesis-cli
+            sleep 30
+          fi

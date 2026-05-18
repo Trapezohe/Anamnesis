@@ -4,7 +4,17 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
-_Nothing yet — open the next iteration here._
+### Infrastructure
+- **Crates.io publish prep**: workspace `categories` (`command-line-utilities`,
+  `database`, `development-tools`) + `keywords` (`memory`, `agent`, `mcp`,
+  `rag`) added at `[workspace.package]`; every crate now inherits
+  `readme.workspace`, `categories.workspace`, `keywords.workspace` so the
+  full 22-crate workspace is publish-ready.
+- **`.github/workflows/publish-crates.yml`**: manual `workflow_dispatch`
+  publish ladder in topological order (core → store/embedder →
+  search/extractor/importer → 14 adapters → mcp-server → cli), with a
+  `dry_run` toggle and 30 s sleep between real uploads. Requires a
+  `CARGO_REGISTRY_TOKEN` repo secret before the first real run.
 
 ## [0.1.0] — 2026-05-18 — First stable adapter-contract release
 
