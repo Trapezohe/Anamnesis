@@ -1,0 +1,24 @@
+[package]
+name = "anamnesis-adapter-memos"
+description = "Anamnesis adapter for MemOS (MemTensor/MemOS) — reads dumped MemCube directories (textual_memory.json) under ~/.memos/ or a user-supplied root"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anamnesis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+walkdir = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }
