@@ -312,20 +312,61 @@ Current MCP surface:
 
 ## Quick Start
 
-### Install pre-built binary (recommended)
+### Install (one-liner)
 
-Each tagged release ships pre-built binaries for **macOS** (aarch64 +
-x86_64), **Linux** (x86_64), and **Windows** (x86_64) on the
-[Releases page](https://github.com/Trapezohe/Anamnesis/releases).
-Linux aarch64 currently installs from source (cross-compile is parked
-on `fastembed-rs` C-deps; tracked in the release workflow comments).
-The release artefact is a tarball / zip containing two binaries:
-
-- `anamnesis` — the CLI (`init`, `import`, `search`, `serve`, …).
-- `anamnesis-mcp` — the standalone MCP server (stdio + loopback HTTP).
+POSIX one-liner — detects your platform, downloads the matching
+release tarball from GitHub, verifies its SHA-256, and drops the two
+binaries (`anamnesis` + `anamnesis-mcp`) into `~/.local/bin`:
 
 ```bash
-# Linux x86_64 example — substitute the artefact for your platform.
+curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh | sh
+```
+
+Pin a version or change the install prefix:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh \
+  | ANAMNESIS_VERSION=v0.0.2 ANAMNESIS_PREFIX=/usr/local/bin sh
+```
+
+Supported platforms: **Linux x86_64**, **macOS x86_64**, **macOS
+aarch64**. Linux aarch64 is parked (fastembed C-deps); Windows users
+should grab the `.zip` from the [Releases page](https://github.com/Trapezohe/Anamnesis/releases) directly.
+
+### Install via Homebrew (once the tap is published)
+
+```bash
+brew tap Trapezohe/anamnesis
+brew install anamnesis
+```
+
+The formula template lives at [`packaging/homebrew/anamnesis.rb`](./packaging/homebrew/anamnesis.rb) — operators who maintain the tap refresh the four `sha256` lines after every release.
+
+### Install from source
+
+```bash
+git clone https://github.com/Trapezohe/Anamnesis
+cd Anamnesis
+
+# CLI binary
+cargo install --path crates/cli
+
+# MCP server binary
+cargo install --path crates/mcp-server
+```
+
+Or, when the crates are published to crates.io:
+
+```bash
+cargo install --locked anamnesis-cli anamnesis-mcp-server
+```
+
+### Manual binary install
+
+The GitHub release pages also host the raw tarball + `.sha256`
+sidecar for every platform if you'd rather not pipe `install.sh`:
+
+```bash
 VERSION=0.0.2
 TARGET=x86_64-unknown-linux-gnu
 curl -L "https://github.com/Trapezohe/Anamnesis/releases/download/v${VERSION}/anamnesis-${VERSION}-${TARGET}.tar.gz" \
