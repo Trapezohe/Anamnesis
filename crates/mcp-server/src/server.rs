@@ -23,6 +23,7 @@ use anamnesis_adapter_ghast::ghast_adapter;
 use anamnesis_adapter_hermes::hermes_adapter;
 use anamnesis_adapter_letta::letta_adapter;
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
+use anamnesis_adapter_memori::memori_adapter;
 use anamnesis_adapter_mempalace::mempalace_adapter;
 use anamnesis_adapter_openclaw::openclaw_adapter;
 use anamnesis_adapter_openviking::openviking_adapter;
@@ -706,6 +707,18 @@ impl AnamnesisServer {
                     .await
                     .map_err(|e| format!("import: {e}"))?
             }
+            anamnesis_adapter_memori::ADAPTER_ID => {
+                let db_path = registered
+                    .location
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.home().join(".memori").join("memori.db"));
+                let adapter = memori_adapter(db_path, instance);
+                service
+                    .import(&adapter, opts)
+                    .await
+                    .map_err(|e| format!("import: {e}"))?
+            }
             anamnesis_adapter_generic_mcp::ADAPTER_ID => {
                 let url = registered.location.as_deref().ok_or_else(|| {
                     "generic-mcp source has no URL in the registry; \
@@ -1176,7 +1189,7 @@ fn tools_list_payload_all() -> Value {
                                 The source's location (path or URL) and credentials (env-var name only — value \
                                 never leaves the operator's shell) are taken from the registry; MCP clients \
                                 cannot pass `path` or `url` directly. Adapter ids: claude-code, codex, mem0, \
-                                letta, hermes, openclaw, ghast, tdai, openviking, mempalace, generic-mcp. \
+                                letta, hermes, openclaw, ghast, tdai, openviking, mempalace, memori, generic-mcp. \
                                 Admin-gated — server must be started with --allow-admin-tools \
                                 or have it enabled in config.",
                 "inputSchema": {
@@ -1184,8 +1197,8 @@ fn tools_list_payload_all() -> Value {
                     "properties": {
                         "adapter": {
                             "type": "string",
-                            "description": "claude-code | codex | mem0 | letta | hermes | openclaw | ghast | tdai | openviking | mempalace | generic-mcp",
-                            "enum": ["claude-code", "codex", "mem0", "letta", "hermes", "openclaw", "ghast", "tdai", "openviking", "mempalace", "generic-mcp"]
+                            "description": "claude-code | codex | mem0 | letta | hermes | openclaw | ghast | tdai | openviking | mempalace | memori | generic-mcp",
+                            "enum": ["claude-code", "codex", "mem0", "letta", "hermes", "openclaw", "ghast", "tdai", "openviking", "mempalace", "memori", "generic-mcp"]
                         },
                         "instance": {
                             "type": "string",

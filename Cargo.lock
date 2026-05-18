@@ -181,6 +181,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-adapter-memori"
+version = "0.0.2"
+dependencies = [
+ "anamnesis-core",
+ "async-trait",
+ "blake3",
+ "chrono",
+ "futures",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-adapter-mempalace"
 version = "0.0.2"
 dependencies = [
@@ -258,6 +275,7 @@ dependencies = [
  "anamnesis-adapter-hermes",
  "anamnesis-adapter-letta",
  "anamnesis-adapter-mem0",
+ "anamnesis-adapter-memori",
  "anamnesis-adapter-mempalace",
  "anamnesis-adapter-openclaw",
  "anamnesis-adapter-openviking",
@@ -346,6 +364,7 @@ dependencies = [
  "anamnesis-adapter-hermes",
  "anamnesis-adapter-letta",
  "anamnesis-adapter-mem0",
+ "anamnesis-adapter-memori",
  "anamnesis-adapter-mempalace",
  "anamnesis-adapter-openclaw",
  "anamnesis-adapter-openviking",
