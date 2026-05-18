@@ -24,6 +24,7 @@ use anamnesis_adapter_hermes::hermes_adapter;
 use anamnesis_adapter_letta::letta_adapter;
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
 use anamnesis_adapter_openclaw::openclaw_adapter;
+use anamnesis_adapter_tdai::tdai_adapter;
 use anamnesis_core::embedding::EmbeddingProvider;
 use anamnesis_core::model::RecordId;
 use anamnesis_importer::{ImportOptions, ImportService};
@@ -667,6 +668,18 @@ impl AnamnesisServer {
                     .await
                     .map_err(|e| format!("import: {e}"))?
             }
+            anamnesis_adapter_tdai::ADAPTER_ID => {
+                let data_dir = registered
+                    .location
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.home().join(".openclaw").join("memory-tdai"));
+                let adapter = tdai_adapter(data_dir, instance);
+                service
+                    .import(&adapter, opts)
+                    .await
+                    .map_err(|e| format!("import: {e}"))?
+            }
             anamnesis_adapter_generic_mcp::ADAPTER_ID => {
                 let url = registered.location.as_deref().ok_or_else(|| {
                     "generic-mcp source has no URL in the registry; \
@@ -1137,16 +1150,16 @@ fn tools_list_payload_all() -> Value {
                                 The source's location (path or URL) and credentials (env-var name only — value \
                                 never leaves the operator's shell) are taken from the registry; MCP clients \
                                 cannot pass `path` or `url` directly. Adapter ids: claude-code, codex, mem0, \
-                                letta, hermes, openclaw, ghast, generic-mcp. Admin-gated — \
-                                server must be started with --allow-admin-tools or have it \
-                                enabled in config.",
+                                letta, hermes, openclaw, ghast, tdai, generic-mcp. \
+                                Admin-gated — server must be started with --allow-admin-tools \
+                                or have it enabled in config.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "adapter": {
                             "type": "string",
-                            "description": "claude-code | codex | mem0 | letta | hermes | openclaw | ghast | generic-mcp",
-                            "enum": ["claude-code", "codex", "mem0", "letta", "hermes", "openclaw", "ghast", "generic-mcp"]
+                            "description": "claude-code | codex | mem0 | letta | hermes | openclaw | ghast | tdai | generic-mcp",
+                            "enum": ["claude-code", "codex", "mem0", "letta", "hermes", "openclaw", "ghast", "tdai", "generic-mcp"]
                         },
                         "instance": {
                             "type": "string",
