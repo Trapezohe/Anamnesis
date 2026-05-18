@@ -1118,3 +1118,131 @@ fn extract_dry_run_default_still_inspection_only() {
         audit_path.display()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §-1.5 PR-6 — `anamnesis audit list / show` (Round 43)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn audit_list_on_empty_data_dir_is_friendly() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "list"])
+        .assert()
+        .success()
+        .stdout(contains("No Stage 2 audit entries yet"));
+}
+
+#[test]
+fn audit_list_after_extract_run_shows_one_entry() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    // Populate by running mock extract (offline, deterministic).
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "list"])
+        .assert()
+        .success()
+        .stdout(
+            contains("mock")
+                .and(contains("fact"))
+                .and(contains("1 entries shown")),
+        );
+}
+
+#[test]
+fn audit_show_last_pretty_prints_a_run() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "show", "last"])
+        .assert()
+        .success()
+        .stdout(
+            contains("Stage 2 audit entry #1")
+                .and(contains("provider_id    : mock"))
+                .and(contains("target_kind    : fact")),
+        );
+}
+
+#[test]
+fn audit_show_out_of_range_index_errors_cleanly() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "show", "999"])
+        .assert()
+        .failure()
+        .stderr(contains("out of range").or(contains("audit log has 0 entries")));
+}
+
+#[test]
+fn audit_show_unparseable_target_errors_with_hint() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "show", "garbage"])
+        .assert()
+        .failure()
+        .stderr(contains("1-based line number").and(contains("`last`")));
+}
+
+#[test]
+fn audit_list_json_is_array_of_summaries() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "list", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = payload.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["line_no"], 1);
+    assert_eq!(arr[0]["provider_id"], "mock");
+}
