@@ -59,11 +59,36 @@ jobs:
       - name: anamnesis-core
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-core
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-core
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-core
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       # ───────────────────────────────────────────────────────────────
@@ -72,21 +97,71 @@ jobs:
       - name: anamnesis-store
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-store
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-store || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-store
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-embedder
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-embedder
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-embedder || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-embedder
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       # ───────────────────────────────────────────────────────────────
@@ -95,31 +170,106 @@ jobs:
       - name: anamnesis-search
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-search
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-search || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-search
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-extractor
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-extractor
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-extractor || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-extractor
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-importer
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-importer
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-importer || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-importer
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       # ───────────────────────────────────────────────────────────────
@@ -129,141 +279,491 @@ jobs:
       - name: anamnesis-adapter-claude-code
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-claude-code
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-claude-code || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-claude-code
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-codex
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-codex
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-codex || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-codex
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-mem0
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-mem0
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-mem0 || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-mem0
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-letta
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-letta
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-letta || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-letta
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-hermes
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-hermes
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-hermes || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-hermes
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-openclaw
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-openclaw
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-openclaw || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-openclaw
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-ghast
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-ghast
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-ghast || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-ghast
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-tdai
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-tdai
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-tdai || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-tdai
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-openviking
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-openviking
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-openviking || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-openviking
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-mempalace
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-mempalace
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-mempalace || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-mempalace
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-memori
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-memori
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-memori || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-memori
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-memos
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-memos
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-memos || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-memos
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-memary
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-memary
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-memary || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-memary
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       - name: anamnesis-adapter-generic-mcp
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-adapter-generic-mcp
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-adapter-generic-mcp || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-adapter-generic-mcp
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       # ───────────────────────────────────────────────────────────────
@@ -272,11 +772,36 @@ jobs:
       - name: anamnesis-mcp-server
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-mcp-server
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-mcp-server || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-mcp-server
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
 
       # ───────────────────────────────────────────────────────────────
@@ -285,9 +810,34 @@ jobs:
       - name: anamnesis-cli
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
+          crate=anamnesis-cli
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p anamnesis-cli || true
+            cargo publish --dry-run -p $crate || true
           else
-            cargo publish -p anamnesis-cli
-            sleep 30
+            out=$(cargo publish -p $crate 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+              echo "✓ $crate is already on crates.io — skipping (idempotent)"
+            elif echo "$out" | grep -q 'Uploading'; then
+              echo "✓ $crate uploaded"
+              sleep 60
+            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
+              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+              sleep 660
+              out2=$(cargo publish -p $crate 2>&1) || true
+              echo "$out2"
+              if echo "$out2" | grep -qE 'crate version .* is already uploaded|already uploaded'; then
+                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+              elif echo "$out2" | grep -q 'Uploading'; then
+                echo "✓ $crate uploaded after rate-limit wait"
+                sleep 60
+              else
+                echo "✗ $crate still failing after rate-limit wait" >&2
+                exit 1
+              fi
+            else
+              echo "✗ $crate publish failed (see output above)" >&2
+              exit 1
+            fi
           fi
