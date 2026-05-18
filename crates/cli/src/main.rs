@@ -12,6 +12,7 @@ use anamnesis_adapter_codex::{codex_adapter, CodexDetector};
 use anamnesis_adapter_hermes::{hermes_adapter, HermesDetector};
 use anamnesis_adapter_letta::{letta_adapter, LettaSqliteDetector};
 use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
+use anamnesis_adapter_openclaw::{openclaw_adapter, OpenClawDetector};
 use anamnesis_core::discovery::{DetectOpts, Discovery};
 use anamnesis_embedder::registry;
 use anamnesis_importer::{ImportOptions, ImportService};
@@ -694,7 +695,8 @@ async fn cmd_discover() -> Result<()> {
         .register(Box::new(Mem0SqliteDetector::new()))
         .register(Box::new(CodexDetector::new()))
         .register(Box::new(LettaSqliteDetector::new()))
-        .register(Box::new(HermesDetector::new()));
+        .register(Box::new(HermesDetector::new()))
+        .register(Box::new(OpenClawDetector::new()));
     let found = discovery.detect_all(&DetectOpts::default()).await;
     if found.is_empty() {
         println!("no known memory sources found at default locations");
@@ -850,7 +852,7 @@ async fn cmd_import(
     // "no default path".
     if !is_known_adapter(adapter_id) {
         return Err(anyhow!(
-            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, letta, hermes, generic-mcp"
+            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, generic-mcp"
         ));
     }
 
@@ -1002,8 +1004,21 @@ async fn cmd_import(
             )
             .await
         }
+        anamnesis_adapter_openclaw::ADAPTER_ID => {
+            let adapter = openclaw_adapter(location.clone(), instance);
+            run_import(
+                data_dir,
+                &adapter,
+                dry_run,
+                no_embed,
+                Some(&location),
+                source_was_explicit,
+                scan_opts,
+            )
+            .await
+        }
         other => Err(anyhow!(
-            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, generic-mcp"
+            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, generic-mcp"
         )),
     }
 }
@@ -1093,6 +1108,7 @@ fn is_known_adapter(adapter_id: &str) -> bool {
             | anamnesis_adapter_codex::ADAPTER_ID
             | anamnesis_adapter_letta::ADAPTER_ID
             | anamnesis_adapter_hermes::ADAPTER_ID
+            | anamnesis_adapter_openclaw::ADAPTER_ID
             | anamnesis_adapter_generic_mcp::ADAPTER_ID
     )
 }
@@ -1107,6 +1123,7 @@ fn default_path_for(adapter_id: &str) -> Result<PathBuf> {
         anamnesis_adapter_codex::ADAPTER_ID => home_join(&[".codex"]),
         anamnesis_adapter_letta::ADAPTER_ID => home_join(&[".letta", "letta.db"]),
         anamnesis_adapter_hermes::ADAPTER_ID => home_join(&[".hermes"]),
+        anamnesis_adapter_openclaw::ADAPTER_ID => home_join(&[".openclaw"]),
         other => Err(anyhow!("no default path for adapter {other:?}")),
     }
 }

@@ -30,6 +30,7 @@ anamnesis-adapter-codex = { workspace = true }
 anamnesis-adapter-mem0 = { workspace = true }
 anamnesis-adapter-letta = { workspace = true }
 anamnesis-adapter-hermes = { workspace = true }
+anamnesis-adapter-openclaw = { workspace = true }
 anamnesis-adapter-generic-mcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

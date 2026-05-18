@@ -165,6 +165,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-adapter-openclaw"
+version = "0.0.2"
+dependencies = [
+ "anamnesis-core",
+ "async-trait",
+ "blake3",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-cli"
 version = "0.0.2"
 dependencies = [
@@ -174,6 +190,7 @@ dependencies = [
  "anamnesis-adapter-hermes",
  "anamnesis-adapter-letta",
  "anamnesis-adapter-mem0",
+ "anamnesis-adapter-openclaw",
  "anamnesis-core",
  "anamnesis-embedder",
  "anamnesis-importer",
@@ -257,6 +274,7 @@ dependencies = [
  "anamnesis-adapter-hermes",
  "anamnesis-adapter-letta",
  "anamnesis-adapter-mem0",
+ "anamnesis-adapter-openclaw",
  "anamnesis-core",
  "anamnesis-embedder",
  "anamnesis-importer",
