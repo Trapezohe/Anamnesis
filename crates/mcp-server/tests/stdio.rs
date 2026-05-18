@@ -92,12 +92,13 @@ fn binary_responds_to_initialize_and_tools_list() {
         .collect();
     assert_eq!(
         names.len(),
-        4,
+        5,
         "import_source should be hidden by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source".to_string()));
     assert!(names.contains(&"search_memories".to_string()));
     assert!(names.contains(&"list_sources".to_string()));
+    assert!(names.contains(&"doctor".to_string()));
 
     // 3. tools/call list_sources — should report the source we seeded.
     send(

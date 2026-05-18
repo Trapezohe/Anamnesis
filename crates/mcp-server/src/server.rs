@@ -8,6 +8,7 @@
 //!   list_sources()
 //!   import_source(adapter, instance?, path?, dry_run?)
 //!   trace_provenance(id)
+//!   doctor(source?, instance?, since?)
 //!
 //! Resources:
 //!   anamnesis://record/{id}
@@ -215,6 +216,7 @@ impl AnamnesisServer {
             "list_sources" => self.tool_list_sources().await,
             "import_source" => self.tool_import_source(args).await,
             "trace_provenance" => self.tool_trace_provenance(args).await,
+            "doctor" => self.tool_doctor(args).await,
             other => return JsonRpcResponse::err(id, -32602, format!("unknown tool: {other}")),
         };
         match result {
@@ -836,6 +838,238 @@ impl AnamnesisServer {
         }
         Ok(out)
     }
+
+    /// Round-54: expose `anamnesis doctor` over MCP.
+    ///
+    /// Per-source health check — for each registered source, runs the
+    /// adapter's `health()` probe (cheap: e.g. directory exists for
+    /// file-backed adapters, GET `/healthz` for generic-mcp) and joins
+    /// against the store's per-source counts. Agents call this when
+    /// "search_memories returned nothing relevant" so they can tell the
+    /// user "your mem0 source is unreachable" instead of silently
+    /// continuing with stale assumptions.
+    ///
+    /// Wire shape:
+    ///   request:  `{ source?: string, instance?: string, since?: "Nd"|"Nh"|"Nm"|"<int seconds>" }`
+    ///   response: `{ summary: { total, ok, unhealthy, stale }, sources: [...] }`
+    ///
+    /// Not admin-gated — `list_sources` already exposes locations; this
+    /// tool just adds liveness + staleness signal. The CLI's
+    /// `--include-unregistered` mode (which runs filesystem detectors
+    /// for every adapter) is intentionally NOT exposed here: detectors
+    /// walk the user's home dir, and the MCP boundary should not be a
+    /// path-arbitrary probe surface (see `import_source` rationale).
+    async fn tool_doctor(&self, args: Value) -> Result<Value, String> {
+        let filter_source = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let filter_instance = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let stale_threshold = match args.get("since").and_then(|v| v.as_str()) {
+            Some(spec) => Some(parse_doctor_since(spec)?),
+            None => None,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        let store = &self.store;
+        let registered = store
+            .list_sources_with_counts()
+            .map_err(|e| format!("list: {e}"))?;
+
+        let mut rows = Vec::new();
+        for swc in &registered {
+            let src = &swc.source;
+            if let Some(name) = filter_source.as_deref() {
+                if src.adapter != name {
+                    continue;
+                }
+            }
+            if let Some(inst) = filter_instance.as_deref() {
+                if src.instance != inst {
+                    continue;
+                }
+            }
+            let health = self.run_adapter_health_for_source(src).await;
+            let stale = stale_threshold.map(|t| match src.last_import_at {
+                Some(ts) => (now - ts) > t,
+                // Never-imported counts as stale once a threshold is set.
+                None => true,
+            });
+            let ok = health.as_ref().map(|h| h.ok).unwrap_or(false);
+            let detail = match &health {
+                Some(h) => h.detail.clone(),
+                None => "adapter not wired into doctor; see `import` dispatch".to_string(),
+            };
+            rows.push(json!({
+                "adapter": src.adapter,
+                "instance": if src.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(src.instance.clone())
+                },
+                "location": src.location,
+                "ok": ok,
+                "detail": detail,
+                "record_count": swc.record_count,
+                "chunk_count": swc.chunk_count,
+                "last_import_at": src.last_import_at,
+                "stale": stale,
+            }));
+        }
+
+        let ok_count = rows
+            .iter()
+            .filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+            .count();
+        let bad_count = rows.len() - ok_count;
+        let stale_count = rows
+            .iter()
+            .filter(|r| r.get("stale").and_then(|v| v.as_bool()).unwrap_or(false))
+            .count();
+
+        Ok(json!({
+            "summary": {
+                "total": rows.len(),
+                "ok": ok_count,
+                "unhealthy": bad_count,
+                "stale": stale_count,
+            },
+            "sources": rows,
+        }))
+    }
+
+    /// Build the right adapter for a registered source and call
+    /// `MemoryAdapter::health().await`. Mirrors the CLI's
+    /// `run_adapter_health` — the dispatch table stays in lockstep with
+    /// `tool_import_source` so a source that can be imported can also
+    /// be doctored. Returns `None` if the adapter id is unknown.
+    async fn run_adapter_health_for_source(
+        &self,
+        src: &anamnesis_store::SourceRow,
+    ) -> Option<anamnesis_core::adapter::HealthStatus> {
+        use anamnesis_core::adapter::MemoryAdapter;
+        let location_path = src.location.as_deref().map(PathBuf::from);
+        let instance = if src.instance.is_empty() {
+            None
+        } else {
+            Some(src.instance.as_str())
+        };
+
+        match src.adapter.as_str() {
+            anamnesis_adapter_claude_code::ADAPTER_ID => {
+                let path =
+                    location_path.unwrap_or_else(|| self.home().join(".claude").join("projects"));
+                let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
+                    projects_root: path,
+                    instance: instance.map(str::to_owned),
+                });
+                Some(adapter.health().await)
+            }
+            anamnesis_adapter_codex::ADAPTER_ID => {
+                let path = location_path.unwrap_or_else(|| self.home().join(".codex"));
+                Some(codex_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_mem0::ADAPTER_ID => {
+                let path =
+                    location_path.unwrap_or_else(|| self.home().join(".mem0").join("db.sqlite"));
+                Some(mem0_sqlite_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_letta::ADAPTER_ID => {
+                let path =
+                    location_path.unwrap_or_else(|| self.home().join(".letta").join("letta.db"));
+                Some(letta_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_hermes::ADAPTER_ID => {
+                let path = location_path.unwrap_or_else(|| self.home().join(".hermes"));
+                Some(hermes_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_openclaw::ADAPTER_ID => {
+                let path = location_path.unwrap_or_else(|| self.home().join(".openclaw"));
+                Some(openclaw_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_ghast::ADAPTER_ID => {
+                let path = location_path
+                    .unwrap_or_else(|| self.home().join("Documents").join("ghast_desktop"));
+                Some(ghast_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_tdai::ADAPTER_ID => {
+                let path = location_path
+                    .unwrap_or_else(|| self.home().join(".openclaw").join("memory-tdai"));
+                Some(tdai_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_openviking::ADAPTER_ID => {
+                let path =
+                    location_path.unwrap_or_else(|| self.home().join(".openviking").join("data"));
+                Some(openviking_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_mempalace::ADAPTER_ID => {
+                let path = location_path.unwrap_or_else(|| self.home().join(".mempalace"));
+                Some(mempalace_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_memori::ADAPTER_ID => {
+                let path =
+                    location_path.unwrap_or_else(|| self.home().join(".memori").join("memori.db"));
+                Some(memori_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_memos::ADAPTER_ID => {
+                let path = location_path.unwrap_or_else(|| self.home().join(".memos"));
+                Some(memos_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_memary::ADAPTER_ID => {
+                let path =
+                    location_path.unwrap_or_else(|| self.home().join(".memary").join("data"));
+                Some(memary_adapter(path, instance).health().await)
+            }
+            anamnesis_adapter_generic_mcp::ADAPTER_ID => {
+                // Same logic the CLI uses — read URL from the registry,
+                // resolve token env-var, then fire a single `/healthz` GET.
+                let Some(url) = src.location.clone() else {
+                    return Some(anamnesis_core::adapter::HealthStatus {
+                        ok: false,
+                        detail: "generic-mcp registered without --url".to_string(),
+                    });
+                };
+                let token = match resolve_generic_mcp_token(src.config_json.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Some(anamnesis_core::adapter::HealthStatus {
+                            ok: false,
+                            detail: format!("generic-mcp token resolution failed: {e}"),
+                        });
+                    }
+                };
+                let adapter = generic_mcp_adapter(url, token.as_deref(), instance);
+                Some(adapter.health().await)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parse the MCP `doctor.since` argument into seconds. Same shapes the
+/// CLI's `--since` accepts (`Nd`, `Nh`, `Nm`, bare integer). Returns a
+/// string error so the JSON-RPC layer can wrap it as `-32602`.
+fn parse_doctor_since(spec: &str) -> Result<i64, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("since cannot be empty".to_string());
+    }
+    let (num_str, mult) = match spec.chars().last() {
+        Some('d') | Some('D') => (&spec[..spec.len() - 1], 86_400_i64),
+        Some('h') | Some('H') => (&spec[..spec.len() - 1], 3_600_i64),
+        Some('m') | Some('M') => (&spec[..spec.len() - 1], 60_i64),
+        _ => (spec, 1_i64),
+    };
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| format!("since must be `Nd`/`Nh`/`Nm`/bare seconds; got {spec:?}"))?;
+    if n < 0 {
+        return Err(format!("since must be non-negative; got {spec:?}"));
+    }
+    Ok(n.saturating_mul(mult))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1263,6 +1497,35 @@ fn tools_list_payload_all() -> Value {
                         {"required": ["chunk_id"]}
                     ]
                 }
+            },
+            {
+                "name": "doctor",
+                "description": "Per-source health check. For each registered source, runs the adapter's \
+                                `health()` probe (cheap — directory existence, single-row SELECT, or \
+                                `/healthz` GET) and joins against per-source record counts. Use this when \
+                                `search_memories` returns nothing relevant to distinguish \"no memories \
+                                yet\" from \"the source is unreachable\". Read-only; never mutates state.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Restrict to one adapter id (claude-code, codex, mem0, ...). \
+                                            Omit to check every registered source."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Instance discriminator. Meaningful only when `source` is also set."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Mark a source as stale if its last_import_at is older than this \
+                                            relative window. Shapes: `Nd` (days), `Nh` (hours), `Nm` (minutes), \
+                                            or a bare integer (seconds). Never-imported sources always count \
+                                            as stale once `since` is set."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -1518,6 +1781,7 @@ mod tests {
             "get_record",
             "list_sources",
             "trace_provenance",
+            "doctor",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -1528,23 +1792,24 @@ mod tests {
             !names.contains(&"import_source".to_string()),
             "import_source MUST be hidden by default — found in tools/list",
         );
-        assert_eq!(names.len(), 4, "expect exactly 4 non-admin tools");
+        assert_eq!(names.len(), 5, "expect exactly 5 non-admin tools");
     }
 
     #[tokio::test]
-    async fn tools_list_includes_all_five_when_admin_enabled() {
+    async fn tools_list_includes_all_when_admin_enabled() {
         // PR-A: with admin enabled, the full catalogue is back.
         let store = Store::open_in_memory().unwrap();
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
         for expected in [
             "search_memories",
             "get_record",
             "list_sources",
             "import_source",
             "trace_provenance",
+            "doctor",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -2381,5 +2646,182 @@ mod tests {
             ))
             .await;
         assert!(resp.error.is_some());
+    }
+
+    // ─── Round-54: `doctor` tool ──────────────────────────────────────
+
+    /// Smoke: doctor returns one row per registered source, with the
+    /// summary fields and per-source health detail.
+    #[tokio::test]
+    async fn doctor_returns_per_source_health_for_registered_sources() {
+        let store = Store::open_in_memory().unwrap();
+        // Two registered sources — one with a deliberately bogus location
+        // so its `health()` flips `ok=false`, plus another with a path
+        // that doesn't exist either (claude-code's health checks for
+        // projects_root existence).
+        store
+            .register_source("mem0", None, Some("/nonexistent/mem0.sqlite"), None)
+            .unwrap();
+        store
+            .register_source(
+                "claude-code",
+                None,
+                Some("/nonexistent/claude/projects"),
+                None,
+            )
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s.handle(req("tools/call", json!({"name": "doctor"}))).await;
+        let result = resp.result.expect("doctor must succeed");
+        let body = &result["structuredContent"];
+        let sources = body["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2, "expected one row per registered source");
+        // Both sources point at nonexistent paths → both unhealthy.
+        assert_eq!(body["summary"]["total"], 2);
+        assert_eq!(body["summary"]["ok"], 0);
+        assert_eq!(body["summary"]["unhealthy"], 2);
+        // Every row carries the wire-format keys downstream agents rely on.
+        for src in sources {
+            for key in [
+                "adapter",
+                "instance",
+                "location",
+                "ok",
+                "detail",
+                "record_count",
+                "chunk_count",
+                "last_import_at",
+                "stale",
+            ] {
+                assert!(src.get(key).is_some(), "doctor row missing {key}: {src}",);
+            }
+            // No `since` was passed → stale must be JSON null.
+            assert!(src["stale"].is_null(), "stale must be null without since");
+        }
+    }
+
+    /// `source` filter narrows the result set to one adapter — the
+    /// equivalent of CLI `doctor mem0`.
+    #[tokio::test]
+    async fn doctor_source_filter_narrows_to_one_adapter() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", None, Some("/nonexistent/mem0.sqlite"), None)
+            .unwrap();
+        store
+            .register_source("claude-code", None, Some("/nonexistent/claude"), None)
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "doctor", "arguments": {"source": "mem0"}}),
+            ))
+            .await;
+        let sources = resp.result.unwrap()["structuredContent"]["sources"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["adapter"], "mem0");
+    }
+
+    /// `since=Nd` marks a source whose `last_import_at` is older than
+    /// the threshold (or was never imported) as `stale=true`.
+    #[tokio::test]
+    async fn doctor_since_marks_stale_when_last_import_older_than_threshold() {
+        let store = Store::open_in_memory().unwrap();
+        // Source A: never imported → must be stale once `since` is set.
+        store
+            .register_source("mem0", None, Some("/nonexistent/mem0.sqlite"), None)
+            .unwrap();
+        // Source B: imported "1 year ago" (way past 7d threshold below).
+        store
+            .register_source("claude-code", None, Some("/nonexistent/claude"), None)
+            .unwrap();
+        let one_year_ago = chrono::Utc::now().timestamp() - 365 * 86_400;
+        store
+            .conn()
+            .execute(
+                "UPDATE sources SET last_import_at = ?1 WHERE adapter = 'claude-code'",
+                rusqlite::params![one_year_ago],
+            )
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "doctor", "arguments": {"since": "7d"}}),
+            ))
+            .await;
+        let body = resp.result.unwrap()["structuredContent"].clone();
+        let sources = body["sources"].as_array().unwrap();
+        for src in sources {
+            assert_eq!(
+                src["stale"], true,
+                "every source must be stale under since=7d here: {src}",
+            );
+        }
+        assert_eq!(body["summary"]["stale"], 2);
+    }
+
+    /// Unknown `since` shape is a -32603 error (wrapped from the
+    /// handler's `Err`) — agents must learn the contract not silently
+    /// get an all-stale or all-fresh report.
+    #[tokio::test]
+    async fn doctor_rejects_garbage_since() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "doctor", "arguments": {"since": "next tuesday"}}),
+            ))
+            .await;
+        let err = resp.error.expect("garbage since must error");
+        assert!(
+            err.message.contains("since"),
+            "error must mention 'since': {}",
+            err.message,
+        );
+    }
+
+    /// Empty registry → empty rows + zeroed summary. Agents should not
+    /// confuse "no rows" with "tool failed".
+    #[tokio::test]
+    async fn doctor_returns_zero_summary_on_empty_registry() {
+        let store = Store::open_in_memory().unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s.handle(req("tools/call", json!({"name": "doctor"}))).await;
+        let body = resp.result.unwrap()["structuredContent"].clone();
+        assert_eq!(body["summary"]["total"], 0);
+        assert_eq!(body["summary"]["ok"], 0);
+        assert_eq!(body["summary"]["unhealthy"], 0);
+        assert_eq!(body["summary"]["stale"], 0);
+        assert!(body["sources"].as_array().unwrap().is_empty());
+    }
+
+    /// `doctor` is in the default tool catalogue (not admin-gated) so
+    /// any MCP client can discover it without `--allow-admin-tools`.
+    #[tokio::test]
+    async fn doctor_is_visible_to_non_admin_clients() {
+        let s = server_with_records(&[]);
+        assert!(!s.admin_tools_allowed());
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let names = tool_names_from(&resp.result.unwrap());
+        assert!(
+            names.contains(&"doctor".to_string()),
+            "doctor must be in non-admin tools/list",
+        );
+    }
+
+    #[test]
+    fn parse_doctor_since_accepts_known_shapes() {
+        assert_eq!(parse_doctor_since("7d").unwrap(), 7 * 86_400);
+        assert_eq!(parse_doctor_since("12h").unwrap(), 12 * 3_600);
+        assert_eq!(parse_doctor_since("30m").unwrap(), 30 * 60);
+        assert_eq!(parse_doctor_since("90").unwrap(), 90);
+        assert!(parse_doctor_since("").is_err());
+        assert!(parse_doctor_since("xyz").is_err());
+        assert!(parse_doctor_since("-1d").is_err());
     }
 }
