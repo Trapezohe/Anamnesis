@@ -1,0 +1,23 @@
+[package]
+name = "anamnesis-adapter-memary"
+description = "Anamnesis adapter for Memary (kingjulio8238/Memary) — reads the JSON cache files (memory_stream, entity_knowledge_store, past_chat, persona)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anamnesis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
