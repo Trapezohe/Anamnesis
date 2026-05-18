@@ -3872,8 +3872,14 @@ mod freshness_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("--sse-port"), "error must name the flag: {err}");
-        assert!(err.contains("serve --sse"), "error should point at the matching `serve` flag: {err}");
+        assert!(
+            err.contains("--sse-port"),
+            "error must name the flag: {err}"
+        );
+        assert!(
+            err.contains("serve --sse"),
+            "error should point at the matching `serve` flag: {err}"
+        );
     }
 
     /// Unknown transport must reject — don't emit a half-built config.
@@ -3887,7 +3893,10 @@ mod freshness_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("unknown --transport"), "unhelpful error: {err}");
+        assert!(
+            err.contains("unknown --transport"),
+            "unhelpful error: {err}"
+        );
     }
 
     /// Binary override is honored verbatim — `current_exe()` is only
@@ -3899,12 +3908,11 @@ mod freshness_tests {
             "stdio",
             None,
             "ANAMNESIS_MCP_TOKEN",
-            Some(std::path::Path::new("/nix/store/abcd-anamnesis/bin/anamnesis")),
+            Some(std::path::Path::new(
+                "/nix/store/abcd-anamnesis/bin/anamnesis",
+            )),
         )
         .unwrap();
-        assert_eq!(
-            server["command"],
-            "/nix/store/abcd-anamnesis/bin/anamnesis"
-        );
+        assert_eq!(server["command"], "/nix/store/abcd-anamnesis/bin/anamnesis");
     }
 }
