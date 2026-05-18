@@ -380,6 +380,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

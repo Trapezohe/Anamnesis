@@ -45,7 +45,8 @@ pub use openai::{OpenAiProvider, DEFAULT_API_BASE, DEFAULT_TEMPERATURE, DEFAULT_
 pub use prompt::build_prompt;
 pub use provider::{cost_preview_line, LlmProvider, MockProvider};
 pub use stage2::{
-    parse_extracted_items, run_stage2, ExtractedItem, Stage2Report, EXTRACTOR_ADAPTER_ID,
+    parse_extracted_items, run_stage2, run_stage2_concurrent, ExtractedItem, Stage2Report,
+    EXTRACTOR_ADAPTER_ID,
 };
 
 /// Target kind for extraction. Maps to `anamnesis-core::Kind` variants
