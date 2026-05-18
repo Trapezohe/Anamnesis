@@ -28,6 +28,7 @@ anamnesis-adapter-openclaw = { workspace = true }
 anamnesis-adapter-ghast = { workspace = true }
 anamnesis-adapter-tdai = { workspace = true }
 anamnesis-adapter-openviking = { workspace = true }
+anamnesis-adapter-mempalace = { workspace = true }
 anamnesis-adapter-generic-mcp = { workspace = true }
 anamnesis-mcp-server = { workspace = true, default-features = false }
 clap = { workspace = true }
