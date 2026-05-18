@@ -96,13 +96,14 @@ async fn http_endpoint_round_trips_initialize() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let tools = body["result"]["tools"].as_array().unwrap();
     // PR-A: admin tools (`import_source`) are hidden by default. The HTTP
-    // test server is built without `with_admin_tools(true)`, so the four
-    // read-only tools are all that should show up.
+    // test server is built without `with_admin_tools(true)`, so only the
+    // read-only tools should show up (search_memories, get_record,
+    // list_sources, trace_provenance, doctor — five since round-54).
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert_eq!(
         tools.len(),
-        4,
-        "expect 4 non-admin tools by default; got {names:?}"
+        5,
+        "expect 5 non-admin tools by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source"));
     for expected in [
@@ -110,6 +111,7 @@ async fn http_endpoint_round_trips_initialize() {
         "get_record",
         "list_sources",
         "trace_provenance",
+        "doctor",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
