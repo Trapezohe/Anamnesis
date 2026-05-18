@@ -1246,3 +1246,46 @@ fn audit_list_json_is_array_of_summaries() {
     assert_eq!(arr[0]["line_no"], 1);
     assert_eq!(arr[0]["provider_id"], "mock");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §-1.5 PR-6 — Anthropic provider (Round 45)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn extract_anthropic_without_api_key_errors_clearly() {
+    // Mirrors the openai variant. Two CI legs hit this path:
+    //
+    //   - `test (ubuntu-latest)` with `--no-default-features` → the
+    //     `anthropic-provider` feature is OFF → "requires the
+    //     anthropic-provider cargo feature".
+    //   - default-features → feature ON → "ANTHROPIC_API_KEY required".
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["extract", "--no-dry-run", "--provider", "anthropic"])
+        .assert()
+        .failure()
+        .stderr(contains("ANTHROPIC_API_KEY").or(contains("anthropic-provider")));
+}
+
+#[test]
+fn extract_unknown_provider_lists_anthropic_in_supported() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run", "--provider", "bogus-vendor"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown --provider").and(contains("anthropic")));
+}
