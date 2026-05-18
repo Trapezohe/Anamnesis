@@ -32,7 +32,7 @@
 
 ## Overview
 
-**Anamnesis** is an open-source memory infrastructure project for the agent era. It reads memories and sessions from Claude Code, mem0, Codex, generic MCP resources, and future agent frameworks, then normalizes them into one local schema, one local database, and one Anamnesis-owned RAG stack.
+**Anamnesis** is an open-source memory infrastructure project for the agent era. It reads memories and sessions from **14 first-class adapters** — agent frameworks (Claude Code, Codex, Hermes, OpenClaw, ghast) and memory systems (mem0, Letta, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary) — plus any MCP-aware project through the Generic MCP adapter, then normalizes them into one local schema, one local database, and one Anamnesis-owned RAG stack.
 
 It is not another chat interface. It is the memory layer underneath your tools:
 
@@ -53,19 +53,41 @@ It is not another chat interface. It is the memory layer underneath your tools:
 | Retrieval | FTS5 BM25 + vector kNN + Reciprocal Rank Fusion + ContextPacker |
 | Embeddings | Local `fastembed-rs` by default; curated model registry; Voyage cloud provider is explicit opt-in |
 | Protocol | MCP stdio; `anamnesis-mcp --sse` supports loopback HTTP/SSE |
-| Current adapters | Claude Code, mem0 SQLite, Codex basic, Generic MCP basic |
+| Current adapters | 14 first-class: Claude Code, Codex, mem0, Letta, Hermes, OpenClaw, ghast, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary, Generic MCP |
 | Security posture | Local-first, source provenance, explicit cloud opt-in; MCP admin tool gating is the next P0 hardening step |
 
 ## Supported Sources & Agents
 
 ### Importable memory sources
 
-| Category | Source / Agent | Status | What is read today | Precision |
-|---|---|---|---|---|
-| Agent | Claude Code | Usable | `~/.claude/projects/*/memory/*.md`, project `*.jsonl` sessions | Medium-high for memory markdown; medium-low for sessions |
-| Memory framework | mem0 | Usable | Self-hosted SQLite `memories` table | Medium-high |
-| Agent | Codex | Basic | `.codex` JSON / JSONL session files | Low; precise schema parsing is planned |
-| Protocol | Generic MCP server | Basic | `resources/list` + `resources/read` | Low; currently treated as opaque resources |
+#### §-2.2 Agents
+
+| Source / Agent | Status | What is read today | Precision |
+|---|---|---|---|
+| Claude Code | Usable | `~/.claude/projects/*/memory/*.md`, project `*.jsonl` sessions | Medium-high for memory markdown; medium-low for sessions |
+| Codex | Usable | `~/.codex/` session JSON/JSONL | Medium |
+| Hermes (Nous Research) | Usable | `~/.hermes/MEMORY.md` + `USER.md` + SQLite session DBs | Medium-high |
+| OpenClaw | Usable | `~/.openclaw/` workspace MD + `skills/`, `sessions/*.json[l]` | Medium-high |
+| ghast | Usable | `~/Documents/ghast_desktop/prompts/`, bundled skills; detects encrypted profile DB | Medium-high |
+
+#### §-2.3 Memory frameworks
+
+| Source / Framework | Status | What is read today | License |
+|---|---|---|---|
+| mem0 | Usable | Self-hosted SQLite `memories` table | Apache-2.0 |
+| Letta (formerly MemGPT) | Usable | SQLite `block` table (`~/.letta/letta.db`) | Apache-2.0 |
+| TencentDB Agent Memory | Usable | `~/.openclaw/memory-tdai/` 4-tier (L0 refs, L1 JSONL facts, L2 scenarios, L3 persona) | MIT |
+| OpenViking | Usable | VikingFS AGFS workspace (resources/user/agent/session × L0/L1/L2) | AGPLv3 (read-only, no link) |
+| MemPalace | Usable | `~/.mempalace/identity.txt` + ChromaDB drawers/closets | AGPLv3 (read-only, no link) |
+| Memori | Usable | SQLite — entity_facts, process_attrs, conversation messages + summaries, KG triples | Apache-2.0 |
+| MemOS | Usable | MemCube dumps (`textual_memory.json`) per `memory_type` | Apache-2.0 |
+| Memary | Usable | Local cache files (`memory_stream.json`, entity tally, past chat, personas) | MIT |
+
+#### §-2.4 Long-tail (any MCP-aware source)
+
+| Protocol | Status | What is read today |
+|---|---|---|
+| Generic MCP server | Usable | `resources/list` + `resources/read` — works for any project that exposes an MCP server (Cognee, Zep, etc.) |
 
 ### Consumers that can use Anamnesis
 
@@ -81,20 +103,21 @@ It is not another chat interface. It is the memory layer underneath your tools:
 
 | Source / Consumer | Type | Plan |
 |---|---|---|
-| Hermes | Agent / memory system | Dedicated adapter using the same normalized schema and local RAG stack |
+| Zep / Graphiti | Temporal knowledge graph | Bi-temporal facts push beyond the current `created_at/updated_at` schema; integration via `generic-mcp` until §-1.4 schema evolves |
+| Cognee | DuckDB + Kuzu graph | Today: via Cognee's own MCP server through `generic-mcp`. Native adapter pending if/when a portable on-disk export lands |
+| LangMem | LangChain SDK | Reads whichever backend LangGraph Store points at; case-by-case |
 | OpenAI / Voyage / other cloud embeddings | Embedding provider | Explicit opt-in only; never called silently |
+| Session extractor (§-1.5 PR-6) | Pipeline | Two-stage LLM-gated `Episode → Fact / Preference / Skill / Feedback` distillation |
 | Agent Memory Interchange Format | Standardization | Future RFC for cross-agent memory exchange |
 
 ## Why Anamnesis
 
-Each agent stores memory differently:
+Each agent and memory framework stores memory differently:
 
-- Claude Code keeps project JSONL sessions and markdown memory files.
-- mem0 stores structured memories in SQLite or API-backed deployments.
-- Codex has local session and rollout history.
-- ghast, Hermes, Cursor, Zed, and future agents may each add their own memory layer.
+- **Agents** — Claude Code keeps project JSONL sessions and markdown memory files; Codex has local session and rollout history; Hermes uses SQLite session DBs plus `MEMORY.md`/`USER.md`; OpenClaw and ghast each layer their own workspace conventions on top.
+- **Memory frameworks** — mem0/Letta/Memori use SQLite; MemPalace uses ChromaDB; OpenViking and TencentDB Agent Memory use hierarchical filesystem layouts; MemOS dumps JSON "MemCubes"; Memary uses Neo4j with local-cache JSON; Cognee uses DuckDB+Kuzu; Zep/Graphiti use temporal graphs.
 
-Without a neutral memory layer, users retrain every agent from scratch. Anamnesis turns fragmented memory stores into one local, inspectable, searchable, and portable substrate.
+Without a neutral memory layer, users retrain every agent from scratch — and migrating from one memory framework to another means losing years of accumulated context. Anamnesis turns fragmented memory stores into one local, inspectable, searchable, and portable substrate — read-only against each upstream, with full provenance kept so original sources stay authoritative.
 
 ## Architecture
 
@@ -117,12 +140,10 @@ flowchart TB
     Embedder["embedder crate<br/>fastembed / optional cloud"]
   end
 
-  subgraph Sources["Memory Sources"]
-    ClaudeCode["Claude Code<br/>MD + JSONL"]
-    Mem0["mem0<br/>SQLite"]
-    Codex["Codex<br/>JSON / JSONL"]
-    GenericMCP["Generic MCP<br/>resources/read"]
-    Future["Hermes / more adapters"]
+  subgraph Sources["Memory Sources (14 first-class adapters)"]
+    Agents["Agents: Claude Code · Codex<br/>Hermes · OpenClaw · ghast"]
+    MemFW["Memory frameworks: mem0 · Letta<br/>TencentDB Agent Memory · OpenViking<br/>MemPalace · Memori · MemOS · Memary"]
+    GenericMCP["Generic MCP<br/>(Cognee, Zep, any MCP-aware source)"]
   end
 
   Ghast --> MCP
@@ -141,11 +162,9 @@ flowchart TB
   Store --> Embedder
   Embedder --> Store
 
-  ClaudeCode --> Importer
-  Mem0 --> Importer
-  Codex --> Importer
+  Agents --> Importer
+  MemFW --> Importer
   GenericMCP --> Importer
-  Future --> Importer
 ```
 
 ## Import Pipeline
@@ -403,9 +422,19 @@ anamnesis/
 │   ├── cli/                    # `anamnesis`
 │   ├── mcp-server/             # `anamnesis-mcp`
 │   ├── adapter-claude-code/    # Claude Code adapter
+│   ├── adapter-codex/          # Codex adapter
 │   ├── adapter-mem0/           # mem0 SQLite adapter
-│   ├── adapter-codex/          # Codex basic adapter
-│   └── adapter-generic-mcp/    # Generic MCP resource adapter
+│   ├── adapter-letta/          # Letta (formerly MemGPT) SQLite adapter
+│   ├── adapter-hermes/         # Hermes (Nous Research) adapter
+│   ├── adapter-openclaw/       # OpenClaw adapter
+│   ├── adapter-ghast/          # ghast adapter
+│   ├── adapter-tdai/           # TencentDB Agent Memory adapter
+│   ├── adapter-openviking/     # OpenViking VikingFS adapter
+│   ├── adapter-mempalace/      # MemPalace ChromaDB adapter
+│   ├── adapter-memori/         # Memori SQLite adapter
+│   ├── adapter-memos/          # MemOS MemCube adapter
+│   ├── adapter-memary/         # Memary local-cache adapter
+│   └── adapter-generic-mcp/    # Generic MCP resource adapter (long-tail)
 ├── docs/
 │   └── BLUEPRINT.md
 ├── logo.png
@@ -447,19 +476,19 @@ Anamnesis can already unify imports and retrieval, but it should not yet claim t
 
 | Phase | Status | Focus |
 |---|---|---|
-| Phase 0 | Mostly complete | Rust workspace, Apache-2.0, CI, README/CONTRIBUTING, schema v1/v2 |
-| Phase 1 | Mostly complete | core/store/importer/search/embedder, Claude Code, mem0 SQLite, local hybrid RAG |
-| Phase 2 | Hardening | MCP admin gate, source registry import, filter pushdown, ScanOpts, streaming scan |
+| Phase 0 | Complete | Rust workspace, Apache-2.0, CI (8-leg matrix), README/CONTRIBUTING, schema v1/v2 |
+| Phase 1 | Complete | core/store/importer/search/embedder, 14 first-class adapters across §-2.2 + §-2.3, local hybrid RAG |
+| Phase 2 | In progress | MCP admin gate, source registry import, filter pushdown, ScanOpts, streaming scan |
 | Phase 3 | Planned | ghast integration, Homebrew/cargo release, real dogfood quality evaluation |
-| Phase 4 | Planned | Hermes adapter, precise Codex adapter, memory MCP convention, Agent Memory Interchange Format |
+| Phase 4 | Planned | §-1.5 PR-6 session extractor (Episode → Fact/Preference/Skill/Feedback LLM distillation), memory MCP convention, Agent Memory Interchange Format |
 
 Recommended next PR slices:
 
-1. MCP admin tool gate
-2. Source registry canonical import
-3. Store-level `SearchFilter`
-4. `ScanOpts` + streaming scan
-5. Session extractor design
+1. §-1.5 PR-6 — session extractor (Episode → Fact / Preference / Skill / Feedback, two-stage with deterministic gate + LLM)
+2. §-1.4 schema evolution for temporal/graph edges (unlocks Zep/Graphiti, Cognee Kuzu)
+3. §-2.5 adapter health-check tooling — `anamnesis doctor` per source
+4. Homebrew/cargo release packaging
+5. ghast first-consumer integration
 
 ## Contributing
 
