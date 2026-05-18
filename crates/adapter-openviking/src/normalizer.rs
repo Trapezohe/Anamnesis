@@ -139,6 +139,7 @@ fn normalize_file(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamnesi
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])
@@ -226,6 +227,7 @@ fn normalize_message(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamn
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])

@@ -216,6 +216,7 @@ mod tests {
                 native_path: None,
                 captured_at: Utc::now(),
                 raw_hash: "h".into(),
+                derived_from: None,
             },
             schema_version: SCHEMA_VERSION,
         }

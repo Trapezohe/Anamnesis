@@ -28,6 +28,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
     ("0002_phase1", include_str!("migrations/0002_phase1.sql")),
     ("0003_cjk_fts", include_str!("migrations/0003_cjk_fts.sql")),
+    (
+        "0004_provenance_derived_from",
+        include_str!("migrations/0004_provenance_derived_from.sql"),
+    ),
 ];
 
 /// Register the `tokenize_cjk(text)` SQLite scalar function on `conn`.

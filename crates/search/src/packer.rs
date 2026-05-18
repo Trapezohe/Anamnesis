@@ -339,6 +339,7 @@ mod tests {
                 native_path: Some(format!("/p/{native_id}")),
                 captured_at: Utc::now(),
                 raw_hash: "h".into(),
+                derived_from: None,
             },
             schema_version: SCHEMA_VERSION,
         }

@@ -552,8 +552,9 @@ fn write_record(tx: &Transaction<'_>, r: &AnamnesisRecord) -> Result<()> {
         "INSERT INTO records(\
             id, adapter, instance, content, scope, kind, \
             created_at, updated_at, tags, metadata, \
-            native_id, native_path, captured_at, raw_hash, schema_version\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+            native_id, native_path, captured_at, raw_hash, schema_version, \
+            derived_from\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(id) DO UPDATE SET \
             content = excluded.content, \
             scope = excluded.scope, \
@@ -562,7 +563,8 @@ fn write_record(tx: &Transaction<'_>, r: &AnamnesisRecord) -> Result<()> {
             tags = excluded.tags, \
             metadata = excluded.metadata, \
             native_path = excluded.native_path, \
-            raw_hash = excluded.raw_hash",
+            raw_hash = excluded.raw_hash, \
+            derived_from = excluded.derived_from",
         params![
             r.id.0,
             r.source.adapter,
@@ -579,6 +581,7 @@ fn write_record(tx: &Transaction<'_>, r: &AnamnesisRecord) -> Result<()> {
             ts(r.provenance.captured_at),
             r.provenance.raw_hash,
             r.schema_version,
+            r.provenance.derived_from.as_ref().map(|rid| rid.0.clone()),
         ],
     )?;
     Ok(())
@@ -746,7 +749,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, adapter, instance, content, scope, kind, \
                     created_at, updated_at, tags, metadata, \
-                    native_id, native_path, captured_at, raw_hash, schema_version \
+                    native_id, native_path, captured_at, raw_hash, schema_version, \
+                    derived_from \
              FROM records WHERE id = ?1",
         )?;
         let row = stmt.query_row(params![id.0], record_from_row).optional()?;
@@ -935,6 +939,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnamnesisRecord>
             native_path: row.get(11)?,
             captured_at: dt(row.get(12)?),
             raw_hash: row.get(13)?,
+            derived_from: row.get::<_, Option<String>>(15)?.map(RecordId),
         },
         schema_version: row.get::<_, i64>(14)? as u32,
     })
@@ -1289,6 +1294,7 @@ mod tests {
                 native_path: Some(format!("/tmp/{native_id}.md")),
                 captured_at: Utc::now(),
                 raw_hash: "h".into(),
+                derived_from: None,
             },
             schema_version: anamnesis_core::SCHEMA_VERSION,
         }
@@ -2261,5 +2267,60 @@ mod tests {
         let (page, _) = store.list_record_ids_paged(None, u32::MAX).unwrap();
         assert!(page.len() <= MAX_LIST_LIMIT as usize);
         assert_eq!(page.len(), 5);
+    }
+
+    #[test]
+    fn derived_from_roundtrips_through_store() {
+        // §-1.5 PR-6 regression: a record carrying `provenance.derived_from`
+        // must survive upsert + get_record without losing the lineage link.
+        // This is the only audit hook §-1.5 #6 promises.
+        let store = Store::open_in_memory().unwrap();
+        let parent = make_record("claude-code", "ep-1", "raw conversation", Kind::Episode);
+        let parent_id = parent.id.clone();
+        let chunks = Chunker::default().chunk(&parent.id, &parent.content);
+        store.upsert_record(&parent, &chunks, None).unwrap();
+
+        let mut derived = make_record("extractor", "fact-1", "user lives in Paris", Kind::Fact);
+        derived.provenance.derived_from = Some(parent_id.clone());
+        let derived_chunks = Chunker::default().chunk(&derived.id, &derived.content);
+        let derived_id = derived.id.clone();
+        store
+            .upsert_record(&derived, &derived_chunks, None)
+            .unwrap();
+
+        let got_parent = store.get_record(&parent_id).unwrap().unwrap();
+        assert!(
+            got_parent.provenance.derived_from.is_none(),
+            "non-derived records keep derived_from = None on the way back"
+        );
+
+        let got_derived = store.get_record(&derived_id).unwrap().unwrap();
+        assert_eq!(
+            got_derived.provenance.derived_from.as_ref().map(|r| &r.0),
+            Some(&parent_id.0),
+            "derived record's lineage must point at the source Episode after round-trip"
+        );
+    }
+
+    #[test]
+    fn derived_from_index_is_present_after_migration() {
+        // The migration explicitly creates `idx_records_derived_from`. If
+        // a future change drops it, the `anamnesis lineage` query path
+        // would regress to a full table scan — fail loudly here so the
+        // perf characteristic is part of the contract.
+        let store = Store::open_in_memory().unwrap();
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_records_derived_from'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "derived_from index must exist after 0004 migration"
+        );
     }
 }

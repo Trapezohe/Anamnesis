@@ -148,6 +148,7 @@ fn normalize_md(
             native_path: path,
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])
@@ -224,6 +225,7 @@ fn normalize_session(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamn
             native_path: db_path,
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])

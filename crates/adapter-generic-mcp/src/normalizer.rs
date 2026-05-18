@@ -83,6 +83,7 @@ pub fn normalize(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamnesis
             native_path: raw.native_path,
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }])

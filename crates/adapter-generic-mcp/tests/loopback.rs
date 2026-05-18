@@ -46,6 +46,7 @@ fn build_upstream_with_seeds(seeds: &[(&str, &str)]) -> AnamnesisServer {
                 native_path: Some(format!("/p/{native_id}")),
                 captured_at: Utc::now(),
                 raw_hash: format!("h-{native_id}"),
+                derived_from: None,
             },
             schema_version: SCHEMA_VERSION,
         };

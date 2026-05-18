@@ -178,6 +178,7 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     }
@@ -247,6 +248,7 @@ fn normalize_session(raw: &RawRecord, instance: Option<&str>) -> Result<Anamnesi
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
+            derived_from: None,
         },
         schema_version: SCHEMA_VERSION,
     })

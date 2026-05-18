@@ -103,6 +103,16 @@ pub struct Provenance {
     pub captured_at: DateTime<Utc>,
     /// `blake3` of the raw payload — used for cheap incremental dedup.
     pub raw_hash: String,
+    /// If this record was *derived* from another Anamnesis record (e.g.
+    /// the §-1.5 PR-6 session extractor distilling a Fact out of an
+    /// Episode), points back to the source `RecordId`. `None` for
+    /// records that came directly from an upstream adapter.
+    ///
+    /// Required by §-1.5 #6: extractor output must be traceable back
+    /// to the original Episode `record_id` so users can audit the
+    /// derivation chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<RecordId>,
 }
 
 /// The unified cross-source memory record.
@@ -178,6 +188,7 @@ mod tests {
                 native_path: Some("memory/editor.md".into()),
                 captured_at: Utc::now(),
                 raw_hash: "deadbeef".into(),
+                derived_from: None,
             },
             schema_version: SCHEMA_VERSION,
         };
