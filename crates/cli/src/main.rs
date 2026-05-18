@@ -295,6 +295,13 @@ enum Command {
     /// Run pending schema migrations (no-op after init).
     Migrate,
 
+    /// MCP-client integration helpers. Round-55: print the
+    /// copy-and-paste `mcpServers` snippet a Claude Desktop / Cursor /
+    /// ghast / Continue / generic MCP-aware client needs to talk to
+    /// this Anamnesis install.
+    #[command(subcommand)]
+    Mcp(McpCmd),
+
     /// §-2.5 per-source health check. Probes each registered source's
     /// `MemoryAdapter::health()` and surfaces what's reachable, what's
     /// stale, and any adapter-specific notes (e.g. ghast's encrypted
@@ -418,6 +425,47 @@ enum AuditCmd {
         /// Emit JSON instead of a human-readable summary.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// Emit the `mcpServers` JSON snippet for a Claude Desktop / Cursor /
+    /// ghast / Continue / generic MCP client. Output is the smallest
+    /// pasteable wrapper:
+    ///
+    /// ```json
+    /// { "mcpServers": { "<name>": { "command": "...", "args": [...] } } }
+    /// ```
+    ///
+    /// The user merges this with their existing config (e.g. with `jq`,
+    /// or by opening the JSON file and pasting into `"mcpServers"`).
+    ///
+    /// Defaults to stdio transport, which every common client supports.
+    /// Pass `--transport sse --sse-port <port>` for HTTP/SSE clients.
+    Config {
+        /// Server name to register under in the host config. Default
+        /// `anamnesis` (the typical convention).
+        #[arg(long, default_value = "anamnesis")]
+        name: String,
+        /// Transport: `stdio` (default — every client supports it) or
+        /// `sse` (HTTP/JSON-RPC, requires `--sse-port`).
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// Port for `--transport sse`. Required when transport is sse.
+        #[arg(long)]
+        sse_port: Option<u16>,
+        /// Env-var name holding the bearer token for SSE mode. Default
+        /// `ANAMNESIS_MCP_TOKEN` (same name `anamnesis serve` reads). The
+        /// emitted config references this by name, never the value.
+        #[arg(long, default_value = "ANAMNESIS_MCP_TOKEN")]
+        token_env: String,
+        /// Override the binary path emitted into `command`. Defaults to
+        /// the absolute path of the running `anamnesis` executable so the
+        /// snippet works even if `anamnesis` isn't on `$PATH` in the
+        /// host client's process.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 }
 
@@ -601,6 +649,13 @@ async fn main() -> Result<()> {
             println!("migrations applied");
             Ok(())
         }
+        Command::Mcp(McpCmd::Config {
+            name,
+            transport,
+            sse_port,
+            token_env,
+            binary,
+        }) => cmd_mcp_config(&name, &transport, sse_port, &token_env, binary.as_deref()),
         Command::Doctor {
             source,
             instance,
@@ -623,6 +678,89 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mcp config — emit the `mcpServers` JSON snippet a host client (Claude
+// Desktop / Cursor / ghast / Continue / etc.) needs to launch this
+// Anamnesis install. Round-55: codex-recommended path to "from CLI to
+// closed-loop memory server in one paste" for the 0.1.0 demo.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build and print the `mcpServers` JSON wrapper. Pure I/O — nothing
+/// touches the data dir or the store. Idempotent; users re-run this
+/// after every release to refresh the absolute binary path.
+fn cmd_mcp_config(
+    name: &str,
+    transport: &str,
+    sse_port: Option<u16>,
+    token_env: &str,
+    binary_override: Option<&std::path::Path>,
+) -> Result<()> {
+    let server = build_mcp_server_entry(transport, sse_port, token_env, binary_override)?;
+    let wrapper = serde_json::json!({
+        "mcpServers": { name: server },
+    });
+    println!("{}", serde_json::to_string_pretty(&wrapper)?);
+    Ok(())
+}
+
+/// Build the JSON value that goes under `mcpServers.<name>` for one
+/// host. Two shapes:
+///
+///   * stdio:  `{"command": "...", "args": ["serve"]}`
+///   * sse:    `{"url": "http://127.0.0.1:<port>", "headers": {"Authorization": "Bearer ${env:TOKEN}"}}`
+///
+/// Factored out from `cmd_mcp_config` so unit tests don't have to go
+/// through stdout — they assert on this `Value` directly.
+fn build_mcp_server_entry(
+    transport: &str,
+    sse_port: Option<u16>,
+    token_env: &str,
+    binary_override: Option<&std::path::Path>,
+) -> Result<serde_json::Value> {
+    match transport {
+        "stdio" => {
+            let bin = resolve_anamnesis_binary(binary_override)?;
+            Ok(serde_json::json!({
+                "command": bin.to_string_lossy(),
+                "args": ["serve"],
+            }))
+        }
+        "sse" => {
+            let port = sse_port.ok_or_else(|| {
+                anyhow!("--transport sse requires --sse-port <port> (use the same port you'll pass to `anamnesis serve --sse <port>`)")
+            })?;
+            // Host config consumers (Claude Desktop, Cursor, etc.) all
+            // support the `${env:NAME}` placeholder — the value is
+            // resolved at request time, not at config-write time, so
+            // the secret never lands on disk.
+            let auth = format!("Bearer ${{env:{token_env}}}");
+            Ok(serde_json::json!({
+                "url": format!("http://127.0.0.1:{port}"),
+                "headers": { "Authorization": auth },
+            }))
+        }
+        other => Err(anyhow!(
+            "unknown --transport {other:?}; supported: stdio, sse"
+        )),
+    }
+}
+
+/// Return the absolute path to the `anamnesis` binary the host client
+/// should launch. Default = the executable that's running this
+/// command, so a user who installed via `~/.local/bin/anamnesis` gets
+/// a snippet that works from inside their MCP client (which won't
+/// necessarily inherit the same `$PATH`).
+fn resolve_anamnesis_binary(override_path: Option<&std::path::Path>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
+        return Ok(p.to_path_buf());
+    }
+    // current_exe() returns the canonical path to the running process's
+    // executable. On macOS / Linux this is what `/proc/self/exe` (or
+    // _NSGetExecutablePath) reports — almost always the user's
+    // installed-into-PATH binary.
+    std::env::current_exe().map_err(|e| anyhow!("could not resolve current binary path: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3612,7 +3750,7 @@ fn install_model(_data_dir: &std::path::Path, _key: &str) -> Result<()> {
 
 #[cfg(test)]
 mod freshness_tests {
-    use super::{human_age_short, source_freshness};
+    use super::{build_mcp_server_entry, human_age_short, source_freshness};
 
     #[test]
     fn freshness_never_imported_when_last_import_is_none() {
@@ -3675,5 +3813,106 @@ mod freshness_tests {
         assert_eq!(human_age_short(29 * 24 * 3600), "29d");
         assert_eq!(human_age_short(30 * 24 * 3600), "30d+");
         assert_eq!(human_age_short(365 * 24 * 3600), "30d+");
+    }
+
+    // ─── Round-55: `anamnesis mcp config` ───────────────────────────────
+
+    /// Stdio default is the shape Claude Desktop / Cursor / ghast /
+    /// Continue / Windsurf all consume — a `command` + `args` pair.
+    #[test]
+    fn mcp_config_stdio_default_shape() {
+        let server = build_mcp_server_entry(
+            "stdio",
+            None,
+            "ANAMNESIS_MCP_TOKEN",
+            Some(std::path::Path::new("/usr/local/bin/anamnesis")),
+        )
+        .unwrap();
+        assert_eq!(server["command"], "/usr/local/bin/anamnesis");
+        assert_eq!(server["args"], serde_json::json!(["serve"]));
+        // Stdio mode must NOT emit url/headers — those are SSE-only and
+        // confuse strict host parsers (e.g. Claude Desktop rejects mixed
+        // command+url entries).
+        assert!(server.get("url").is_none());
+        assert!(server.get("headers").is_none());
+    }
+
+    /// SSE mode emits a URL + bearer-token header. The token env-var
+    /// name is interpolated via the `${env:NAME}` placeholder host
+    /// clients resolve at request time — the value never lands on disk.
+    #[test]
+    fn mcp_config_sse_emits_bearer_env_placeholder() {
+        let server = build_mcp_server_entry(
+            "sse",
+            Some(7878),
+            "MY_TOKEN_VAR",
+            Some(std::path::Path::new("/usr/local/bin/anamnesis")),
+        )
+        .unwrap();
+        assert_eq!(server["url"], "http://127.0.0.1:7878");
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer ${env:MY_TOKEN_VAR}"
+        );
+        // No command/args for SSE — that's the discriminator hosts use
+        // to pick the transport.
+        assert!(server.get("command").is_none());
+        assert!(server.get("args").is_none());
+    }
+
+    /// SSE without --sse-port is the one user-facing error this command
+    /// can produce. Must surface a hint pointing at `anamnesis serve --sse`.
+    #[test]
+    fn mcp_config_sse_without_port_errors_clearly() {
+        let err = build_mcp_server_entry(
+            "sse",
+            None,
+            "ANAMNESIS_MCP_TOKEN",
+            Some(std::path::Path::new("/usr/local/bin/anamnesis")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--sse-port"),
+            "error must name the flag: {err}"
+        );
+        assert!(
+            err.contains("serve --sse"),
+            "error should point at the matching `serve` flag: {err}"
+        );
+    }
+
+    /// Unknown transport must reject — don't emit a half-built config.
+    #[test]
+    fn mcp_config_unknown_transport_errors() {
+        let err = build_mcp_server_entry(
+            "websocket",
+            None,
+            "ANAMNESIS_MCP_TOKEN",
+            Some(std::path::Path::new("/usr/local/bin/anamnesis")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown --transport"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// Binary override is honored verbatim — `current_exe()` is only
+    /// the fallback, and operators packaging anamnesis under a custom
+    /// path (e.g. a Nix store) need to be able to pin it.
+    #[test]
+    fn mcp_config_honors_binary_override() {
+        let server = build_mcp_server_entry(
+            "stdio",
+            None,
+            "ANAMNESIS_MCP_TOKEN",
+            Some(std::path::Path::new(
+                "/nix/store/abcd-anamnesis/bin/anamnesis",
+            )),
+        )
+        .unwrap();
+        assert_eq!(server["command"], "/nix/store/abcd-anamnesis/bin/anamnesis");
     }
 }
