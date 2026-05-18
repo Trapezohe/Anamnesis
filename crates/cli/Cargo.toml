@@ -31,6 +31,7 @@ anamnesis-adapter-openviking = { workspace = true }
 anamnesis-adapter-mempalace = { workspace = true }
 anamnesis-adapter-memori = { workspace = true }
 anamnesis-adapter-memos = { workspace = true }
+anamnesis-adapter-memary = { workspace = true }
 anamnesis-adapter-generic-mcp = { workspace = true }
 anamnesis-mcp-server = { workspace = true, default-features = false }
 clap = { workspace = true }
