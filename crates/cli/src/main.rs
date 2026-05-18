@@ -2885,11 +2885,31 @@ async fn run_adapter_health(
                 .unwrap_or_else(|| home_join(&[".memary", "data"]).unwrap_or_default());
             Some(memary_adapter(path, instance).health().await)
         }
-        // generic-mcp: needs URL + optional token-from-env. Skip
-        // here — the adapter constructs a long-lived MCP session
-        // and exposing that to doctor without spinning one up just
-        // for a health probe would be expensive. Return None so the
-        // caller renders "not wired into doctor".
+        anamnesis_adapter_generic_mcp::ADAPTER_ID => {
+            // `MemoryAdapter::health()` on generic-mcp is a single GET
+            // to `<url>/healthz` — much cheaper than the resources/list
+            // pull that import does. The bearer token (if any) is
+            // resolved from `src.config_json` the same way `cmd_import`
+            // resolves it, so token-env discrepancies show up here too.
+            let Some(url) = src.location.clone() else {
+                return Some(anamnesis_core::adapter::HealthStatus {
+                    ok: false,
+                    detail: "generic-mcp registered without --url".to_string(),
+                });
+            };
+            let token = match resolve_generic_mcp_token(src.config_json.as_deref()) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(anamnesis_core::adapter::HealthStatus {
+                        ok: false,
+                        detail: format!("generic-mcp token resolution failed: {e}"),
+                    });
+                }
+            };
+            let adapter =
+                anamnesis_adapter_generic_mcp::generic_mcp_adapter(url, token.as_deref(), instance);
+            Some(adapter.health().await)
+        }
         _ => None,
     }
 }
