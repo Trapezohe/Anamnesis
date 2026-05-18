@@ -63,8 +63,11 @@ pub struct Stage2Report {
 /// concurrency level here pushes you into rate-limit territory on
 /// hosted providers without giving the user a chance to inspect
 /// progress. Concurrency can come in a follow-up PR behind a flag.
-pub async fn run_stage2<P: LlmProvider>(
-    provider: &P,
+///
+/// Takes `&dyn LlmProvider` (not a generic `&P`) so the CLI can pick
+/// `Box<dyn LlmProvider>` at runtime based on `--provider`.
+pub async fn run_stage2(
+    provider: &dyn LlmProvider,
     candidates: &[Candidate],
     target_kind: ExtractKind,
     instance: Option<&str>,

@@ -47,11 +47,16 @@ futures = { workspace = true }
 rusqlite = { workspace = true }
 
 [features]
-default = ["local-fastembed", "sse"]
+default = ["local-fastembed", "sse", "openai-provider"]
 local-fastembed = ["anamnesis-embedder/local-fastembed", "anamnesis-mcp-server/local-fastembed"]
 # Wires `anamnesis serve --sse <port>` to the in-process MCP HTTP
 # transport. Off → CLI still builds, but `--sse` errors at runtime.
 sse = ["anamnesis-mcp-server/sse"]
+# Pulls in the real OpenAI-compatible HTTP provider for
+# `anamnesis extract --provider openai`. Off → the CLI builds without
+# `reqwest` and the openai provider path errors at runtime with a
+# pointer to the feature flag.
+openai-provider = ["anamnesis-extractor/openai-provider"]
 
 [dev-dependencies]
 assert_cmd = "2"
