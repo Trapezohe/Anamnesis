@@ -1448,3 +1448,104 @@ fn doctor_filter_source_narrows_output() {
     assert_eq!(arr.len(), 1, "--source should filter to one row");
     assert_eq!(arr[0]["adapter"], "mem0");
 }
+
+#[test]
+fn doctor_strict_exits_nonzero_when_a_source_is_unhealthy() {
+    // Round 50: --strict turns the "all healthy?" check into a CI gate.
+    // Without --strict, doctor exits 0 even when some sources are
+    // unreachable (it's an inspection tool too).
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            "/tmp/anamnesis-doctor-strict-nope",
+        ])
+        .assert()
+        .success();
+    // Default mode → exit 0.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor"])
+        .assert()
+        .success();
+    // --strict → exit non-zero.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--strict"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "registered source(s) reported unhealthy under --strict",
+        ));
+}
+
+#[test]
+fn doctor_strict_with_only_healthy_sources_exits_zero() {
+    // Build a minimal fixture that the claude-code adapter accepts as
+    // a valid (empty) projects_root, then strict mode must NOT trip.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    // Make a real empty projects dir.
+    let projects = dir.path().join("claude_projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "claude-code",
+            "--path",
+            projects.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--strict"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn doctor_strict_json_still_prints_then_errors() {
+    // CI gates want both the JSON payload AND the non-zero exit so they
+    // can tee the report and fail the build. Verify both happen.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/nope.sqlite"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--json", "--strict"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "strict json mode must still fail when unhealthy: status={:?}",
+        out.status
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = payload.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["ok"], false);
+}
