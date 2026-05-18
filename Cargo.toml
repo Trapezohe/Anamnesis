@@ -18,6 +18,7 @@ members = [
     "crates/adapter-ghast",
     "crates/adapter-tdai",
     "crates/adapter-openviking",
+    "crates/adapter-mempalace",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ anamnesis-adapter-openclaw = { path = "crates/adapter-openclaw", version = "0.0.
 anamnesis-adapter-ghast = { path = "crates/adapter-ghast", version = "0.0.2" }
 anamnesis-adapter-tdai = { path = "crates/adapter-tdai", version = "0.0.2" }
 anamnesis-adapter-openviking = { path = "crates/adapter-openviking", version = "0.0.2" }
+anamnesis-adapter-mempalace = { path = "crates/adapter-mempalace", version = "0.0.2" }
 anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.0.2", default-features = false }
 
 # Serialization
