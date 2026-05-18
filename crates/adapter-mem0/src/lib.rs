@@ -217,13 +217,20 @@ mod tests {
     use futures::StreamExt;
     use rusqlite::Connection;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MEM0_LIB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_dir() -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("anamnesis-mem0-adapter-{nonce}"));
+        let seq = MEM0_LIB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "anamnesis-mem0-adapter-{nonce}-{pid}-{seq}",
+            pid = std::process::id()
+        ));
         fs::create_dir_all(&p).unwrap();
         p
     }

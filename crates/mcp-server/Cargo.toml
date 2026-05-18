@@ -33,6 +33,7 @@ anamnesis-adapter-hermes = { workspace = true }
 anamnesis-adapter-openclaw = { workspace = true }
 anamnesis-adapter-ghast = { workspace = true }
 anamnesis-adapter-tdai = { workspace = true }
+anamnesis-adapter-openviking = { workspace = true }
 anamnesis-adapter-generic-mcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

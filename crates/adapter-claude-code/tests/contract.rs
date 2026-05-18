@@ -4,16 +4,23 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use anamnesis_core::contract::AdapterContract;
+
+static CLAUDE_CONTRACT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn fixture_root() -> PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("anamnesis-claude-contract-{nonce}"));
+    let seq = CLAUDE_CONTRACT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "anamnesis-claude-contract-{nonce}-{pid}-{seq}",
+        pid = std::process::id()
+    ));
     let proj = root.join("project-abc");
     fs::create_dir_all(proj.join("memory")).unwrap();
     fs::write(
