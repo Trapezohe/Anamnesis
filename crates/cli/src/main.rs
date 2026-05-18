@@ -324,6 +324,17 @@ enum Command {
         /// have missing paths yet.
         #[arg(long)]
         strict: bool,
+        /// Flag any registered source whose `last_import_at` is older
+        /// than this duration. Accepts `Nd` (days), `Nh` (hours),
+        /// `Nm` (minutes). Sources never imported are also flagged.
+        /// Staleness is reported as a `[!]` row marker; combine with
+        /// `--strict-staleness` if you want it to trip the exit code.
+        #[arg(long)]
+        since: Option<String>,
+        /// Also exit non-zero (alongside `--strict`) if any registered
+        /// source is stale per `--since`. No effect without `--since`.
+        #[arg(long)]
+        strict_staleness: bool,
     },
 }
 
@@ -596,6 +607,8 @@ async fn main() -> Result<()> {
             include_unregistered,
             json,
             strict,
+            since,
+            strict_staleness,
         } => {
             cmd_doctor(
                 &data_dir,
@@ -604,6 +617,8 @@ async fn main() -> Result<()> {
                 include_unregistered,
                 json,
                 strict,
+                since.as_deref(),
+                strict_staleness,
             )
             .await
         }
@@ -2526,7 +2541,14 @@ async fn cmd_doctor(
     include_unregistered: bool,
     json: bool,
     strict: bool,
+    since: Option<&str>,
+    strict_staleness: bool,
 ) -> Result<()> {
+    let stale_threshold = match since {
+        Some(spec) => Some(parse_doctor_since(spec)?),
+        None => None,
+    };
+    let now = chrono::Utc::now().timestamp();
     let store = Store::open(db_path(data_dir))?;
     let registered = store.list_sources_with_counts()?;
 
@@ -2544,6 +2566,11 @@ async fn cmd_doctor(
             }
         }
         let health = run_adapter_health(src).await;
+        let stale = stale_threshold.map(|t| match src.last_import_at {
+            Some(ts) => (now - ts) > t,
+            // Never imported → counts as stale when a threshold is set.
+            None => true,
+        });
         rows.push(DoctorRow {
             adapter: src.adapter.clone(),
             instance: instance_label(&src.instance),
@@ -2557,6 +2584,7 @@ async fn cmd_doctor(
             record_count: Some(swc.record_count),
             chunk_count: Some(swc.chunk_count),
             last_import_at: src.last_import_at,
+            stale,
         });
     }
 
@@ -2591,6 +2619,9 @@ async fn cmd_doctor(
                 record_count: d.estimated_records,
                 chunk_count: None,
                 last_import_at: None,
+                // Unregistered rows aren't subject to staleness — there
+                // was never an import to begin with.
+                stale: None,
             });
         }
     }
@@ -2609,20 +2640,15 @@ async fn cmd_doctor(
                     "record_count": r.record_count,
                     "chunk_count": r.chunk_count,
                     "last_import_at": r.last_import_at,
+                    "stale": r.stale,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
-        // Honor --strict in json mode too — print the JSON first so the
-        // caller can still parse stdout, then exit non-zero. This lets
-        // CI gates do `anamnesis doctor --json --strict | tee report.json`.
-        let bad_count = rows.iter().filter(|r| r.registered && !r.ok).count();
-        if strict && bad_count > 0 {
-            return Err(anyhow!(
-                "{bad_count} registered source(s) reported unhealthy under --strict"
-            ));
-        }
-        return Ok(());
+        // Honor --strict and --strict-staleness in json mode too — print
+        // the JSON first so the caller can still parse stdout, then exit
+        // non-zero. Lets CI gates do `doctor --json --strict | tee report.json`.
+        return apply_doctor_exit_gate(&rows, strict, strict_staleness);
     }
 
     if rows.is_empty() {
@@ -2649,6 +2675,9 @@ async fn cmd_doctor(
     for row in &rows {
         let tag = if !row.registered {
             "?"
+        } else if row.stale == Some(true) && row.ok {
+            // Registered + reachable but data is older than --since.
+            "!"
         } else if row.ok {
             "✓"
         } else {
@@ -2661,7 +2690,11 @@ async fn cmd_doctor(
         };
         let status = if row.registered {
             if row.ok {
-                "registered, healthy"
+                if row.stale == Some(true) {
+                    "registered, healthy, STALE"
+                } else {
+                    "registered, healthy"
+                }
             } else {
                 "registered, NOT HEALTHY"
             }
@@ -2691,10 +2724,32 @@ async fn cmd_doctor(
     let ok_count = rows.iter().filter(|r| r.registered && r.ok).count();
     let bad_count = rows.iter().filter(|r| r.registered && !r.ok).count();
     let unreg_count = rows.iter().filter(|r| !r.registered).count();
-    println!("Summary: {ok_count} healthy, {bad_count} unhealthy, {unreg_count} unregistered.");
+    let stale_count = rows.iter().filter(|r| r.stale == Some(true)).count();
+    let stale_blurb = if stale_threshold.is_some() {
+        format!(", {stale_count} stale")
+    } else {
+        String::new()
+    };
+    println!(
+        "Summary: {ok_count} healthy, {bad_count} unhealthy, {unreg_count} unregistered{stale_blurb}."
+    );
+    apply_doctor_exit_gate(&rows, strict, strict_staleness)
+}
+
+/// Decide whether `doctor` should exit non-zero based on the flags.
+/// Both human and JSON paths call this; the JSON path already printed
+/// the report so we just need to propagate the exit signal.
+fn apply_doctor_exit_gate(rows: &[DoctorRow], strict: bool, strict_staleness: bool) -> Result<()> {
+    let bad_count = rows.iter().filter(|r| r.registered && !r.ok).count();
+    let stale_count = rows.iter().filter(|r| r.stale == Some(true)).count();
     if strict && bad_count > 0 {
         return Err(anyhow!(
             "{bad_count} registered source(s) reported unhealthy under --strict"
+        ));
+    }
+    if strict_staleness && stale_count > 0 {
+        return Err(anyhow!(
+            "{stale_count} registered source(s) are stale under --strict-staleness"
         ));
     }
     Ok(())
@@ -2710,6 +2765,35 @@ struct DoctorRow {
     record_count: Option<u64>,
     chunk_count: Option<u64>,
     last_import_at: Option<i64>,
+    /// `Some(true)` if this registered row is older than `--since`
+    /// or never-imported. `Some(false)` if it's fresh enough.
+    /// `None` when `--since` wasn't passed.
+    stale: Option<bool>,
+}
+
+/// Parse the `--since` value into seconds. Accepts shapes:
+///   - `7d`  → 7 * 86_400
+///   - `12h` → 12 * 3_600
+///   - `30m` → 30 * 60
+///   - bare integer → seconds
+fn parse_doctor_since(spec: &str) -> Result<i64> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(anyhow!("--since cannot be empty"));
+    }
+    let (num_str, mult) = match spec.chars().last() {
+        Some('d') | Some('D') => (&spec[..spec.len() - 1], 86_400_i64),
+        Some('h') | Some('H') => (&spec[..spec.len() - 1], 3_600_i64),
+        Some('m') | Some('M') => (&spec[..spec.len() - 1], 60_i64),
+        _ => (spec, 1_i64),
+    };
+    let n: i64 = num_str.parse().map_err(|_| {
+        anyhow!("--since must be of the form `Nd`, `Nh`, `Nm`, or bare seconds; got {spec:?}")
+    })?;
+    if n < 0 {
+        return Err(anyhow!("--since must be non-negative; got {spec:?}"));
+    }
+    Ok(n.saturating_mul(mult))
 }
 
 fn instance_label(instance: &str) -> String {
