@@ -194,6 +194,30 @@ enum Command {
         no_dry_run: bool,
     },
 
+    /// Show the `provenance.derived_from` lineage of a record. Walks
+    /// from the given record id up through its source-Episode chain.
+    /// Use the inverse query — direct children of a record — with the
+    /// `--children` flag.
+    ///
+    /// Required for §-1.5 #6 ("结果 provenance 回指原始 Episode 的
+    /// record_id，抽取日志可查"): once the Stage-2 extractor starts
+    /// writing derived records, this is how users audit which Episode
+    /// produced which Fact / Preference / Skill / Feedback.
+    Lineage {
+        /// Record id to start the walk from.
+        record_id: String,
+        /// List direct children (records whose `derived_from` points
+        /// at the given id) instead of walking ancestors.
+        #[arg(long)]
+        children: bool,
+        /// Max children to list (only meaningful with `--children`).
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Emit JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run as an MCP server. Default = stdio; `--sse <port>` binds the
     /// HTTP/JSON-RPC transport on `127.0.0.1:<port>` (use `0` for an
     /// ephemeral port — the chosen port is printed to stderr).
@@ -422,6 +446,12 @@ async fn main() -> Result<()> {
             json,
             !no_dry_run,
         ),
+        Command::Lineage {
+            record_id,
+            children,
+            limit,
+            json,
+        } => cmd_lineage(&data_dir, &record_id, children, limit, json),
         Command::Model(sub) => cmd_model(&data_dir, sub).await,
         Command::Serve { sse, token } => {
             cmd_serve(&data_dir, sse, token, config.server.allow_admin_tools).await
@@ -2008,6 +2038,143 @@ fn preview(s: &str, max_chars: usize) -> String {
     }
     let head: String = cleaned.chars().take(max_chars).collect();
     format!("{head}…")
+}
+
+/// `anamnesis lineage <record-id>` — show the §-1.5 PR-6 derivation chain.
+///
+/// Default mode walks `provenance.derived_from` upward from the given record
+/// until it hits a root (a record with `derived_from = None`) or a dangling
+/// parent reference. With `--children`, lists *direct* derivations of the
+/// record instead — useful right after running the Stage-2 extractor to see
+/// which Facts/Preferences/Skills got distilled out of one Episode.
+fn cmd_lineage(
+    data_dir: &std::path::Path,
+    record_id: &str,
+    children: bool,
+    limit: u32,
+    json: bool,
+) -> Result<()> {
+    use anamnesis_core::model::RecordId;
+    let store = Store::open(db_path(data_dir))?;
+    let rid = RecordId(record_id.to_string());
+
+    if children {
+        let kids = store.list_derivations(&rid, limit)?;
+        if json {
+            let rows: Vec<_> = kids
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id.0,
+                        "adapter": r.source.adapter,
+                        "instance": r.source.instance,
+                        "kind": format!("{:?}", r.kind).to_lowercase(),
+                        "scope": format!("{:?}", r.scope).to_lowercase(),
+                        "created_at": r.created_at.to_rfc3339(),
+                        "content_preview": preview(&r.content, 200),
+                    })
+                })
+                .collect();
+            let out = serde_json::json!({
+                "parent": record_id,
+                "children": rows,
+                "count": kids.len(),
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
+        }
+        if kids.is_empty() {
+            println!("No records derived from {record_id}.");
+            println!("(If you expected results, the §-1.5 PR-6 Stage-2 extractor probably hasn't run on this record yet.)");
+            return Ok(());
+        }
+        println!(
+            "Direct derivations of {record_id} ({} record(s)):",
+            kids.len()
+        );
+        println!();
+        for (i, r) in kids.iter().enumerate() {
+            println!(
+                "[{:>2}] {:?}/{:?}  {}  ({})",
+                i + 1,
+                r.kind,
+                r.scope,
+                r.source.adapter,
+                r.created_at.to_rfc3339(),
+            );
+            println!("     id={}", r.id.0);
+            println!("     {}", preview(&r.content, 200));
+            println!();
+        }
+        return Ok(());
+    }
+
+    // Ancestor walk.
+    let chain = store.lineage_chain(&rid)?;
+    let chain = match chain {
+        None => {
+            return Err(anyhow!("no record with id {record_id:?} in this store"));
+        }
+        Some(c) => c,
+    };
+    if json {
+        let nodes: Vec<_> = chain
+            .records
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id.0,
+                    "adapter": r.source.adapter,
+                    "instance": r.source.instance,
+                    "kind": format!("{:?}", r.kind).to_lowercase(),
+                    "scope": format!("{:?}", r.scope).to_lowercase(),
+                    "created_at": r.created_at.to_rfc3339(),
+                    "derived_from": r.provenance.derived_from.as_ref().map(|p| p.0.clone()),
+                    "content_preview": preview(&r.content, 200),
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "start": record_id,
+            "chain": nodes,
+            "depth": chain.records.len(),
+            "missing_parent": chain.missing_parent.as_ref().map(|r| r.0.clone()),
+            "complete": chain.missing_parent.is_none(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    println!(
+        "Lineage of {record_id} ({} record(s) in chain, leaf → root):",
+        chain.records.len()
+    );
+    println!();
+    for (depth, r) in chain.records.iter().enumerate() {
+        let arrow = if depth == 0 { "  " } else { "↑ " };
+        println!(
+            "{arrow}[{depth}] {:?}/{:?}  {}  ({})",
+            r.kind,
+            r.scope,
+            r.source.adapter,
+            r.created_at.to_rfc3339(),
+        );
+        println!("       id={}", r.id.0);
+        println!("       {}", preview(&r.content, 200));
+        println!();
+    }
+    if let Some(missing) = chain.missing_parent {
+        println!(
+            "⚠ chain ends at a dangling parent reference: {} \
+             (the parent record is no longer in the store; lineage is incomplete)",
+            missing.0
+        );
+    } else {
+        println!(
+            "✓ chain is complete — root is a record with no derived_from \
+             (came directly from an upstream adapter)."
+        );
+    }
+    Ok(())
 }
 
 async fn run_search(
