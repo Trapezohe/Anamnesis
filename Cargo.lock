@@ -377,6 +377,8 @@ name = "anamnesis-extractor"
 version = "0.0.2"
 dependencies = [
  "anamnesis-core",
+ "async-trait",
+ "blake3",
  "chrono",
  "serde",
  "serde_json",

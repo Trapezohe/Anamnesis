@@ -1,6 +1,6 @@
 [package]
 name = "anamnesis-extractor"
-description = "Two-stage extractor: turn Episode records into Fact / Preference / Feedback / Skill records (Stage 1 deterministic gate now; Stage 2 LLM step coming in a follow-up PR)"
+description = "Two-stage extractor: turn Episode records into Fact / Preference / Feedback / Skill records (Stage 1 deterministic gate + Stage 2 LLM-driven distillation via a pluggable LlmProvider trait)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 anamnesis-core = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

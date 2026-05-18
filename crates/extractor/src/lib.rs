@@ -31,10 +31,18 @@
 #![warn(missing_docs)]
 
 pub mod gate;
+pub mod prompt;
+pub mod provider;
+pub mod stage2;
 
 use anamnesis_core::model::{AnamnesisRecord, Kind, RecordId};
 
 pub use gate::{default_gate, DefaultGate, Stage1Gate, Stage1Score};
+pub use prompt::build_prompt;
+pub use provider::{cost_preview_line, LlmProvider, MockProvider};
+pub use stage2::{
+    parse_extracted_items, run_stage2, ExtractedItem, Stage2Report, EXTRACTOR_ADAPTER_ID,
+};
 
 /// Target kind for extraction. Maps to `anamnesis-core::Kind` variants
 /// users typically want to distill out of raw conversation episodes.

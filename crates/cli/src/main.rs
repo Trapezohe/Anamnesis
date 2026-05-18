@@ -435,17 +435,20 @@ async fn main() -> Result<()> {
             explain,
             json,
             no_dry_run,
-        } => cmd_extract(
-            &data_dir,
-            &kind,
-            source.as_deref(),
-            instance.as_deref(),
-            threshold,
-            limit,
-            explain,
-            json,
-            !no_dry_run,
-        ),
+        } => {
+            cmd_extract(
+                &data_dir,
+                &kind,
+                source.as_deref(),
+                instance.as_deref(),
+                threshold,
+                limit,
+                explain,
+                json,
+                !no_dry_run,
+            )
+            .await
+        }
         Command::Lineage {
             record_id,
             children,
@@ -1856,7 +1859,7 @@ async fn cmd_search(
 /// distillation) must remain a separate explicit command, must show a
 /// cost preview up front, and must never run inside `anamnesis import`.
 #[allow(clippy::too_many_arguments)]
-fn cmd_extract(
+async fn cmd_extract(
     data_dir: &std::path::Path,
     kind_str: &str,
     source: Option<&str>,
@@ -1870,13 +1873,6 @@ fn cmd_extract(
     let target_kind = anamnesis_extractor::ExtractKind::parse(kind_str).ok_or_else(|| {
         anyhow!("unknown extract kind {kind_str:?}; supported: fact, preference, feedback, skill")
     })?;
-    if !dry_run {
-        // Stage 2 isn't wired yet — be explicit so users aren't surprised.
-        return Err(anyhow!(
-            "Stage 2 (the LLM-driven extraction step) is not yet implemented. \
-             Drop the `--no-dry-run` flag to inspect Stage-1 candidates instead."
-        ));
-    }
 
     use anamnesis_extractor::Stage1Gate as _;
     let store = Store::open(db_path(data_dir))?;
@@ -1884,6 +1880,14 @@ fn cmd_extract(
     let total_seen = episodes.len();
     let gate = anamnesis_extractor::default_gate();
     let candidates = anamnesis_extractor::stage1_select(episodes, &gate, threshold, limit);
+
+    if !dry_run {
+        // §-1.5 #6: "运行前向用户展示'将使用模型 X 做 N 次 LLM 调用'".
+        // The configured provider defaults to MockProvider here — the
+        // real OpenAI-compatible provider is gated behind a follow-up
+        // PR and a feature flag. Either way we print the plan first.
+        return run_stage2_path(&store, &candidates, target_kind, instance, total_seen, json).await;
+    }
 
     if json {
         let rows: Vec<_> = candidates
@@ -1987,6 +1991,128 @@ fn cmd_extract(
 /// adapter / instance. Used by `cmd_extract`. Uses paged id listing
 /// followed by per-id `get_record`; fine for ≤10k-record installs which
 /// is what we target in Phase 1.
+/// `anamnesis extract --no-dry-run` execution path.
+///
+/// Today this uses the deterministic `MockProvider` — the real OpenAI-
+/// compatible provider is the next PR in the §-1.5 sequence. Even with
+/// the mock, the path runs end-to-end: prints the cost preview, calls
+/// the provider, parses results, writes derived records to the store
+/// with `provenance.derived_from = source_episode_id`. That makes the
+/// `anamnesis lineage` audit trail meaningful immediately.
+async fn run_stage2_path(
+    store: &Store,
+    candidates: &[anamnesis_extractor::Candidate],
+    target_kind: anamnesis_extractor::ExtractKind,
+    instance: Option<&str>,
+    total_seen: usize,
+    json: bool,
+) -> Result<()> {
+    use anamnesis_extractor::{cost_preview_line, LlmProvider, MockProvider};
+    let provider = MockProvider::default_instance();
+
+    // §-1.5 #6 plan banner — always printed BEFORE any provider call.
+    let estimated_tokens: usize = candidates
+        .iter()
+        .map(|c| {
+            let prompt = anamnesis_extractor::build_prompt(target_kind, &c.record.content);
+            <MockProvider as anamnesis_extractor::LlmProvider>::estimate_tokens(&provider, &prompt)
+        })
+        .sum();
+    let preview = cost_preview_line(provider.model_id(), candidates.len(), estimated_tokens);
+    if !json {
+        eprintln!("{preview}");
+        eprintln!(
+            "Stage 2 will run via the built-in MockProvider — \
+             zero network requests, deterministic output."
+        );
+        eprintln!();
+    }
+
+    let report =
+        anamnesis_extractor::run_stage2(&provider, candidates, target_kind, instance).await?;
+
+    // Persist every derived record. Chunker is needed because
+    // upsert_record demands at least one chunk row for the FTS index.
+    use anamnesis_core::chunker::Chunker;
+    let chunker = Chunker::default();
+    let mut written = 0usize;
+    for record in &report.records {
+        let chunks = chunker.chunk(&record.id, &record.content);
+        store.upsert_record(record, &chunks, None)?;
+        written += 1;
+    }
+
+    if json {
+        let rows: Vec<_> = report
+            .records
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "record_id": r.id.0,
+                    "kind": format!("{:?}", r.kind).to_lowercase(),
+                    "scope": format!("{:?}", r.scope).to_lowercase(),
+                    "content_preview": preview_text(&r.content, 240),
+                    "derived_from": r.provenance.derived_from.as_ref().map(|p| p.0.clone()),
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "stage": "stage2",
+            "provider_model": provider.model_id(),
+            "candidates_total_scanned": total_seen,
+            "candidates_processed": candidates.len(),
+            "records_written": written,
+            "records_skipped": report.skipped,
+            "errors": report.errors,
+            "estimated_input_tokens": report.estimated_input_tokens,
+            "records": rows,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!(
+        "anamnesis extract --no-dry-run  (Stage 2 via {} — mock; no network)",
+        provider.model_id()
+    );
+    println!(
+        "  scanned       : {total_seen} Episode record(s); {} survived Stage-1 gate",
+        candidates.len()
+    );
+    println!("  records made  : {written}");
+    println!(
+        "  records skip  : {} (provider returned empty)",
+        report.skipped
+    );
+    println!(
+        "  llm errors    : {}{}",
+        report.errors.len(),
+        if report.errors.is_empty() {
+            ""
+        } else {
+            " — see audit log"
+        }
+    );
+    println!("  tokens (est)  : {}", report.estimated_input_tokens);
+    for err in &report.errors {
+        eprintln!("  ⚠ {err}");
+    }
+    println!();
+    if written == 0 {
+        println!("(no derived records persisted — nothing to extract)");
+    } else {
+        println!(
+            "{written} derived record(s) written. Use \
+             `anamnesis lineage <record-id>` to inspect the derivation chain."
+        );
+    }
+    Ok(())
+}
+
+fn preview_text(s: &str, max_chars: usize) -> String {
+    preview(s, max_chars)
+}
+
 fn load_episode_records(
     store: &Store,
     source: Option<&str>,
