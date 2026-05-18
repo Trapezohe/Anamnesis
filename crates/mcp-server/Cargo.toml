@@ -36,6 +36,7 @@ anamnesis-adapter-tdai = { workspace = true }
 anamnesis-adapter-openviking = { workspace = true }
 anamnesis-adapter-mempalace = { workspace = true }
 anamnesis-adapter-memori = { workspace = true }
+anamnesis-adapter-memos = { workspace = true }
 anamnesis-adapter-generic-mcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

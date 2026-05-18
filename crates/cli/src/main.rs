@@ -14,6 +14,7 @@ use anamnesis_adapter_hermes::{hermes_adapter, HermesDetector};
 use anamnesis_adapter_letta::{letta_adapter, LettaSqliteDetector};
 use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
 use anamnesis_adapter_memori::{memori_adapter, MemoriDetector};
+use anamnesis_adapter_memos::{memos_adapter, MemosDetector};
 use anamnesis_adapter_mempalace::{mempalace_adapter, MempalaceDetector};
 use anamnesis_adapter_openclaw::{openclaw_adapter, OpenClawDetector};
 use anamnesis_adapter_openviking::{openviking_adapter, OpenVikingDetector};
@@ -706,7 +707,8 @@ async fn cmd_discover() -> Result<()> {
         .register(Box::new(TdaiDetector::new()))
         .register(Box::new(OpenVikingDetector::new()))
         .register(Box::new(MempalaceDetector::new()))
-        .register(Box::new(MemoriDetector::new()));
+        .register(Box::new(MemoriDetector::new()))
+        .register(Box::new(MemosDetector::new()));
     let found = discovery.detect_all(&DetectOpts::default()).await;
     if found.is_empty() {
         println!("no known memory sources found at default locations");
@@ -1092,8 +1094,21 @@ async fn cmd_import(
             )
             .await
         }
+        anamnesis_adapter_memos::ADAPTER_ID => {
+            let adapter = memos_adapter(location.clone(), instance);
+            run_import(
+                data_dir,
+                &adapter,
+                dry_run,
+                no_embed,
+                Some(&location),
+                source_was_explicit,
+                scan_opts,
+            )
+            .await
+        }
         other => Err(anyhow!(
-            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, ghast, tdai, openviking, mempalace, memori, generic-mcp"
+            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, ghast, tdai, openviking, mempalace, memori, memos, generic-mcp"
         )),
     }
 }
@@ -1189,6 +1204,7 @@ fn is_known_adapter(adapter_id: &str) -> bool {
             | anamnesis_adapter_openviking::ADAPTER_ID
             | anamnesis_adapter_mempalace::ADAPTER_ID
             | anamnesis_adapter_memori::ADAPTER_ID
+            | anamnesis_adapter_memos::ADAPTER_ID
             | anamnesis_adapter_generic_mcp::ADAPTER_ID
     )
 }
@@ -1209,6 +1225,7 @@ fn default_path_for(adapter_id: &str) -> Result<PathBuf> {
         anamnesis_adapter_openviking::ADAPTER_ID => home_join(&[".openviking", "data"]),
         anamnesis_adapter_mempalace::ADAPTER_ID => home_join(&[".mempalace"]),
         anamnesis_adapter_memori::ADAPTER_ID => home_join(&[".memori", "memori.db"]),
+        anamnesis_adapter_memos::ADAPTER_ID => home_join(&[".memos"]),
         other => Err(anyhow!("no default path for adapter {other:?}")),
     }
 }
