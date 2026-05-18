@@ -23,6 +23,7 @@ anamnesis-adapter-claude-code = { workspace = true }
 anamnesis-adapter-codex = { workspace = true }
 anamnesis-adapter-mem0 = { workspace = true }
 anamnesis-adapter-letta = { workspace = true }
+anamnesis-adapter-hermes = { workspace = true }
 anamnesis-adapter-generic-mcp = { workspace = true }
 anamnesis-mcp-server = { workspace = true, default-features = false }
 clap = { workspace = true }
