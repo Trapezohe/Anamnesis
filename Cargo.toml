@@ -34,6 +34,8 @@ authors = ["The Anamnesis Authors"]
 repository = "https://github.com/Trapezohe/Anamnesis"
 homepage = "https://github.com/Trapezohe/Anamnesis"
 readme = "README.md"
+categories = ["command-line-utilities", "database", "development-tools"]
+keywords = ["memory", "agent", "mcp", "rag"]
 
 [workspace.dependencies]
 # Internal crates
