@@ -74,7 +74,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -112,7 +112,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -147,7 +147,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -185,7 +185,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -220,7 +220,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -255,7 +255,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -294,7 +294,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -329,7 +329,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -364,7 +364,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -399,7 +399,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -434,7 +434,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -469,7 +469,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -504,7 +504,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -539,7 +539,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -574,7 +574,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -609,7 +609,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -644,7 +644,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -679,7 +679,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -714,7 +714,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -735,10 +735,16 @@ jobs:
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
         run: |
           crate=anamnesis-adapter-generic-mcp
+          # generic-mcp's dev-dependencies include anamnesis-mcp-server (for the
+          # loopback integration test). mcp-server publishes AFTER this step, so
+          # at this point it isn't on crates.io yet — cargo's local-verify build
+          # would fail "no matching package named anamnesis-mcp-server". Skip
+          # verify; dev-deps aren't shipped in the .crate package anyway.
+          publish_flags="--no-verify"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p $crate || true
+            cargo publish --dry-run $publish_flags -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
+            out=$(cargo publish $publish_flags -p $crate 2>&1) || true
             echo "$out"
             if echo "$out" | grep -qE 'already uploaded|already exists'; then
               echo "✓ $crate is already on crates.io — skipping (idempotent)"
@@ -749,7 +755,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -787,7 +793,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
@@ -825,7 +831,7 @@ jobs:
               # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
               echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
               sleep 660
-              out2=$(cargo publish -p $crate 2>&1) || true
+              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
               echo "$out2"
               if echo "$out2" | grep -qE 'already uploaded|already exists'; then
                 echo "✓ $crate now on crates.io (race with another publisher) — skipping"
