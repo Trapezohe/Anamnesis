@@ -317,6 +317,7 @@ dependencies = [
  "anamnesis-adapter-tdai",
  "anamnesis-core",
  "anamnesis-embedder",
+ "anamnesis-extractor",
  "anamnesis-importer",
  "anamnesis-mcp-server",
  "anamnesis-search",
@@ -364,6 +365,19 @@ dependencies = [
  "chrono",
  "fastembed",
  "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "anamnesis-extractor"
+version = "0.0.2"
+dependencies = [
+ "anamnesis-core",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
