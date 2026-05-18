@@ -237,6 +237,12 @@ enum Command {
         /// aggressively.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
+        /// Total retry attempts per provider call (including the
+        /// first). Default 3. Set to 1 to disable retry. Honors
+        /// `Retry-After` headers when longer than the computed
+        /// exponential backoff. `mock` provider ignores this.
+        #[arg(long, default_value_t = 3)]
+        max_retries: u32,
     },
 
     /// Show the `provenance.derived_from` lineage of a record. Walks
@@ -509,6 +515,7 @@ async fn main() -> Result<()> {
             max_llm_calls,
             yes,
             concurrency,
+            max_retries,
         } => {
             cmd_extract(
                 &data_dir,
@@ -526,6 +533,7 @@ async fn main() -> Result<()> {
                 max_llm_calls,
                 yes,
                 concurrency,
+                max_retries,
             )
             .await
         }
@@ -1956,6 +1964,7 @@ async fn cmd_extract(
     max_llm_calls: usize,
     yes: bool,
     concurrency: usize,
+    max_retries: u32,
 ) -> Result<()> {
     let target_kind = anamnesis_extractor::ExtractKind::parse(kind_str).ok_or_else(|| {
         anyhow!("unknown extract kind {kind_str:?}; supported: fact, preference, feedback, skill")
@@ -1985,6 +1994,7 @@ async fn cmd_extract(
             max_llm_calls,
             yes,
             concurrency,
+            max_retries,
         )
         .await;
     }
@@ -2113,6 +2123,7 @@ async fn run_stage2_path(
     max_llm_calls: usize,
     yes: bool,
     concurrency: usize,
+    max_retries: u32,
 ) -> Result<()> {
     use anamnesis_extractor::cost_preview_line;
 
@@ -2130,7 +2141,7 @@ async fn run_stage2_path(
         ));
     }
 
-    let (provider, banner) = build_provider(provider_id, model, api_base)?;
+    let (provider, banner) = build_provider(provider_id, model, api_base, max_retries)?;
 
     // §-1.5 #6 plan banner — always printed BEFORE any provider call.
     let estimated_tokens: usize = candidates
@@ -2200,6 +2211,7 @@ async fn run_stage2_path(
         "provider_model": provider.model_id(),
         "target_kind": target_kind.as_str(),
         "concurrency": concurrency,
+        "max_retries": max_retries,
         "candidates_total_scanned": total_seen,
         "candidates_processed": candidates.len(),
         "records_written": written,
@@ -2301,6 +2313,7 @@ fn build_provider(
     provider_id: &str,
     model: &str,
     api_base: Option<&str>,
+    max_retries: u32,
 ) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
     match provider_id {
         "mock" => Ok((
@@ -2309,8 +2322,8 @@ fn build_provider(
              deterministic output."
                 .into(),
         )),
-        "openai" => build_openai_provider(model, api_base),
-        "anthropic" => build_anthropic_provider(model, api_base),
+        "openai" => build_openai_provider(model, api_base, max_retries),
+        "anthropic" => build_anthropic_provider(model, api_base, max_retries),
         other => Err(anyhow!(
             "unknown --provider {other:?}; supported: mock, openai, anthropic"
         )),
@@ -2321,6 +2334,7 @@ fn build_provider(
 fn build_anthropic_provider(
     model: &str,
     api_base: Option<&str>,
+    max_retries: u32,
 ) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
     let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
         anyhow!(
@@ -2328,7 +2342,9 @@ fn build_anthropic_provider(
              Set it before running, or use `--provider mock`."
         )
     })?;
-    let mut p = anamnesis_extractor::AnthropicProvider::new(model).with_api_key(api_key);
+    let mut p = anamnesis_extractor::AnthropicProvider::new(model)
+        .with_api_key(api_key)
+        .with_max_retries(max_retries);
     // Priority: --api-base CLI flag > ANTHROPIC_API_BASE env > default.
     let resolved_base = api_base
         .map(|s| s.to_string())
@@ -2337,10 +2353,11 @@ fn build_anthropic_provider(
         p = p.with_api_base(base);
     }
     let banner = format!(
-        "Stage 2 will run via Anthropic Messages API at {} (model={}). \
+        "Stage 2 will run via Anthropic Messages API at {} (model={}, max_retries={}). \
          Each candidate is one HTTP POST.",
         p.api_base(),
         p.model_name(),
+        p.retry_policy().max_attempts,
     );
     Ok((Box::new(p), banner))
 }
@@ -2349,6 +2366,7 @@ fn build_anthropic_provider(
 fn build_anthropic_provider(
     _model: &str,
     _api_base: Option<&str>,
+    _max_retries: u32,
 ) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
     Err(anyhow!(
         "`--provider anthropic` requires the `anthropic-provider` cargo feature, \
@@ -2361,6 +2379,7 @@ fn build_anthropic_provider(
 fn build_openai_provider(
     model: &str,
     api_base: Option<&str>,
+    max_retries: u32,
 ) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
     let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
         anyhow!(
@@ -2368,7 +2387,9 @@ fn build_openai_provider(
              Set it before running, or use `--provider mock`."
         )
     })?;
-    let mut p = anamnesis_extractor::OpenAiProvider::new(model).with_api_key(api_key);
+    let mut p = anamnesis_extractor::OpenAiProvider::new(model)
+        .with_api_key(api_key)
+        .with_max_retries(max_retries);
     // Priority: --api-base CLI flag > OPENAI_API_BASE env > library default.
     let resolved_base = api_base
         .map(|s| s.to_string())
@@ -2377,10 +2398,11 @@ fn build_openai_provider(
         p = p.with_api_base(base);
     }
     let banner = format!(
-        "Stage 2 will run via OpenAI-compatible provider at {} (model={}). \
+        "Stage 2 will run via OpenAI-compatible provider at {} (model={}, max_retries={}). \
          Each candidate is one HTTP POST.",
         p.api_base(),
         p.model_name(),
+        p.retry_policy().max_attempts,
     );
     Ok((Box::new(p), banner))
 }
@@ -2389,6 +2411,7 @@ fn build_openai_provider(
 fn build_openai_provider(
     _model: &str,
     _api_base: Option<&str>,
+    _max_retries: u32,
 ) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
     Err(anyhow!(
         "`--provider openai` requires the `openai-provider` cargo feature, \

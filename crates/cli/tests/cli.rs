@@ -1289,3 +1289,49 @@ fn extract_unknown_provider_lists_anthropic_in_supported() {
         .failure()
         .stderr(contains("unknown --provider").and(contains("anthropic")));
 }
+
+#[test]
+fn extract_max_retries_lands_in_audit_log() {
+    // Round 48: --max-retries flag plumbs into both the provider's
+    // RetryPolicy AND into the per-run audit log entry.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run", "--max-retries", "7"])
+        .assert()
+        .success();
+    let audit_path = dir.path().join("audit").join("stage2.jsonl");
+    let body = std::fs::read_to_string(&audit_path).unwrap();
+    let line = body.lines().next().expect("at least one audit line");
+    let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        entry["max_retries"].as_u64(),
+        Some(7),
+        "--max-retries must be recorded in stage2.jsonl"
+    );
+}
+
+#[test]
+fn extract_default_max_retries_is_three() {
+    // Without --max-retries, the audit log captures the default (3).
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run"])
+        .assert()
+        .success();
+    let audit_path = dir.path().join("audit").join("stage2.jsonl");
+    let body = std::fs::read_to_string(&audit_path).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["max_retries"].as_u64(), Some(3));
+}
