@@ -317,6 +317,13 @@ enum Command {
         /// Emit JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+        /// Exit with code 1 if any registered source's `health()`
+        /// returned `ok = false`. Useful in CI gates. Off by default —
+        /// `doctor` is also an inspection command you might run on a
+        /// partially-set-up machine where some sources legitimately
+        /// have missing paths yet.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -588,6 +595,7 @@ async fn main() -> Result<()> {
             instance,
             include_unregistered,
             json,
+            strict,
         } => {
             cmd_doctor(
                 &data_dir,
@@ -595,6 +603,7 @@ async fn main() -> Result<()> {
                 instance.as_deref(),
                 include_unregistered,
                 json,
+                strict,
             )
             .await
         }
@@ -2509,12 +2518,14 @@ fn read_audit_log(data_dir: &std::path::Path) -> Result<Vec<serde_json::Value>> 
 ///
 /// With `--include-unregistered`, also runs the discovery detectors so
 /// the output names adapters that *could* be wired up but aren't yet.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_doctor(
     data_dir: &std::path::Path,
     filter_source: Option<&str>,
     filter_instance: Option<&str>,
     include_unregistered: bool,
     json: bool,
+    strict: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let registered = store.list_sources_with_counts()?;
@@ -2602,6 +2613,15 @@ async fn cmd_doctor(
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
+        // Honor --strict in json mode too — print the JSON first so the
+        // caller can still parse stdout, then exit non-zero. This lets
+        // CI gates do `anamnesis doctor --json --strict | tee report.json`.
+        let bad_count = rows.iter().filter(|r| r.registered && !r.ok).count();
+        if strict && bad_count > 0 {
+            return Err(anyhow!(
+                "{bad_count} registered source(s) reported unhealthy under --strict"
+            ));
+        }
         return Ok(());
     }
 
@@ -2672,6 +2692,11 @@ async fn cmd_doctor(
     let bad_count = rows.iter().filter(|r| r.registered && !r.ok).count();
     let unreg_count = rows.iter().filter(|r| !r.registered).count();
     println!("Summary: {ok_count} healthy, {bad_count} unhealthy, {unreg_count} unregistered.");
+    if strict && bad_count > 0 {
+        return Err(anyhow!(
+            "{bad_count} registered source(s) reported unhealthy under --strict"
+        ));
+    }
     Ok(())
 }
 

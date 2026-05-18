@@ -406,10 +406,11 @@ anamnesis search <query> [--source X] [--kind K] [--scope S] [--limit N] [--mode
 anamnesis extract [--kind fact|preference|feedback|skill] [--no-dry-run]
                   [--provider mock|openai|anthropic] [--model NAME] [--api-base URL]
                   [--threshold 0.4] [--limit 25] [--max-llm-calls 100]
-                  [--concurrency 1] [--yes] [--explain] [--json]
+                  [--concurrency 1] [--max-retries 3] [--yes] [--explain] [--json]
 anamnesis lineage <record-id> [--children] [--limit N] [--json]
 anamnesis audit list [--limit N] [--json]
 anamnesis audit show <line-no|last> [--json]
+anamnesis doctor [--source X] [--instance Y] [--include-unregistered] [--strict] [--json]
 anamnesis export [--format jsonl|csv] [--out FILE] [--source X]
 anamnesis verify [--repair]
 anamnesis model list/use/install/rebuild
