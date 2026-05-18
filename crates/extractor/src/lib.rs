@@ -37,6 +37,7 @@ pub mod gate;
 pub mod openai;
 pub mod prompt;
 pub mod provider;
+pub mod retry;
 pub mod stage2;
 
 use anamnesis_core::model::{AnamnesisRecord, Kind, RecordId};
@@ -51,6 +52,7 @@ pub use gate::{default_gate, DefaultGate, Stage1Gate, Stage1Score};
 pub use openai::{OpenAiProvider, DEFAULT_API_BASE, DEFAULT_TEMPERATURE, DEFAULT_TIMEOUT_SECS};
 pub use prompt::build_prompt;
 pub use provider::{cost_preview_line, LlmProvider, MockProvider};
+pub use retry::{compute_delay, retry_with_backoff, RetryPolicy, RetryStep};
 pub use stage2::{
     parse_extracted_items, run_stage2, run_stage2_concurrent, ExtractedItem, Stage2Report,
     EXTRACTOR_ADAPTER_ID,

@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::LlmProvider;
+use crate::retry::{retry_with_backoff, RetryPolicy, RetryStep};
 
 /// Default base URL — points at OpenAI itself. Override for any other
 /// vendor that speaks the same wire format.
@@ -50,6 +51,7 @@ pub struct OpenAiProvider {
     api_key: Option<String>,
     temperature: f32,
     timeout_secs: u64,
+    retry: RetryPolicy,
 }
 
 impl OpenAiProvider {
@@ -66,6 +68,7 @@ impl OpenAiProvider {
             api_key: None,
             temperature: DEFAULT_TEMPERATURE,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -94,6 +97,21 @@ impl OpenAiProvider {
         self
     }
 
+    /// Override the retry policy. Defaults to 3 attempts with
+    /// exponential backoff (1s → 2s, capped at 16s). Set `max_attempts
+    /// = 1` to disable retry entirely.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// Convenience: cap the retry policy at `n` attempts (keeps the
+    /// default backoff schedule).
+    pub fn with_max_retries(mut self, n: u32) -> Self {
+        self.retry.max_attempts = n.max(1);
+        self
+    }
+
     /// The underlying model name (e.g. `"gpt-4o-mini"`) without the
     /// `"openai:"` prefix. Tests use this for assertion.
     pub fn model_name(&self) -> &str {
@@ -103,6 +121,11 @@ impl OpenAiProvider {
     /// Resolved base URL.
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// Resolved retry policy (for audit-log visibility).
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
     }
 }
 
@@ -177,38 +200,65 @@ impl LlmProvider for OpenAiProvider {
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()
             .map_err(|e| Error::Other(format!("openai client build: {e}")))?;
-        let mut req = client.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("openai request: {e}")))?;
-        let status = resp.status();
-        let raw = resp
-            .text()
-            .await
-            .map_err(|e| Error::Other(format!("openai read body: {e}")))?;
-        if !status.is_success() {
-            return Err(Error::Other(format!(
-                "openai HTTP {status}: {}",
-                truncate(&raw, 400)
-            )));
-        }
-        let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
-            Error::Other(format!(
-                "openai response parse: {e}; body={}",
-                truncate(&raw, 200)
-            ))
-        })?;
-        let first = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Other("openai response had zero choices".into()))?;
-        Ok(first.message.content)
+
+        retry_with_backoff(self.retry, |_attempt| async {
+            let mut req = client.post(&url).json(&body);
+            if let Some(key) = &self.api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Network-level errors (DNS, refused, timeout) are
+                    // worth retrying — they're transient by definition.
+                    return RetryStep::Retry {
+                        message: format!("openai request: {e}"),
+                        retry_after: None,
+                    };
+                }
+            };
+            let status = resp.status();
+            let retry_after_hint = retry_after_from_headers(resp.headers());
+            let raw = match resp.text().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return RetryStep::Retry {
+                        message: format!("openai read body: {e}"),
+                        retry_after: retry_after_hint,
+                    };
+                }
+            };
+            if status.as_u16() == 429 || status.is_server_error() {
+                return RetryStep::Retry {
+                    message: format!("openai HTTP {status}: {}", truncate(&raw, 400)),
+                    retry_after: retry_after_hint,
+                };
+            }
+            if !status.is_success() {
+                return RetryStep::Fatal(format!("openai HTTP {status}: {}", truncate(&raw, 400)));
+            }
+            let parsed: ChatResponse = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    return RetryStep::Fatal(format!(
+                        "openai response parse: {e}; body={}",
+                        truncate(&raw, 200)
+                    ));
+                }
+            };
+            match parsed.choices.into_iter().next() {
+                Some(first) => RetryStep::Done(first.message.content),
+                None => RetryStep::Fatal("openai response had zero choices".into()),
+            }
+        })
+        .await
     }
+}
+
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 fn truncate(s: &str, max: usize) -> String {
