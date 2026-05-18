@@ -22,6 +22,7 @@ members = [
     "crates/adapter-memori",
     "crates/adapter-memos",
     "crates/adapter-memary",
+    "crates/extractor",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ anamnesis-store = { path = "crates/store", version = "0.0.2" }
 anamnesis-embedder = { path = "crates/embedder", version = "0.0.2", default-features = false }
 anamnesis-search = { path = "crates/search", version = "0.0.2" }
 anamnesis-importer = { path = "crates/importer", version = "0.0.2" }
+anamnesis-extractor = { path = "crates/extractor", version = "0.0.2" }
 anamnesis-adapter-claude-code = { path = "crates/adapter-claude-code", version = "0.0.2" }
 anamnesis-adapter-codex = { path = "crates/adapter-codex", version = "0.0.2" }
 anamnesis-adapter-generic-mcp = { path = "crates/adapter-generic-mcp", version = "0.0.2" }

@@ -157,6 +157,43 @@ enum Command {
         source: Option<String>,
     },
 
+    /// §-1.5 PR-6 stage 1: deterministic gate over Episode records.
+    ///
+    /// Lists which records would be handed to Stage 2 (the LLM step,
+    /// not yet implemented). No LLM calls happen during this command —
+    /// it's pure inspection. Per §-1.2 #5, Anamnesis never silently
+    /// calls an LLM, and this command is the surface that makes the
+    /// future Stage 2 explicit.
+    Extract {
+        /// Target Kind to distill toward: fact | preference | feedback | skill.
+        #[arg(long, default_value = "fact")]
+        kind: String,
+        /// Restrict to one source (adapter id).
+        #[arg(long)]
+        source: Option<String>,
+        /// Restrict to a specific source instance.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Minimum Stage-1 score to surface (0.0–1.0; default 0.4).
+        #[arg(long, default_value_t = 0.4)]
+        threshold: f32,
+        /// Max candidates to list (top-N by score).
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Show per-candidate gate rationale.
+        #[arg(long)]
+        explain: bool,
+        /// Emit JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+        /// Opt-out of the (currently required) dry-run mode. Stage 2 is
+        /// not yet implemented; passing this flag will simply error.
+        /// It exists as a placeholder so the CLI surface stays stable
+        /// once Stage 2 lands and starts honoring it.
+        #[arg(long)]
+        no_dry_run: bool,
+    },
+
     /// Run as an MCP server. Default = stdio; `--sse <port>` binds the
     /// HTTP/JSON-RPC transport on `127.0.0.1:<port>` (use `0` for an
     /// ephemeral port — the chosen port is printed to stderr).
@@ -365,6 +402,26 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Extract {
+            kind,
+            source,
+            instance,
+            threshold,
+            limit,
+            explain,
+            json,
+            no_dry_run,
+        } => cmd_extract(
+            &data_dir,
+            &kind,
+            source.as_deref(),
+            instance.as_deref(),
+            threshold,
+            limit,
+            explain,
+            json,
+            !no_dry_run,
+        ),
         Command::Model(sub) => cmd_model(&data_dir, sub).await,
         Command::Serve { sse, token } => {
             cmd_serve(&data_dir, sse, token, config.server.allow_admin_tools).await
@@ -1757,6 +1814,200 @@ async fn cmd_search(
         }
     }
     Ok(())
+}
+
+/// `anamnesis extract` — §-1.5 PR-6 Stage 1 deterministic gate.
+///
+/// Today this is **inspection-only**. It enumerates every `Episode` record
+/// in the local store, runs the default Stage-1 gate over each, and prints
+/// the top-N surviving candidates with their scores. No LLM calls happen.
+///
+/// Per §-1.5 #6 + §-1.2 #5: any future Stage 2 (the actual LLM-driven
+/// distillation) must remain a separate explicit command, must show a
+/// cost preview up front, and must never run inside `anamnesis import`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_extract(
+    data_dir: &std::path::Path,
+    kind_str: &str,
+    source: Option<&str>,
+    instance: Option<&str>,
+    threshold: f32,
+    limit: usize,
+    explain: bool,
+    json: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let target_kind = anamnesis_extractor::ExtractKind::parse(kind_str).ok_or_else(|| {
+        anyhow!("unknown extract kind {kind_str:?}; supported: fact, preference, feedback, skill")
+    })?;
+    if !dry_run {
+        // Stage 2 isn't wired yet — be explicit so users aren't surprised.
+        return Err(anyhow!(
+            "Stage 2 (the LLM-driven extraction step) is not yet implemented. \
+             Drop the `--no-dry-run` flag to inspect Stage-1 candidates instead."
+        ));
+    }
+
+    use anamnesis_extractor::Stage1Gate as _;
+    let store = Store::open(db_path(data_dir))?;
+    let episodes = load_episode_records(&store, source, instance)?;
+    let total_seen = episodes.len();
+    let gate = anamnesis_extractor::default_gate();
+    let candidates = anamnesis_extractor::stage1_select(episodes, &gate, threshold, limit);
+
+    if json {
+        let rows: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "record_id": c.record.id.0,
+                    "adapter": c.record.source.adapter,
+                    "instance": c.record.source.instance,
+                    "created_at": c.record.created_at.to_rfc3339(),
+                    "score": c.score,
+                    "rationale": if explain { c.rationale.clone() } else { vec![] },
+                    "content_preview": preview(&c.record.content, 240),
+                })
+            })
+            .collect();
+        let plan = anamnesis_extractor::plan_stage2(
+            candidates.clone(),
+            target_kind,
+            "(stage-2 not configured)",
+        );
+        let out = serde_json::json!({
+            "stage1": {
+                "gate": gate.name(),
+                "threshold": threshold,
+                "limit": limit,
+                "candidates_total_scanned": total_seen,
+                "candidates_surfaced": candidates.len(),
+                "candidates": rows,
+            },
+            "stage2_plan": {
+                "target_kind": target_kind.as_str(),
+                "estimated_llm_calls": plan.estimated_llm_calls,
+                "summary": plan.summary(),
+                "status": "not-yet-implemented",
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("anamnesis extract --dry-run  (Stage 2 not yet wired; this is an inspection)");
+    println!(
+        "  target kind   : {} → Kind::{:?}",
+        target_kind.as_str(),
+        target_kind.target_kind()
+    );
+    println!("  gate          : {}", gate.name());
+    println!("  threshold     : {threshold}");
+    println!("  limit         : {limit}");
+    if let Some(s) = source {
+        println!(
+            "  source filter : {s}{}",
+            instance.map(|i| format!("::{i}")).unwrap_or_default()
+        );
+    }
+    println!();
+    if candidates.is_empty() {
+        println!(
+            "no Episode records survived the Stage-1 gate ({total_seen} scanned, threshold={threshold})"
+        );
+        println!();
+        println!("Stage 2 plan: nothing to extract.");
+        return Ok(());
+    }
+    println!(
+        "{} of {} Episode records survived the Stage-1 gate. Top {}:",
+        candidates.len(),
+        total_seen,
+        candidates.len().min(limit)
+    );
+    println!();
+    for (i, c) in candidates.iter().enumerate() {
+        println!(
+            "[{:>2}] score={:.2}  {}  ({})",
+            i + 1,
+            c.score,
+            c.record.source.adapter,
+            c.record.created_at.to_rfc3339(),
+        );
+        println!("     id={}", c.record.id.0);
+        println!("     {}", preview(&c.record.content, 240));
+        if explain {
+            for line in &c.rationale {
+                println!("       ▸ {line}");
+            }
+        }
+        println!();
+    }
+    let plan = anamnesis_extractor::plan_stage2(
+        candidates.clone(),
+        target_kind,
+        "(stage-2 not configured)",
+    );
+    println!("{}", plan.summary());
+    println!("(Stage 2 is not yet implemented; run again once it lands.)");
+    Ok(())
+}
+
+/// Read every Episode record from the local store, optionally filtered by
+/// adapter / instance. Used by `cmd_extract`. Uses paged id listing
+/// followed by per-id `get_record`; fine for ≤10k-record installs which
+/// is what we target in Phase 1.
+fn load_episode_records(
+    store: &Store,
+    source: Option<&str>,
+    instance: Option<&str>,
+) -> Result<Vec<anamnesis_core::AnamnesisRecord>> {
+    use anamnesis_core::model::{Kind, RecordId};
+    const PAGE: u32 = 500;
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let (ids, next) = store.list_record_ids_paged(cursor.as_deref(), PAGE)?;
+        if ids.is_empty() {
+            break;
+        }
+        for id_str in &ids {
+            let rid = RecordId(id_str.clone());
+            if let Some(record) = store.get_record(&rid)? {
+                if record.kind != Kind::Episode {
+                    continue;
+                }
+                if let Some(src) = source {
+                    if record.source.adapter != src {
+                        continue;
+                    }
+                }
+                if let Some(inst) = instance {
+                    if record.source.instance.as_deref() != Some(inst) {
+                        continue;
+                    }
+                }
+                out.push(record);
+            }
+        }
+        cursor = next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn preview(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
+    }
+    let head: String = cleaned.chars().take(max_chars).collect();
+    format!("{head}…")
 }
 
 async fn run_search(
