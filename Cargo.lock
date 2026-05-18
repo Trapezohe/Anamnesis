@@ -114,6 +114,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-adapter-ghast"
+version = "0.0.2"
+dependencies = [
+ "anamnesis-core",
+ "async-trait",
+ "blake3",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "anamnesis-adapter-hermes"
 version = "0.0.2"
 dependencies = [
@@ -187,6 +203,7 @@ dependencies = [
  "anamnesis-adapter-claude-code",
  "anamnesis-adapter-codex",
  "anamnesis-adapter-generic-mcp",
+ "anamnesis-adapter-ghast",
  "anamnesis-adapter-hermes",
  "anamnesis-adapter-letta",
  "anamnesis-adapter-mem0",
@@ -271,6 +288,7 @@ dependencies = [
  "anamnesis-adapter-claude-code",
  "anamnesis-adapter-codex",
  "anamnesis-adapter-generic-mcp",
+ "anamnesis-adapter-ghast",
  "anamnesis-adapter-hermes",
  "anamnesis-adapter-letta",
  "anamnesis-adapter-mem0",
