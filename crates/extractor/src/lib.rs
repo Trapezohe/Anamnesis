@@ -30,6 +30,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "anthropic-provider")]
+pub mod anthropic;
 pub mod gate;
 #[cfg(feature = "openai-provider")]
 pub mod openai;
@@ -39,6 +41,11 @@ pub mod stage2;
 
 use anamnesis_core::model::{AnamnesisRecord, Kind, RecordId};
 
+#[cfg(feature = "anthropic-provider")]
+pub use anthropic::{
+    AnthropicProvider, ANTHROPIC_DEFAULT_API_BASE, ANTHROPIC_DEFAULT_MAX_TOKENS,
+    ANTHROPIC_DEFAULT_TEMPERATURE, ANTHROPIC_DEFAULT_TIMEOUT_SECS, ANTHROPIC_VERSION_HEADER,
+};
 pub use gate::{default_gate, DefaultGate, Stage1Gate, Stage1Score};
 #[cfg(feature = "openai-provider")]
 pub use openai::{OpenAiProvider, DEFAULT_API_BASE, DEFAULT_TEMPERATURE, DEFAULT_TIMEOUT_SECS};

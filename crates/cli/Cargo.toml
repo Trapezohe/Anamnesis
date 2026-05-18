@@ -47,7 +47,7 @@ futures = { workspace = true }
 rusqlite = { workspace = true }
 
 [features]
-default = ["local-fastembed", "sse", "openai-provider"]
+default = ["local-fastembed", "sse", "openai-provider", "anthropic-provider"]
 local-fastembed = ["anamnesis-embedder/local-fastembed", "anamnesis-mcp-server/local-fastembed"]
 # Wires `anamnesis serve --sse <port>` to the in-process MCP HTTP
 # transport. Off → CLI still builds, but `--sse` errors at runtime.
@@ -57,6 +57,10 @@ sse = ["anamnesis-mcp-server/sse"]
 # `reqwest` and the openai provider path errors at runtime with a
 # pointer to the feature flag.
 openai-provider = ["anamnesis-extractor/openai-provider"]
+# Pulls in the native Anthropic Messages API provider for
+# `anamnesis extract --provider anthropic`. Off → the anthropic path
+# errors at runtime with a feature-flag hint.
+anthropic-provider = ["anamnesis-extractor/anthropic-provider"]
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -13,6 +13,10 @@ repository.workspace = true
 # pulls `reqwest` so consumers that don't need it (e.g. tests, the
 # MockProvider path) stay dep-light.
 openai-provider = ["dep:reqwest"]
+# Native Anthropic Messages API provider. Different wire format from
+# OpenAI (`/v1/messages` not `/v1/chat/completions`, `x-api-key` not
+# bearer auth), so it gets its own feature flag. Reuses `reqwest`.
+anthropic-provider = ["dep:reqwest"]
 
 [dependencies]
 anamnesis-core = { workspace = true }

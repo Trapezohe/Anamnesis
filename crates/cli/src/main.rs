@@ -208,11 +208,18 @@ enum Command {
         /// `gpt-4o-mini`, `llama3.2:3b`). Ignored for `mock`.
         #[arg(long, default_value = "gpt-4o-mini")]
         model: String,
-        /// OpenAI-compatible API base URL (e.g.
-        /// `https://api.openai.com/v1`, `http://localhost:11434/v1`
-        /// for Ollama). Falls back to `OPENAI_API_BASE` env, then
-        /// the OpenAI default.
-        #[arg(long, env = "OPENAI_API_BASE")]
+        /// Provider-specific API base URL.
+        ///
+        /// For `--provider openai`: e.g. `https://api.openai.com/v1`,
+        /// `http://localhost:11434/v1` for Ollama. Falls back to
+        /// `OPENAI_API_BASE` env.
+        ///
+        /// For `--provider anthropic`: e.g. `https://api.anthropic.com`.
+        /// Falls back to `ANTHROPIC_API_BASE` env.
+        ///
+        /// Each provider has its own default; omit unless you're
+        /// proxying or using a non-stock endpoint.
+        #[arg(long)]
         api_base: Option<String>,
         /// Safety cap: refuse to start Stage 2 if Stage 1 surfaced
         /// more than this many candidates. Default 100. Bypass with
@@ -2303,10 +2310,51 @@ fn build_provider(
                 .into(),
         )),
         "openai" => build_openai_provider(model, api_base),
+        "anthropic" => build_anthropic_provider(model, api_base),
         other => Err(anyhow!(
-            "unknown --provider {other:?}; supported: mock, openai"
+            "unknown --provider {other:?}; supported: mock, openai, anthropic"
         )),
     }
+}
+
+#[cfg(feature = "anthropic-provider")]
+fn build_anthropic_provider(
+    model: &str,
+    api_base: Option<&str>,
+) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+        anyhow!(
+            "ANTHROPIC_API_KEY environment variable is required for `--provider anthropic`. \
+             Set it before running, or use `--provider mock`."
+        )
+    })?;
+    let mut p = anamnesis_extractor::AnthropicProvider::new(model).with_api_key(api_key);
+    // Priority: --api-base CLI flag > ANTHROPIC_API_BASE env > default.
+    let resolved_base = api_base
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ANTHROPIC_API_BASE").ok());
+    if let Some(base) = resolved_base {
+        p = p.with_api_base(base);
+    }
+    let banner = format!(
+        "Stage 2 will run via Anthropic Messages API at {} (model={}). \
+         Each candidate is one HTTP POST.",
+        p.api_base(),
+        p.model_name(),
+    );
+    Ok((Box::new(p), banner))
+}
+
+#[cfg(not(feature = "anthropic-provider"))]
+fn build_anthropic_provider(
+    _model: &str,
+    _api_base: Option<&str>,
+) -> Result<(Box<dyn anamnesis_extractor::LlmProvider>, String)> {
+    Err(anyhow!(
+        "`--provider anthropic` requires the `anthropic-provider` cargo feature, \
+         which is on by default. Rebuild with `cargo build --features anthropic-provider` \
+         (or `--all-features`) and try again."
+    ))
 }
 
 #[cfg(feature = "openai-provider")]
@@ -2321,7 +2369,11 @@ fn build_openai_provider(
         )
     })?;
     let mut p = anamnesis_extractor::OpenAiProvider::new(model).with_api_key(api_key);
-    if let Some(base) = api_base {
+    // Priority: --api-base CLI flag > OPENAI_API_BASE env > library default.
+    let resolved_base = api_base
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+    if let Some(base) = resolved_base {
         p = p.with_api_base(base);
     }
     let banner = format!(
