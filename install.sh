@@ -8,10 +8,10 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh | sh
 #   # or, pinning a version:
-#   curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh | ANAMNESIS_VERSION=v0.0.2 sh
+#   curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh | ANAMNESIS_VERSION=v0.1.0 sh
 #
 # Environment overrides:
-#   ANAMNESIS_VERSION   — e.g. `v0.0.2`. Default: latest release tag.
+#   ANAMNESIS_VERSION   — e.g. `v0.1.0`. Default: latest release tag.
 #   ANAMNESIS_PREFIX    — install dir. Default: `$HOME/.local/bin`.
 #   ANAMNESIS_REPO      — `owner/repo`. Default: `Trapezohe/Anamnesis`.
 #

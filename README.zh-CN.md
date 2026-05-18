@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Trapezohe/Anamnesis"><img src="https://img.shields.io/badge/version-v0.0.1-0ea5e9?style=for-the-badge" alt="version"></a>
+  <a href="https://github.com/Trapezohe/Anamnesis/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/version-v0.1.0-0ea5e9?style=for-the-badge" alt="version"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-22c55e?style=for-the-badge" alt="license"></a>
   <img src="https://img.shields.io/badge/rust-%3E%3D1.85-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="rust">
   <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-8b5cf6?style=for-the-badge" alt="MCP">
@@ -41,7 +41,7 @@
 - **统一检索栈**：不代理 mem0 search，不混用 Claude / Codex / Hermes 的向量空间；统一由 Anamnesis chunk、embedding、FTS、vector search、rerank。
 - **可审计 provenance**：每条记录都保留 `adapter / instance / native_id / native_path / raw_hash`，可以回到原始来源。
 
-> 当前状态：`v0.0.1` pre-release。导入、存储、本地 RAG、CLI、MCP 主链路已经可运行，但 CLI/API/schema 在 `0.1.0` 前仍可能调整。
+> 当前状态：`v0.1.0` — 首个稳定的 adapter-contract release。14 个一等 adapter 全部通过共享 `MemoryAdapter` 不变量验证；CLI、MCP server、搜索、以及 Claude Desktop / Cursor / ghast 接入（`anamnesis mcp config`）均已稳定。schema 与 `MemoryAdapter` trait 进入 0.1.x 稳定线，遵循 semver。
 
 ## 技术概览
 

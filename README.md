@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Trapezohe/Anamnesis"><img src="https://img.shields.io/badge/version-v0.0.1-0ea5e9?style=for-the-badge" alt="version"></a>
+  <a href="https://github.com/Trapezohe/Anamnesis/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/version-v0.1.0-0ea5e9?style=for-the-badge" alt="version"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-22c55e?style=for-the-badge" alt="license"></a>
   <img src="https://img.shields.io/badge/rust-%3E%3D1.85-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="rust">
   <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-8b5cf6?style=for-the-badge" alt="MCP">
@@ -41,7 +41,7 @@ It is not another chat interface. It is the memory layer underneath your tools:
 - **Unified retrieval**: no delegated source-system search, no mixed embedding spaces, no opaque ranking across vendors.
 - **Auditable provenance**: every record keeps `adapter / instance / native_id / native_path / raw_hash`.
 
-> Status: `v0.0.1` pre-release. The core import, storage, local RAG, CLI, and MCP loops are working, but CLI/API/schema behavior may still change before `0.1.0`.
+> Status: `v0.1.0` — first stable adapter-contract release. All 14 first-class adapters pass the shared `MemoryAdapter` invariant suite; CLI, MCP server, search, and the Claude Desktop / Cursor / ghast on-ramp (`anamnesis mcp config`) are stable. Schema and `MemoryAdapter` trait are now considered stable across the 0.1.x line; semver applies.
 
 ## Technical Snapshot
 
@@ -326,7 +326,7 @@ Pin a version or change the install prefix:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh \
-  | ANAMNESIS_VERSION=v0.0.2 ANAMNESIS_PREFIX=/usr/local/bin sh
+  | ANAMNESIS_VERSION=v0.1.0 ANAMNESIS_PREFIX=/usr/local/bin sh
 ```
 
 Supported platforms: **Linux x86_64**, **macOS x86_64**, **macOS
@@ -355,7 +355,9 @@ cargo install --path crates/cli
 cargo install --path crates/mcp-server
 ```
 
-Or, when the crates are published to crates.io:
+Or, once the crates are published to crates.io (planned for 0.2.0 —
+the `local-fastembed` feature's ONNX dependencies need a publishing
+story first):
 
 ```bash
 cargo install --locked anamnesis-cli anamnesis-mcp-server
@@ -367,7 +369,7 @@ The GitHub release pages also host the raw tarball + `.sha256`
 sidecar for every platform if you'd rather not pipe `install.sh`:
 
 ```bash
-VERSION=0.0.2
+VERSION=0.1.0
 TARGET=x86_64-unknown-linux-gnu
 curl -L "https://github.com/Trapezohe/Anamnesis/releases/download/v${VERSION}/anamnesis-${VERSION}-${TARGET}.tar.gz" \
   | tar -xz
@@ -377,19 +379,6 @@ sudo install -m 755 "anamnesis-${VERSION}-${TARGET}"/anamnesis-mcp  /usr/local/b
 
 Verify the SHA-256 against the `.sha256` sidecar on the release page
 before extracting if you're cautious about supply chain.
-
-### Install from source
-
-```bash
-git clone https://github.com/Trapezohe/Anamnesis
-cd Anamnesis
-
-# CLI binary
-cargo install --path crates/cli
-
-# MCP server binary
-cargo install --path crates/mcp-server
-```
 
 ### Initialize and import
 
