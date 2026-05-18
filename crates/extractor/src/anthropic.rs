@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::LlmProvider;
+use crate::retry::{retry_with_backoff, RetryPolicy, RetryStep};
 
 /// Default base URL — points at Anthropic's hosted API.
 pub const ANTHROPIC_DEFAULT_API_BASE: &str = "https://api.anthropic.com";
@@ -64,6 +65,7 @@ pub struct AnthropicProvider {
     temperature: f32,
     max_tokens: u32,
     timeout_secs: u64,
+    retry: RetryPolicy,
 }
 
 impl AnthropicProvider {
@@ -77,6 +79,7 @@ impl AnthropicProvider {
             temperature: ANTHROPIC_DEFAULT_TEMPERATURE,
             max_tokens: ANTHROPIC_DEFAULT_MAX_TOKENS,
             timeout_secs: ANTHROPIC_DEFAULT_TIMEOUT_SECS,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -110,6 +113,19 @@ impl AnthropicProvider {
         self
     }
 
+    /// Override the retry policy. Defaults to 3 attempts with
+    /// exponential backoff (1s → 2s, capped at 16s).
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// Convenience: cap retries at `n` total attempts (keeps default backoff).
+    pub fn with_max_retries(mut self, n: u32) -> Self {
+        self.retry.max_attempts = n.max(1);
+        self
+    }
+
     /// Bare model name (no `"anthropic:"` prefix).
     pub fn model_name(&self) -> &str {
         &self.model
@@ -118,6 +134,11 @@ impl AnthropicProvider {
     /// Resolved base URL.
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// Resolved retry policy (for audit-log visibility).
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
     }
 }
 
@@ -184,40 +205,71 @@ impl LlmProvider for AnthropicProvider {
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()
             .map_err(|e| Error::Other(format!("anthropic client build: {e}")))?;
-        let resp = client
-            .post(&url)
-            .header("x-api-key", key)
-            .header("anthropic-version", ANTHROPIC_VERSION_HEADER)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("anthropic request: {e}")))?;
-        let status = resp.status();
-        let raw = resp
-            .text()
-            .await
-            .map_err(|e| Error::Other(format!("anthropic read body: {e}")))?;
-        if !status.is_success() {
-            return Err(Error::Other(format!(
-                "anthropic HTTP {status}: {}",
-                truncate(&raw, 400)
-            )));
-        }
-        let parsed: MessagesResponse = serde_json::from_str(&raw).map_err(|e| {
-            Error::Other(format!(
-                "anthropic response parse: {e}; body={}",
-                truncate(&raw, 200)
-            ))
-        })?;
-        let combined = combine_text_blocks(&parsed.content);
-        if combined.is_empty() {
-            return Err(Error::Other(
-                "anthropic response had no text content blocks".into(),
-            ));
-        }
-        Ok(combined)
+
+        retry_with_backoff(self.retry, |_attempt| async {
+            let resp = match client
+                .post(&url)
+                .header("x-api-key", key)
+                .header("anthropic-version", ANTHROPIC_VERSION_HEADER)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return RetryStep::Retry {
+                        message: format!("anthropic request: {e}"),
+                        retry_after: None,
+                    };
+                }
+            };
+            let status = resp.status();
+            let retry_after_hint = retry_after_from_headers(resp.headers());
+            let raw = match resp.text().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return RetryStep::Retry {
+                        message: format!("anthropic read body: {e}"),
+                        retry_after: retry_after_hint,
+                    };
+                }
+            };
+            if status.as_u16() == 429 || status.is_server_error() {
+                return RetryStep::Retry {
+                    message: format!("anthropic HTTP {status}: {}", truncate(&raw, 400)),
+                    retry_after: retry_after_hint,
+                };
+            }
+            if !status.is_success() {
+                return RetryStep::Fatal(format!(
+                    "anthropic HTTP {status}: {}",
+                    truncate(&raw, 400)
+                ));
+            }
+            let parsed: MessagesResponse = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    return RetryStep::Fatal(format!(
+                        "anthropic response parse: {e}; body={}",
+                        truncate(&raw, 200)
+                    ));
+                }
+            };
+            let combined = combine_text_blocks(&parsed.content);
+            if combined.is_empty() {
+                return RetryStep::Fatal("anthropic response had no text content blocks".into());
+            }
+            RetryStep::Done(combined)
+        })
+        .await
     }
+}
+
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 fn combine_text_blocks(blocks: &[MessagesContentBlock]) -> String {
