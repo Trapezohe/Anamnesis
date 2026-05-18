@@ -32,7 +32,7 @@
 
 ## Overview
 
-**Anamnesis** is an open-source memory infrastructure project for the agent era. It reads memories and sessions from **14 first-class adapters** — agent frameworks (Claude Code, Codex, Hermes, OpenClaw, ghast) and memory systems (mem0, Letta, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary) — plus any MCP-aware project through the Generic MCP adapter, then normalizes them into one local schema, one local database, and one Anamnesis-owned RAG stack.
+**Anamnesis** is an open-source memory infrastructure project for the agent era. It reads memories and sessions from **14 first-class adapters** — agent frameworks (Claude Code, Codex, Hermes, OpenClaw, ghast) and memory systems (mem0, Letta, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary) — plus any MCP-aware project through the Generic MCP adapter, then normalizes them into one local schema, one local database, and one Anamnesis-owned RAG stack. A two-stage **session extractor** distills raw `Episode` records into long-lived `Fact` / `Preference` / `Feedback` / `Skill` records, with every LLM call auditable, gated, and provenance-linked back to the source Episode.
 
 It is not another chat interface. It is the memory layer underneath your tools:
 
@@ -54,6 +54,7 @@ It is not another chat interface. It is the memory layer underneath your tools:
 | Embeddings | Local `fastembed-rs` by default; curated model registry; Voyage cloud provider is explicit opt-in |
 | Protocol | MCP stdio; `anamnesis-mcp --sse` supports loopback HTTP/SSE |
 | Current adapters | 14 first-class: Claude Code, Codex, mem0, Letta, Hermes, OpenClaw, ghast, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary, Generic MCP |
+| Session extractor | §-1.5 PR-6 two-stage (deterministic gate + LLM). Three providers: `mock` (offline, deterministic), `openai` (any Chat-Completions-compatible: OpenAI, Ollama, vLLM, OpenRouter, …), `anthropic` (native Messages API). Per-run audit log at `<data_dir>/audit/stage2.jsonl`; `anamnesis lineage <id>` walks `provenance.derived_from`. |
 | Security posture | Local-first, source provenance, explicit cloud opt-in; MCP admin tool gating is the next P0 hardening step |
 
 ## Supported Sources & Agents
@@ -402,12 +403,97 @@ anamnesis discover
 anamnesis source add/list/remove
 anamnesis import <adapter>[:instance] [--full] [--dry-run] [--no-embed] [--path PATH]
 anamnesis search <query> [--source X] [--kind K] [--scope S] [--limit N] [--mode hybrid|fulltext|vector] [--json]
+anamnesis extract [--kind fact|preference|feedback|skill] [--no-dry-run]
+                  [--provider mock|openai|anthropic] [--model NAME] [--api-base URL]
+                  [--threshold 0.4] [--limit 25] [--max-llm-calls 100]
+                  [--concurrency 1] [--yes] [--explain] [--json]
+anamnesis lineage <record-id> [--children] [--limit N] [--json]
+anamnesis audit list [--limit N] [--json]
+anamnesis audit show <line-no|last> [--json]
 anamnesis export [--format jsonl|csv] [--out FILE] [--source X]
 anamnesis verify [--repair]
 anamnesis model list/use/install/rebuild
 anamnesis serve
 anamnesis migrate
 ```
+
+## Session Extractor (§-1.5 PR-6)
+
+Anamnesis distills raw conversation `Episode` records into long-lived
+`Fact` / `Preference` / `Feedback` / `Skill` records via a two-stage,
+auditable pipeline.
+
+**Stage 1** is a deterministic gate (`anamnesis-extractor::gate`). It
+scores every Episode in the store on three local signals — content
+length (40-char floor, 600-char plateau), recency (30-day half-life),
+and content density (letter-to-noise ratio) — weighted 0.45 / 0.20 /
+0.35. Episodes below `--threshold` (default 0.4) are dropped before
+any LLM sees them. Stage 1 is pure CPU and makes zero network calls.
+
+**Stage 2** sends each surviving Episode through the configured
+provider. Three are wired today:
+
+| `--provider` | What it does                                                              |
+|--------------|---------------------------------------------------------------------------|
+| `mock`       | Deterministic, offline, zero network. Default — exercise the pipeline.    |
+| `openai`     | Any OpenAI-compatible Chat-Completions API. Requires `OPENAI_API_KEY`. Set `--api-base http://localhost:11434/v1` for Ollama, `https://openrouter.ai/api/v1` for OpenRouter, etc. |
+| `anthropic`  | Native Anthropic Messages API. Requires `ANTHROPIC_API_KEY`. Pinned to `anthropic-version: 2023-06-01`. |
+
+### Safety posture (§-1.5 #6 + §-1.2 #5)
+
+- **No silent LLM calls.** `extract` defaults to `--dry-run` (just
+  shows candidates). `--no-dry-run` is required to actually invoke the
+  provider — and even then, prints `Stage 2 plan: N candidate(s) →
+  model X (~T input tokens)` **before** the first request and asks for
+  `[y/N]` confirmation unless `--yes` is passed.
+- **Safety cap.** `--max-llm-calls N` (default 100) refuses to run if
+  Stage 1 surfaced more candidates than the cap, before constructing
+  any HTTP client.
+- **Audit trail.** Every `--no-dry-run` run appends one JSON line to
+  `<data_dir>/audit/stage2.jsonl` with timestamps, provider+model,
+  candidate counts, tokens, errors, and the full
+  `derived_record_ids` / `source_record_ids` cross-reference. Browse
+  with `anamnesis audit list` and `anamnesis audit show <#>`.
+- **Provenance link.** Each derived record carries
+  `provenance.derived_from = source_episode_id`. Walk the chain with
+  `anamnesis lineage <record-id>` (or `--children` to find every
+  record extracted from a given Episode).
+- **Idempotent.** Derived `RecordId`s are deterministic in
+  `(source_id, kind, item_index)`, so a second run replaces (not
+  duplicates) prior output.
+
+### Example flow
+
+```bash
+# Step 1: ingest a Claude Code session as Episode records.
+anamnesis source add claude-code --path ~/.claude/projects
+anamnesis import claude-code
+
+# Step 2: see which Episodes the Stage-1 gate would surface.
+anamnesis extract --kind preference --explain
+# → ranks candidates, shows score rationale, no LLM call.
+
+# Step 3: distill via Ollama locally — zero cloud calls.
+export OPENAI_API_KEY=ollama-noop
+anamnesis extract --kind preference --no-dry-run \
+  --provider openai --api-base http://localhost:11434/v1 \
+  --model llama3.2:3b
+
+# Step 4: inspect the audit log + lineage of a derived record.
+anamnesis audit list
+anamnesis lineage <id-from-list> --children
+```
+
+### Feature flags
+
+The CLI ships with `openai-provider` and `anthropic-provider` enabled
+by default. To build a slimmer binary without `reqwest`:
+
+```bash
+cargo build --no-default-features --features local-fastembed,sse
+```
+
+(The `mock` provider always works.)
 
 ## Repository Layout
 
@@ -477,15 +563,15 @@ Anamnesis can already unify imports and retrieval, but it should not yet claim t
 | Phase | Status | Focus |
 |---|---|---|
 | Phase 0 | Complete | Rust workspace, Apache-2.0, CI (8-leg matrix), README/CONTRIBUTING, schema v1/v2 |
-| Phase 1 | Complete | core/store/importer/search/embedder, 14 first-class adapters across §-2.2 + §-2.3, local hybrid RAG |
+| Phase 1 | Complete | core/store/importer/search/embedder, 14 first-class adapters across §-2.2 + §-2.3, local hybrid RAG, §-1.5 PR-6 two-stage session extractor (Mock + OpenAI + Anthropic providers, audit log, lineage CLI) |
 | Phase 2 | In progress | MCP admin gate, source registry import, filter pushdown, ScanOpts, streaming scan |
 | Phase 3 | Planned | ghast integration, Homebrew/cargo release, real dogfood quality evaluation |
-| Phase 4 | Planned | §-1.5 PR-6 session extractor (Episode → Fact/Preference/Skill/Feedback LLM distillation), memory MCP convention, Agent Memory Interchange Format |
+| Phase 4 | Planned | Memory MCP convention, Agent Memory Interchange Format, temporal-graph schema evolution (unlocks Zep / Cognee Kuzu native adapters) |
 
 Recommended next PR slices:
 
-1. §-1.5 PR-6 — session extractor (Episode → Fact / Preference / Skill / Feedback, two-stage with deterministic gate + LLM)
-2. §-1.4 schema evolution for temporal/graph edges (unlocks Zep/Graphiti, Cognee Kuzu)
+1. 429 rate-limit retry/backoff on the OpenAI + Anthropic providers (they currently surface the error and skip the candidate)
+2. §-1.4 schema evolution for temporal/graph edges (unlocks Zep/Graphiti, Cognee Kuzu native adapters)
 3. §-2.5 adapter health-check tooling — `anamnesis doctor` per source
 4. Homebrew/cargo release packaging
 5. ghast first-consumer integration
