@@ -17,6 +17,7 @@
 pub mod detector;
 pub mod normalizer;
 pub mod scanner;
+pub mod session;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,7 +123,15 @@ fn stream_raw_records(cfg: CodexConfig, opts: ScanOpts) -> BoxStream<'static, Ra
                 return None;
             }
             match std::fs::read_to_string(&path) {
-                Ok(body) => Some(normalizer::raw_session(&path, body, instance.as_deref())),
+                Ok(body) => {
+                    let mtime = file_mtime(&path);
+                    Some(normalizer::raw_session(
+                        &path,
+                        &body,
+                        mtime,
+                        instance.as_deref(),
+                    ))
+                }
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -153,6 +162,15 @@ fn passes_since_filter(
         return true;
     };
     chrono::DateTime::<chrono::Utc>::from(modified) > threshold
+}
+
+/// Read a file's modification time as `DateTime<Utc>`. Returns `None`
+/// when `metadata()` fails or the platform doesn't expose mtime — the
+/// normalizer falls back to message-level timestamps then `captured_at`.
+fn file_mtime(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let m = meta.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(m))
 }
 
 /// Convenience constructor.
