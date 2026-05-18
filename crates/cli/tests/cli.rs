@@ -994,3 +994,117 @@ fn double_import_keeps_one_source_row_and_advances_timestamp() {
         "last_import_at non-null"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §-1.5 PR-6 — `anamnesis extract` safety/audit features (Round 42)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn extract_unknown_provider_errors_before_any_work() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run", "--provider", "totally-fake"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown --provider").and(contains("supported: mock, openai")));
+}
+
+#[test]
+fn extract_openai_without_api_key_errors_clearly() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        // Force-unset OPENAI_API_KEY so this passes even on a machine that
+        // happens to have one set in its shell env.
+        .env_remove("OPENAI_API_KEY")
+        .args(["extract", "--no-dry-run", "--provider", "openai"])
+        .assert()
+        .failure()
+        .stderr(contains("OPENAI_API_KEY"));
+}
+
+#[test]
+fn extract_mock_no_dry_run_on_empty_store_runs_cleanly_and_writes_audit() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    // Mock is offline + deterministic — no prompt, no `--yes` needed.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run"])
+        .assert()
+        .success();
+    // §-1.5 #6 audit log must be appended on every Stage 2 run.
+    let audit_path = dir.path().join("audit").join("stage2.jsonl");
+    assert!(
+        audit_path.exists(),
+        "audit log {} not created",
+        audit_path.display()
+    );
+    let body = std::fs::read_to_string(&audit_path).unwrap();
+    let line = body.lines().next().expect("at least one audit line");
+    let entry: serde_json::Value = serde_json::from_str(line).expect("audit line is JSON");
+    assert_eq!(entry["stage"], "stage2");
+    assert_eq!(entry["provider_id"], "mock");
+    assert_eq!(entry["provider_model"], "mock:default");
+    assert_eq!(entry["target_kind"], "fact");
+    assert!(entry["ts_started"].is_string());
+    assert!(entry["ts_finished"].is_string());
+}
+
+#[test]
+fn extract_max_llm_calls_lets_zero_candidates_through() {
+    // Sanity: --max-llm-calls=0 + empty store → 0 candidates → no cap
+    // violation, just a normal "nothing to extract" run.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract", "--no-dry-run", "--max-llm-calls", "0"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn extract_dry_run_default_still_inspection_only() {
+    // Make sure the safety/audit work didn't accidentally enable LLM
+    // calls in the default --dry-run path.
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["extract"])
+        .assert()
+        .success()
+        .stdout(contains("Stage 2 not yet wired").or(contains("inspection")));
+    // The dry-run path must NOT write the audit log — only the
+    // --no-dry-run path is auditable. (Dry-run is metadata-free.)
+    let audit_path = dir.path().join("audit").join("stage2.jsonl");
+    assert!(
+        !audit_path.exists(),
+        "dry-run unexpectedly wrote audit log at {}",
+        audit_path.display()
+    );
+}
