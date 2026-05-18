@@ -124,13 +124,20 @@ fn map_to_fastembed(info: &CuratedModel) -> Result<fastembed::EmbeddingModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FE_CACHE_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_cache() -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("anamnesis-fe-cache-{nonce}"));
+        let seq = FE_CACHE_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "anamnesis-fe-cache-{nonce}-{pid}-{seq}",
+            pid = std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

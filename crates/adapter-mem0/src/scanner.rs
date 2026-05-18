@@ -122,13 +122,20 @@ fn read_opt_text(row: &rusqlite::Row<'_>, idx: usize) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MEM0_SCAN_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_dir() -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("anamnesis-mem0-scan-{nonce}"));
+        let seq = MEM0_SCAN_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "anamnesis-mem0-scan-{nonce}-{pid}-{seq}",
+            pid = std::process::id()
+        ));
         fs::create_dir_all(&p).unwrap();
         p
     }

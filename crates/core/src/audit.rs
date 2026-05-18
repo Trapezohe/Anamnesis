@@ -84,13 +84,20 @@ impl AuditEntry {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static AUDIT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_dir() -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("anamnesis-audit-{nonce}"));
+        let seq = AUDIT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "anamnesis-audit-{nonce}-{pid}-{seq}",
+            pid = std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

@@ -182,13 +182,20 @@ mod tests {
     use super::*;
     use anamnesis_core::Kind;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static GHAST_LIB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_dir() -> PathBuf {
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("anamnesis-ghast-{n}"));
+        let seq = GHAST_LIB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "anamnesis-ghast-{n}-{pid}-{seq}",
+            pid = std::process::id()
+        ));
         fs::create_dir_all(&p).unwrap();
         p
     }
