@@ -1017,6 +1017,16 @@ fn extract_unknown_provider_errors_before_any_work() {
 
 #[test]
 fn extract_openai_without_api_key_errors_clearly() {
+    // Two CI matrix legs hit this test path:
+    //
+    //   - `test (ubuntu-latest)` runs with `--no-default-features`, so
+    //     the `openai-provider` cargo feature is OFF → the error is
+    //     "requires the `openai-provider` cargo feature".
+    //   - `test (sse, *)` / local default-features → feature is ON →
+    //     the error is "OPENAI_API_KEY environment variable is required".
+    //
+    // Either error is a clean "we refused to make any HTTP call"
+    // outcome, which is what §-1.5 #6 demands. Accept both.
     let dir = tmp_dir();
     cli()
         .env("ANAMNESIS_DATA_DIR", dir.path())
@@ -1031,7 +1041,7 @@ fn extract_openai_without_api_key_errors_clearly() {
         .args(["extract", "--no-dry-run", "--provider", "openai"])
         .assert()
         .failure()
-        .stderr(contains("OPENAI_API_KEY"));
+        .stderr(contains("OPENAI_API_KEY").or(contains("openai-provider")));
 }
 
 #[test]
