@@ -952,7 +952,26 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
                 "chunks": stats.chunks,
                 "jobs_pending": stats.jobs_pending,
                 "jobs_failed": stats.jobs_failed,
+                "import_errors": stats.import_errors,
             },
+            "recent_import_errors": store
+                .recent_import_errors(None, 10)
+                .unwrap_or_default()
+                .iter()
+                .map(|e| serde_json::json!({
+                    "adapter": e.adapter,
+                    "instance": if e.instance.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(e.instance.clone())
+                    },
+                    "native_id": e.native_id,
+                    "native_path": e.native_path,
+                    "phase": e.phase,
+                    "error": e.error,
+                    "occurred_at": e.occurred_at,
+                }))
+                .collect::<Vec<_>>(),
             "sources": per_source.iter().map(|r| {
                 let freshness = source_freshness(r.source.last_import_at, now);
                 serde_json::json!({
@@ -989,6 +1008,32 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     println!("chunks          : {}", stats.chunks);
     println!("jobs pending    : {}", stats.jobs_pending);
     println!("jobs failed     : {}", stats.jobs_failed);
+    println!("import errors   : {}", stats.import_errors);
+
+    // Show the 5 most recent import errors so operators see what
+    // silently failed during the last import without needing to open
+    // the SQLite database. JSON output already includes the full top-10.
+    if stats.import_errors > 0 {
+        let recent = store.recent_import_errors(None, 5).unwrap_or_default();
+        if !recent.is_empty() {
+            println!();
+            println!("recent import errors (top 5):");
+            for e in &recent {
+                let inst = if e.instance.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{}", e.instance)
+                };
+                println!(
+                    "  [{adapter}{inst} · {phase}] {error}",
+                    adapter = e.adapter,
+                    inst = inst,
+                    phase = e.phase,
+                    error = e.error,
+                );
+            }
+        }
+    }
 
     // Per-source health table. Always emitted (even when empty) so the
     // operator sees the "no sources yet — run `anamnesis source add`"
@@ -2672,6 +2717,13 @@ async fn cmd_doctor(
     let store = Store::open(db_path(data_dir))?;
     let registered = store.list_sources_with_counts()?;
 
+    // Round-64 follow-up: one `GROUP BY` query instead of N row-
+    // materializing scans. For 13 registered sources this turns
+    // 13 × `SELECT * FROM import_errors WHERE adapter = ?` (which
+    // could materialize huge result sets on bad-import storms) into
+    // one `SELECT adapter, COUNT(1) FROM import_errors GROUP BY adapter`.
+    let error_counts = store.count_import_errors_by_adapter().unwrap_or_default();
+
     let mut rows = Vec::new();
     for swc in &registered {
         let src = &swc.source;
@@ -2691,6 +2743,7 @@ async fn cmd_doctor(
             // Never imported → counts as stale when a threshold is set.
             None => true,
         });
+        let import_errors_n = error_counts.get(&src.adapter).copied().unwrap_or(0);
         rows.push(DoctorRow {
             adapter: src.adapter.clone(),
             instance: instance_label(&src.instance),
@@ -2705,6 +2758,7 @@ async fn cmd_doctor(
             chunk_count: Some(swc.chunk_count),
             last_import_at: src.last_import_at,
             stale,
+            import_errors: import_errors_n,
         });
     }
 
@@ -2739,6 +2793,7 @@ async fn cmd_doctor(
                 record_count: d.estimated_records,
                 chunk_count: None,
                 last_import_at: None,
+                import_errors: 0,
                 // Unregistered rows aren't subject to staleness — there
                 // was never an import to begin with.
                 stale: None,
@@ -2761,6 +2816,7 @@ async fn cmd_doctor(
                     "chunk_count": r.chunk_count,
                     "last_import_at": r.last_import_at,
                     "stale": r.stale,
+                    "import_errors": r.import_errors,
                 })
             })
             .collect();
@@ -2838,6 +2894,9 @@ async fn cmd_doctor(
         if let Some(chunks) = row.chunk_count {
             println!("    chunks            : {chunks}");
         }
+        if row.registered && row.import_errors > 0 {
+            println!("    import errors     : {}", row.import_errors);
+        }
         println!("    detail            : {}", row.detail);
         println!();
     }
@@ -2889,6 +2948,11 @@ struct DoctorRow {
     /// or never-imported. `Some(false)` if it's fresh enough.
     /// `None` when `--since` wasn't passed.
     stale: Option<bool>,
+    /// Count of `import_errors` rows scoped to this adapter (across
+    /// every instance — `import_errors` doesn't denormalize the
+    /// instance discriminator into the row count yet). 0 when clean.
+    /// Only populated for `registered` rows.
+    import_errors: u64,
 }
 
 /// Parse the `--since` value into seconds. Accepts shapes:

@@ -193,6 +193,34 @@ pub struct StoreStats {
     pub jobs_failed: u64,
     /// Distinct `(adapter, instance)` source rows.
     pub sources: u64,
+    /// Non-fatal per-record import errors logged across all runs.
+    /// Each row is one record the importer skipped (scan / parse /
+    /// normalize / upsert phase). Surfaces in `anamnesis status` so
+    /// the user knows when a source has silently-skipped data; the
+    /// rows themselves are available via `recent_import_errors`.
+    pub import_errors: u64,
+}
+
+/// One row from `import_errors` for `anamnesis status` / `doctor`
+/// presentation. Returned newest-first by `recent_import_errors`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportErrorRow {
+    /// Adapter id (e.g. `"claude-code"`).
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// Original record id at the source, if the error happened after
+    /// the adapter produced one.
+    pub native_id: Option<String>,
+    /// Original record path at the source.
+    pub native_path: Option<String>,
+    /// Pipeline phase the error happened in. One of:
+    /// `scan` | `parse` | `normalize` | `chunk` | `upsert`.
+    pub phase: String,
+    /// Adapter-supplied error message.
+    pub error: String,
+    /// Unix seconds when the row was logged.
+    pub occurred_at: i64,
 }
 
 /// Full row from `sources` — what `list_sources_full` and `get_source`
@@ -1568,13 +1596,88 @@ impl Store {
             |r| r.get(0),
         )?;
         let sources: i64 = conn.query_row("SELECT COUNT(1) FROM sources", [], |r| r.get(0))?;
+        let import_errors: i64 =
+            conn.query_row("SELECT COUNT(1) FROM import_errors", [], |r| r.get(0))?;
         Ok(StoreStats {
             records: records as u64,
             chunks: chunks as u64,
             jobs_pending: pending as u64,
             jobs_failed: failed as u64,
             sources: sources as u64,
+            import_errors: import_errors as u64,
         })
+    }
+
+    /// One-shot per-adapter count of `import_errors` rows. Returned as
+    /// a `HashMap<String, u64>` keyed by adapter id. Adapters with no
+    /// errors are simply absent from the map (callers should default to 0).
+    ///
+    /// Used by `anamnesis doctor` to avoid an N+1 query against
+    /// `recent_import_errors(Some(adapter), …)` once per registered
+    /// source: one `GROUP BY` instead of N row-materializing scans.
+    pub fn count_import_errors_by_adapter(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT adapter, COUNT(1) FROM import_errors GROUP BY adapter")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().map(|(a, n)| (a, n as u64)).collect())
+    }
+
+    /// Most-recent rows from `import_errors`, newest first. Used by
+    /// `anamnesis status` and `anamnesis doctor` to surface what
+    /// silently failed during recent imports without making the user
+    /// dig into the SQLite database directly.
+    ///
+    /// Pass `adapter = Some(...)` to scope to one source (matches
+    /// `doctor`'s per-source path); `adapter = None` returns all
+    /// sources combined.
+    pub fn recent_import_errors(
+        &self,
+        adapter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ImportErrorRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mapper = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ImportErrorRow> {
+            Ok(ImportErrorRow {
+                adapter: r.get(0)?,
+                instance: r.get(1)?,
+                native_id: r.get(2)?,
+                native_path: r.get(3)?,
+                phase: r.get(4)?,
+                error: r.get(5)?,
+                occurred_at: r.get(6)?,
+            })
+        };
+        let rows: Vec<ImportErrorRow> = if let Some(a) = adapter {
+            let mut stmt = conn.prepare(
+                "SELECT adapter, instance, native_id, native_path, phase, error, occurred_at \
+                 FROM import_errors \
+                 WHERE adapter = ?1 \
+                 ORDER BY occurred_at DESC, id DESC \
+                 LIMIT ?2",
+            )?;
+            let mapped = stmt
+                .query_map(params![a, limit as i64], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT adapter, instance, native_id, native_path, phase, error, occurred_at \
+                 FROM import_errors \
+                 ORDER BY occurred_at DESC, id DESC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt
+                .query_map(params![limit as i64], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+        Ok(rows)
     }
 }
 
@@ -2948,6 +3051,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(single_n, batched_n);
+    }
+
+    // ─── Round-64: import_errors exposure ────────────────────────────
+
+    /// `stats().import_errors` must reflect every row written by
+    /// `log_import_error` and must surface as 0 on a fresh store.
+    #[test]
+    fn stats_counts_import_errors() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.stats().unwrap().import_errors, 0);
+        store
+            .log_import_error("claude-code", None, Some("r1"), None, "parse", "bad json")
+            .unwrap();
+        store
+            .log_import_error("mem0", Some("self"), Some("r2"), None, "upsert", "boom")
+            .unwrap();
+        assert_eq!(store.stats().unwrap().import_errors, 2);
+    }
+
+    /// `recent_import_errors(None, limit)` returns rows newest-first
+    /// across every adapter; `recent_import_errors(Some(adapter), ...)`
+    /// scopes to that adapter; `limit = 0` returns an empty Vec without
+    /// touching the database.
+    #[test]
+    fn recent_import_errors_orders_newest_first_and_scopes_by_adapter() {
+        let store = Store::open_in_memory().unwrap();
+        // Insert in order so the natural id sequence also matches the
+        // newest-first ORDER BY tiebreaker.
+        store
+            .log_import_error("claude-code", None, Some("a"), None, "parse", "first")
+            .unwrap();
+        store
+            .log_import_error("mem0", Some("self"), Some("b"), None, "upsert", "second")
+            .unwrap();
+        store
+            .log_import_error("claude-code", None, Some("c"), None, "scan", "third")
+            .unwrap();
+
+        let all = store.recent_import_errors(None, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        // Newest first: "third", "second", "first".
+        assert_eq!(all[0].error, "third");
+        assert_eq!(all[1].error, "second");
+        assert_eq!(all[2].error, "first");
+
+        let claude = store.recent_import_errors(Some("claude-code"), 10).unwrap();
+        assert_eq!(claude.len(), 2);
+        assert_eq!(claude[0].error, "third");
+        assert_eq!(claude[1].error, "first");
+
+        let limited = store.recent_import_errors(None, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].error, "third");
+
+        let zero = store.recent_import_errors(None, 0).unwrap();
+        assert!(zero.is_empty());
     }
 
     /// A batch that mixes already-imported (raw_hash-equal → no-op) records
