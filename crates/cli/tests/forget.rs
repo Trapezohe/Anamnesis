@@ -265,6 +265,149 @@ fn list_forgotten_include_sensitive_reveals_fields() {
     assert!(row["raw_hash"].is_string());
 }
 
+// ─── Round-75 PR-75: unforget ───────────────────────────────────────
+
+/// Full lifecycle: import → search hits → forget → search empty →
+/// unforget → search STILL empty → re-import → search hits again.
+/// The "STILL empty after unforget" step is load-bearing: it
+/// proves `unforget` removes the gate without resurrecting the
+/// record on its own.
+#[test]
+fn unforget_lifts_suppression_but_requires_reimport_to_resurrect() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+
+    assert_eq!(
+        search_hit_count(home.path(), data.path(), "forgetMeChannel"),
+        1
+    );
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid])
+        .assert()
+        .success();
+    assert_eq!(
+        search_hit_count(home.path(), data.path(), "forgetMeChannel"),
+        0
+    );
+
+    // Unforget: tombstone gate removed.
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &rid])
+        .assert()
+        .success()
+        .stdout(contains("unforgotten").and(contains("NOT resurrected")));
+
+    // Still empty — unforget alone doesn't bring the record back.
+    assert_eq!(
+        search_hit_count(home.path(), data.path(), "forgetMeChannel"),
+        0,
+        "unforget must not resurrect the record by itself",
+    );
+
+    // Re-import: the source's own data brings the record back.
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["import", "claude-code", "--no-embed", "--full"])
+        .assert()
+        .success();
+    assert_eq!(
+        search_hit_count(home.path(), data.path(), "forgetMeChannel"),
+        1,
+        "after unforget + re-import the record must be searchable again",
+    );
+}
+
+#[test]
+fn unforget_removes_tombstone_from_list_forgotten() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid])
+        .assert()
+        .success();
+
+    let pre = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&pre.stdout).unwrap();
+    assert_eq!(v["count"], 1);
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &rid])
+        .assert()
+        .success();
+
+    let post = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&post.stdout).unwrap();
+    assert_eq!(v["count"], 0);
+}
+
+#[test]
+fn unforget_unknown_id_exits_nonzero() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", "no-such-id"])
+        .assert()
+        .failure()
+        .stderr(contains("nothing to unforget"));
+}
+
+#[test]
+fn unforget_json_payload_makes_resurrection_semantics_explicit() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid])
+        .assert()
+        .success();
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &rid, "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "unforgotten");
+    assert_eq!(v["record_id"], rid);
+    assert_eq!(v["record_resurrected"], false);
+    assert_eq!(v["requires_reimport"], true);
+}
+
 #[test]
 fn list_forgotten_empty_store_says_so() {
     let home = tmp_dir();

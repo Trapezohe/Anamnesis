@@ -139,6 +139,24 @@ enum Command {
         json: bool,
     },
 
+    /// Remove a tombstone so the source can resurrect the memory
+    /// on its next import. Does NOT recreate the record itself —
+    /// the tombstone only stored provenance, so "stay forgotten"
+    /// becomes "allowed to come back if the source re-emits."
+    ///
+    /// Idempotency: a typo or unknown id exits non-zero
+    /// (`no tombstone for id ... nothing to unforget`) so silent
+    /// "success" can't hide a paste mistake from
+    /// `list-forgotten`.
+    Unforget {
+        /// Record id to unforget — same shape as
+        /// `list-forgotten.rows[].record_id`.
+        record_id: String,
+        /// Emit JSON instead of the human one-liner.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List tombstoned records (audit view).
     ///
     /// Round 74: surfaces what `forget` has tombstoned, scoped by
@@ -723,6 +741,7 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
+        Command::Unforget { record_id, json } => cmd_unforget(&data_dir, &record_id, json),
         Command::ListForgotten {
             source,
             instance,
@@ -2379,6 +2398,84 @@ fn cmd_forget(
     if matches!(outcome, anamnesis_store::ForgetRecordOutcome::NotFound) {
         return Err(anyhow!(
             "no record with id {record_id:?} — nothing to forget"
+        ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// unforget (Round 75 PR-75)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis unforget <record_id>` — remove a tombstone so a future
+/// import is allowed to bring the record back.
+///
+/// Critically: does NOT recreate the live record. The tombstone
+/// only stored provenance, not content, so resurrecting from it
+/// would let `unforget` synthesise data — Anamnesis is a read-only
+/// mirror of source data. The truthful design is "remove the gate;
+/// the source itself decides whether to re-emit on next import."
+///
+/// Exit codes:
+///   - 0 on `Unforgotten` (tombstone removed).
+///   - non-zero on `NotForgotten` so a paste mistake from
+///     `list-forgotten` is loud rather than silently a no-op.
+fn cmd_unforget(data_dir: &std::path::Path, record_id: &str, json: bool) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let id = anamnesis_core::model::RecordId(record_id.to_string());
+    let outcome = store.unforget_record(&id)?;
+
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "unforget",
+        serde_json::json!({
+            "record_id": record_id,
+            "outcome": match &outcome {
+                anamnesis_store::UnforgetRecordOutcome::Unforgotten(_) => "unforgotten",
+                anamnesis_store::UnforgetRecordOutcome::NotForgotten   => "not-forgotten",
+            },
+        }),
+    ));
+
+    if json {
+        let payload = match &outcome {
+            anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => serde_json::json!({
+                "status": "unforgotten",
+                "record_id": r.record_id.0,
+                "adapter": r.adapter,
+                "instance": if r.instance.is_empty() { None } else { Some(&r.instance) },
+                "native_id": r.native_id,
+                "forgotten_at": r.forgotten_at,
+                "record_resurrected": false,
+                "requires_reimport": true,
+            }),
+            anamnesis_store::UnforgetRecordOutcome::NotForgotten => serde_json::json!({
+                "status": "not-forgotten",
+                "record_id": record_id,
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if let anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) = &outcome {
+        let inst = if r.instance.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", r.instance)
+        };
+        println!(
+            "unforgotten {} (adapter={}{inst}, native_id={})",
+            r.record_id.0, r.adapter, r.native_id
+        );
+        println!(
+            "  tombstone removed — record itself is NOT resurrected; \
+             re-import the source to bring it back."
+        );
+    }
+
+    if matches!(
+        outcome,
+        anamnesis_store::UnforgetRecordOutcome::NotForgotten
+    ) {
+        return Err(anyhow!(
+            "no tombstone for id {record_id:?} — nothing to unforget"
         ));
     }
     Ok(())

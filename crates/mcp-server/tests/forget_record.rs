@@ -414,3 +414,124 @@ async fn list_forgotten_filters_by_source() {
         .unwrap();
     assert_eq!(body["structuredContent"]["count"], 1);
 }
+
+// ─── Round-75 PR-75: unforget_record ────────────────────────────────
+
+#[tokio::test]
+async fn unforget_record_is_listed_as_admin_tool() {
+    assert!(
+        ADMIN_TOOLS.contains(&"unforget_record"),
+        "unforget_record must be admin-gated"
+    );
+}
+
+#[tokio::test]
+async fn unforget_record_hidden_from_tools_list_without_admin() {
+    let (bundle, _id) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"unforget_record"),
+        "unforget_record must NOT appear in default tools/list; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn unforget_record_rejected_when_admin_disabled() {
+    let (bundle, id) = build_bundle(false);
+    let resp = bundle
+        .server
+        .handle(tool_call("unforget_record", json!({"record_id": id.0})))
+        .await;
+    assert!(
+        resp.error.is_some(),
+        "unforget_record must error without admin gate"
+    );
+}
+
+/// The full forget → unforget cycle through MCP. After unforget,
+/// `list_forgotten` must drop to 0 and `get_record` must STILL
+/// return null (unforget doesn't resurrect the live row).
+#[tokio::test]
+async fn unforget_record_removes_tombstone_but_keeps_record_absent() {
+    let (bundle, id) = build_bundle(true);
+    // Forget first so there's a tombstone to remove.
+    let _ = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "test"}),
+        ))
+        .await;
+
+    let unforget_resp = bundle
+        .server
+        .handle(tool_call("unforget_record", json!({"record_id": id.0})))
+        .await;
+    assert!(
+        unforget_resp.error.is_none(),
+        "unforget_record failed: {:?}",
+        unforget_resp.error
+    );
+    let payload = extract_payload(&unforget_resp);
+    assert_eq!(payload["outcome"], "unforgotten");
+    assert_eq!(payload["record_id"], id.0);
+    assert_eq!(payload["record_resurrected"], false);
+    assert_eq!(payload["requires_reimport"], true);
+
+    // list_forgotten count drops to 0.
+    let list_payload = extract_payload(
+        &bundle
+            .server
+            .handle(tool_call("list_forgotten", json!({})))
+            .await,
+    );
+    assert_eq!(list_payload["count"], 0, "tombstone must be gone");
+
+    // get_record stays null — unforget alone doesn't resurrect.
+    let get_payload = extract_payload(
+        &bundle
+            .server
+            .handle(tool_call("get_record", json!({"id": id.0})))
+            .await,
+    );
+    assert!(
+        get_payload["record"].is_null(),
+        "unforget must NOT resurrect the live row: {get_payload}"
+    );
+
+    // Audit log carries an `unforget` entry with `via: "mcp"`.
+    let audit = read_audit_lines(&bundle.audit_dir);
+    let entries: Vec<_> = audit.iter().filter(|e| e["action"] == "unforget").collect();
+    assert_eq!(entries.len(), 1, "expected one unforget audit entry");
+    assert_eq!(entries[0]["detail"]["via"], "mcp");
+    assert_eq!(entries[0]["detail"]["outcome"], "unforgotten");
+}
+
+#[tokio::test]
+async fn unforget_record_unknown_id_is_tool_error() {
+    let (bundle, _id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({"record_id": "no-tombstone-here"}),
+        ))
+        .await;
+    assert!(
+        resp.error.is_some(),
+        "unforget on unknown id must error, not silently succeed"
+    );
+    let msg = resp.error.unwrap().message.to_lowercase();
+    assert!(
+        msg.contains("no tombstone") || msg.contains("nothing to unforget"),
+        "error must explain why; got {msg}"
+    );
+}

@@ -257,6 +257,31 @@ pub struct ForgottenRecord {
     pub forgotten_at: i64,
 }
 
+/// Result of [`Store::unforget_record`]. Distinguishes the two
+/// observable outcomes so the CLI / MCP surface can fail loudly
+/// when the operator typoed an id from `list_forgotten` instead
+/// of pretending a recovery happened.
+///
+/// Round 75: `unforget` deletes the tombstone but does **not**
+/// recreate the live `records` row. The tombstone only carried
+/// provenance, not the original normalized content — and even if
+/// it did, resurrecting it would let `unforget` make data appear
+/// out of nowhere, which violates Anamnesis's "read-only mirror
+/// of source data" contract. The record stays absent until the
+/// source is re-imported (which is now allowed because the
+/// tombstone gate is gone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnforgetRecordOutcome {
+    /// A tombstone existed and is now deleted. Carries the
+    /// `ForgottenRecord` snapshot the operator was responding
+    /// to — useful for "you just unforgot X, here's what it was".
+    Unforgotten(ForgottenRecord),
+    /// No tombstone for this id. Returned as a loud error by the
+    /// CLI / MCP surfaces because the operator almost certainly
+    /// pasted the wrong id from `list_forgotten`.
+    NotForgotten,
+}
+
 /// Result of [`Store::forget_record`]. Distinguishes the three
 /// observable outcomes so the CLI / future MCP surface can render
 /// them differently — and so repeated `forget` calls stay
@@ -892,6 +917,81 @@ impl Store {
             raw_hash,
             reason: reason.map(str::to_owned),
             forgotten_at: now,
+        }))
+    }
+
+    /// Round 75 (PR-75): remove a tombstone, so the same source can
+    /// resurrect the memory on its next `import`. Does NOT recreate
+    /// the live `records` row — the tombstone only stored
+    /// provenance, not the original normalized content, and
+    /// resurrecting from a tombstone would let `unforget` synthesise
+    /// content out of nowhere. The truthful design is "remove the
+    /// suppression gate, let the source's own data bring the record
+    /// back."
+    ///
+    /// Idempotency: returns `NotForgotten` when no tombstone is
+    /// present. Callers should treat that as user error (loud
+    /// non-zero exit / tool error), because the operator almost
+    /// certainly typoed an id from `list_forgotten`.
+    pub fn unforget_record(&self, id: &RecordId) -> Result<UnforgetRecordOutcome> {
+        let mut conn = self.conn.lock();
+        // Immediate transaction mirrors the forget path — atomic
+        // against a concurrent `forget` writing the same row.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Columns: adapter, instance, native_id, native_path,
+        //          raw_hash, reason, forgotten_at — aliased to
+        //          quiet clippy::type_complexity.
+        type TombstoneCols = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            i64,
+        );
+        let existing: Option<TombstoneCols> = tx
+            .query_row(
+                "SELECT adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                 FROM record_tombstones WHERE record_id = ?1",
+                params![id.0],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at)) =
+            existing
+        else {
+            tx.commit()?;
+            return Ok(UnforgetRecordOutcome::NotForgotten);
+        };
+
+        tx.execute(
+            "DELETE FROM record_tombstones WHERE record_id = ?1",
+            params![id.0],
+        )?;
+        tx.commit()?;
+
+        Ok(UnforgetRecordOutcome::Unforgotten(ForgottenRecord {
+            record_id: id.clone(),
+            adapter,
+            instance,
+            native_id,
+            native_path,
+            raw_hash,
+            reason,
+            forgotten_at,
         }))
     }
 
@@ -4565,5 +4665,106 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), 4);
+    }
+
+    // ─── Round-75: unforget_record ──────────────────────────────────
+
+    /// `unforget` removes the tombstone and returns the snapshot
+    /// that was just deleted, but does NOT recreate the live
+    /// `records` row (the tombstone has provenance only, not the
+    /// original content).
+    #[test]
+    fn unforget_removes_tombstone_but_does_not_resurrect_record() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("claude-code", "rec-a", "alpha content", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store.forget_record(&r.id, Some("oops")).unwrap();
+
+        let outcome = store.unforget_record(&r.id).unwrap();
+        match outcome {
+            UnforgetRecordOutcome::Unforgotten(rec) => {
+                assert_eq!(rec.record_id, r.id);
+                assert_eq!(rec.adapter, "claude-code");
+                assert_eq!(rec.reason.as_deref(), Some("oops"));
+            }
+            UnforgetRecordOutcome::NotForgotten => panic!("expected Unforgotten"),
+        }
+        let n_tombstones: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_tombstones", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(n_tombstones, 0, "tombstone row should be gone");
+        let n_records: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n_records, 0,
+            "unforget must NOT resurrect the record itself — re-import is required",
+        );
+    }
+
+    /// After `unforget`, a re-upsert of the same record is no
+    /// longer suppressed — the tombstone gate is gone. This is
+    /// what makes `unforget` actually useful (otherwise it would
+    /// just remove an entry from `list_forgotten` with no
+    /// behavioural effect).
+    #[test]
+    fn upsert_after_unforget_is_accepted_again() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("mem0", "m1", "first content", Kind::Fact);
+        r.provenance.raw_hash = "h-first".into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store.forget_record(&r.id, None).unwrap();
+
+        // Suppression still holds before unforget.
+        let mut re = make_record("mem0", "m1", "second content", Kind::Fact);
+        re.provenance.raw_hash = "h-second".into();
+        let new_chunks = Chunker::default().chunk(&re.id, &re.content);
+        let (recs, _) = store.upsert_record(&re, &new_chunks, None).unwrap();
+        assert_eq!(recs, 0, "tombstone must suppress upsert");
+
+        store.unforget_record(&r.id).unwrap();
+
+        let (recs, chunks_n) = store.upsert_record(&re, &new_chunks, None).unwrap();
+        assert_eq!(
+            (recs, chunks_n as usize),
+            (1, new_chunks.len()),
+            "after unforget the same (adapter,instance,native_id) must be importable again"
+        );
+    }
+
+    #[test]
+    fn unforget_record_with_no_tombstone_returns_not_forgotten() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId::from_parts("claude-code", None, "never-tombstoned");
+        let outcome = store.unforget_record(&phantom).unwrap();
+        assert!(matches!(outcome, UnforgetRecordOutcome::NotForgotten));
+    }
+
+    /// Repeated `unforget` calls must NOT silently succeed — second
+    /// call should return `NotForgotten` because there's nothing
+    /// left to remove. (Distinct from `forget`'s `AlreadyForgotten`,
+    /// which carries the original tombstone; here there's no
+    /// payload to return.)
+    #[test]
+    fn unforget_record_second_call_returns_not_forgotten() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("claude-code", "rec-twice", "x", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store.forget_record(&r.id, None).unwrap();
+        let first = store.unforget_record(&r.id).unwrap();
+        let second = store.unforget_record(&r.id).unwrap();
+        assert!(matches!(first, UnforgetRecordOutcome::Unforgotten(_)));
+        assert!(matches!(second, UnforgetRecordOutcome::NotForgotten));
     }
 }
