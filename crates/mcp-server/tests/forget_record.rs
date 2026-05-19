@@ -1,0 +1,272 @@
+//! Round-73 PR-72b: admin-gated MCP `forget_record` end-to-end.
+//!
+//! Acceptance points:
+//!
+//!   1. **Admin gate respected.** Without `with_admin_tools(true)`,
+//!      `tools/call forget_record` is rejected and `tools/list`
+//!      hides the tool. Same pattern as `import_source` (R0 PR-#10).
+//!
+//!   2. **Live record forget succeeds.** Admin-on client can forget
+//!      a record by id; the live `records` row goes; `get_record`
+//!      returns null afterward; payload carries the structured
+//!      tombstone fields.
+//!
+//!   3. **Idempotent re-forget.** A second `forget_record` on the
+//!      same id returns `"outcome": "already-forgotten"` without
+//!      breaking, with the original tombstone metadata preserved.
+//!
+//!   4. **NotFound is an error.** Calling on an id that never
+//!      existed errors loudly — silently returning success would
+//!      let the operator believe a guarantee was made when it
+//!      wasn't (no tombstone was written).
+//!
+//!   5. **Audit parity.** The MCP forget writes a `"forget"`
+//!      audit entry with the same shape the CLI does, with
+//!      `via: "mcp"` for entry-point provenance.
+
+use anamnesis_core::chunker::Chunker;
+use anamnesis_core::model::{
+    AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+};
+use anamnesis_mcp_server::{server::ADMIN_TOOLS, AnamnesisServer};
+use anamnesis_store::Store;
+use chrono::Utc;
+use serde_json::{json, Value};
+
+struct TestBundle {
+    server: AnamnesisServer,
+    /// Holds the temp dir alive for the duration of the test.
+    _data_dir: tempfile::TempDir,
+    audit_dir: std::path::PathBuf,
+}
+
+/// Build a server + pre-seed a single forget-able record so each
+/// test starts from a known live state.
+fn build_bundle(allow_admin: bool) -> (TestBundle, RecordId) {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db_path = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db_path).expect("open store");
+
+    let id = RecordId::from_parts("claude-code", None, "doomed-r73");
+    let record = AnamnesisRecord {
+        id: id.clone(),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "secret content to be forgotten".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "doomed-r73".into(),
+            native_path: Some("/tmp/doomed.md".into()),
+            captured_at: Utc::now(),
+            raw_hash: "h-doomed-r73".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let chunks = Chunker::default().chunk(&record.id, &record.content);
+    store.upsert_record(&record, &chunks, None).unwrap();
+
+    let server = AnamnesisServer::new(store, None, data_dir.path().to_path_buf())
+        .with_admin_tools(allow_admin);
+
+    let audit_dir = data_dir.path().to_path_buf();
+    (
+        TestBundle {
+            server,
+            _data_dir: data_dir,
+            audit_dir,
+        },
+        id,
+    )
+}
+
+fn tool_call(name: &str, arguments: Value) -> anamnesis_mcp_server::protocol::JsonRpcRequest {
+    anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(7)),
+        method: "tools/call".into(),
+        params: json!({ "name": name, "arguments": arguments }),
+    }
+}
+
+fn extract_payload(resp: &anamnesis_mcp_server::protocol::JsonRpcResponse) -> Value {
+    serde_json::to_value(resp).unwrap()["result"]["structuredContent"].clone()
+}
+
+fn read_audit_lines(dir: &std::path::Path) -> Vec<Value> {
+    let raw = std::fs::read_to_string(dir.join("audit.log")).unwrap_or_default();
+    raw.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("audit line is json"))
+        .collect()
+}
+
+#[tokio::test]
+async fn forget_record_is_listed_as_admin_tool() {
+    assert!(
+        ADMIN_TOOLS.contains(&"forget_record"),
+        "forget_record must be admin-gated"
+    );
+}
+
+#[tokio::test]
+async fn forget_record_hidden_from_tools_list_without_admin() {
+    let (bundle, _id) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"forget_record"),
+        "forget_record must NOT appear in default tools/list; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn forget_record_visible_in_tools_list_with_admin() {
+    let (bundle, _id) = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        names.contains(&"forget_record"),
+        "forget_record must appear in admin tools/list; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn forget_record_rejected_when_admin_disabled() {
+    let (bundle, id) = build_bundle(false);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "test"}),
+        ))
+        .await;
+    assert!(
+        resp.error.is_some(),
+        "forget_record must error without admin gate; got {resp:?}"
+    );
+    let err = resp.error.unwrap();
+    let msg = err.message.to_lowercase();
+    assert!(
+        msg.contains("admin"),
+        "error must mention admin gate; got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn forget_record_deletes_record_and_returns_structured_payload() {
+    let (bundle, id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "MCP integration test"}),
+        ))
+        .await;
+    assert!(
+        resp.error.is_none(),
+        "forget_record failed: {:?}",
+        resp.error
+    );
+
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["outcome"], "forgotten");
+    assert_eq!(payload["record_id"], id.0);
+    assert_eq!(payload["adapter"], "claude-code");
+    assert_eq!(payload["native_id"], "doomed-r73");
+    assert_eq!(payload["raw_hash"], "h-doomed-r73");
+    assert_eq!(payload["reason"], "MCP integration test");
+    assert!(payload["forgotten_at"].is_i64());
+
+    // get_record on the same id must now return null (the live row is gone).
+    let get_resp = bundle
+        .server
+        .handle(tool_call("get_record", json!({"id": id.0})))
+        .await;
+    let get_payload = extract_payload(&get_resp);
+    assert!(
+        get_payload["record"].is_null(),
+        "live record must be gone after forget; got {get_payload}"
+    );
+
+    // Audit log carries an entry-point-tagged forget entry.
+    let audit = read_audit_lines(&bundle.audit_dir);
+    let forget_entries: Vec<_> = audit.iter().filter(|e| e["action"] == "forget").collect();
+    assert_eq!(forget_entries.len(), 1, "expected one forget audit entry");
+    assert_eq!(forget_entries[0]["detail"]["via"], "mcp");
+    assert_eq!(forget_entries[0]["detail"]["outcome"], "forgotten");
+}
+
+#[tokio::test]
+async fn forget_record_second_call_returns_already_forgotten() {
+    let (bundle, id) = build_bundle(true);
+    let _first = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "first"}),
+        ))
+        .await;
+    let second = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "second"}),
+        ))
+        .await;
+    assert!(
+        second.error.is_none(),
+        "second forget failed: {:?}",
+        second.error
+    );
+    let payload = extract_payload(&second);
+    assert_eq!(payload["outcome"], "already-forgotten");
+    assert_eq!(
+        payload["reason"], "first",
+        "original tombstone reason must be preserved across re-forget"
+    );
+}
+
+#[tokio::test]
+async fn forget_record_unknown_id_is_tool_error() {
+    let (bundle, _id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": "no-such-id-anywhere"}),
+        ))
+        .await;
+    assert!(
+        resp.error.is_some(),
+        "forget_record on unknown id must error, not silently succeed"
+    );
+    let msg = resp.error.unwrap().message.to_lowercase();
+    assert!(
+        msg.contains("nothing to forget") || msg.contains("no record"),
+        "error must explain why; got {msg}"
+    );
+}

@@ -48,11 +48,27 @@ pub const PROTOCOL_VERSION: &str = "2025-03-26";
 /// filesystem paths, or otherwise stray outside read-only memory access.
 /// Hidden from `tools/list` and rejected by `tools/call` unless
 /// `AnamnesisServer::allow_admin_tools` is true. See BLUEPRINT §17.5 PR-A.
-pub const ADMIN_TOOLS: &[&str] = &["import_source"];
+pub const ADMIN_TOOLS: &[&str] = &["import_source", "forget_record"];
 
 /// Was this tool tagged as admin?
 fn is_admin_tool(name: &str) -> bool {
     ADMIN_TOOLS.contains(&name)
+}
+
+/// Render a `ForgottenRecord` into the MCP wire shape used by
+/// `forget_record`. Outcome is `"forgotten"` or `"already-forgotten"`.
+fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
+    json!({
+        "outcome":      outcome,
+        "record_id":    r.record_id.0,
+        "adapter":      r.adapter,
+        "instance":     if r.instance.is_empty() { Value::Null } else { Value::String(r.instance) },
+        "native_id":    r.native_id,
+        "native_path":  r.native_path,
+        "raw_hash":     r.raw_hash,
+        "reason":       r.reason,
+        "forgotten_at": r.forgotten_at,
+    })
 }
 
 /// Round-22 (§-1.5 PR-5): parse an RFC3339 timestamp into the unix
@@ -217,6 +233,7 @@ impl AnamnesisServer {
             "import_source" => self.tool_import_source(args.clone()).await,
             "trace_provenance" => self.tool_trace_provenance(args.clone()).await,
             "doctor" => self.tool_doctor(args.clone()).await,
+            "forget_record" => self.tool_forget_record(args.clone()).await,
             other => {
                 self.record_metric_safely(
                     Some(started_at),
@@ -1122,6 +1139,63 @@ impl AnamnesisServer {
         }))
     }
 
+    /// Round 73 (PR-72b): MCP-side counterpart to `anamnesis forget`.
+    /// Admin-gated — the dispatcher rejects this tool unless
+    /// `allow_admin_tools = true` so only operator-trusted clients
+    /// can mutate state. Reuses `Store::forget_record` from R72,
+    /// which writes the tombstone + cascades cleanup + suppresses
+    /// future re-imports.
+    ///
+    /// `NotFound` is surfaced as a tool error, not success: if no
+    /// tombstone was written, Anamnesis cannot guarantee "stay
+    /// forgotten" — the caller probably has the wrong id and
+    /// should be told loudly.
+    async fn tool_forget_record(&self, args: Value) -> Result<Value, String> {
+        let record_id = args
+            .get("record_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "forget_record.record_id is required".to_string())?;
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+
+        let outcome = self
+            .store
+            .forget_record(&RecordId(record_id.to_string()), reason.as_deref())
+            .map_err(|e| format!("forget_record: {e}"))?;
+
+        // Mirror the CLI's audit entry shape so operator history is
+        // entrypoint-agnostic (`anamnesis audit list` shows MCP and
+        // CLI forgets the same way). Same on-demand `Audit::new` the
+        // import path uses — keeps the server struct slim.
+        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
+            "forget",
+            json!({
+                "record_id": record_id,
+                "reason":    reason,
+                "outcome": match &outcome {
+                    anamnesis_store::ForgetRecordOutcome::Forgotten(_)        => "forgotten",
+                    anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(_) => "already-forgotten",
+                    anamnesis_store::ForgetRecordOutcome::NotFound            => "not-found",
+                },
+                "via": "mcp",
+            }),
+        ));
+
+        match outcome {
+            anamnesis_store::ForgetRecordOutcome::Forgotten(r) => {
+                Ok(forget_payload("forgotten", r))
+            }
+            anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(r) => {
+                Ok(forget_payload("already-forgotten", r))
+            }
+            anamnesis_store::ForgetRecordOutcome::NotFound => Err(format!(
+                "forget_record: no record with id {record_id:?} — nothing to forget"
+            )),
+        }
+    }
+
     /// Build the right adapter for a registered source and call
     /// `MemoryAdapter::health().await`. Mirrors the CLI's
     /// `run_adapter_health` — the dispatch table stays in lockstep with
@@ -1745,6 +1819,33 @@ fn tools_list_payload_all() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "forget_record",
+                "description": "Permanently forget a record by id. Writes a tombstone keyed on \
+                                `(adapter, instance, native_id)` so the same source can no longer \
+                                resurrect the memory through a subsequent `import_source`. \
+                                ADMIN-GATED: hidden from `tools/list` and rejected by `tools/call` \
+                                unless the server was started with `allow_admin_tools = true`. \
+                                Does NOT modify any upstream source data — Anamnesis stays \
+                                read-only with respect to the original Claude Code memory file / \
+                                mem0 row / etc. Calling with an unknown `record_id` is a tool error \
+                                (no tombstone was written, so the guarantee cannot be made).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "record_id": {
+                            "type": "string",
+                            "description": "Record id to forget — same shape as `search_memories.record_id`."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional operator-supplied reason. Stored on the tombstone \
+                                            for the future `list_forgotten` view."
+                        }
+                    },
+                    "required": ["record_id"]
+                }
             }
         ]
     })
@@ -2017,11 +2118,13 @@ mod tests {
     #[tokio::test]
     async fn tools_list_includes_all_when_admin_enabled() {
         // PR-A: with admin enabled, the full catalogue is back.
+        // Round 73 added `forget_record` as a 2nd admin tool, so the
+        // total climbed 6 → 7.
         let store = Store::open_in_memory().unwrap();
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
         for expected in [
             "search_memories",
             "get_record",
@@ -2029,6 +2132,7 @@ mod tests {
             "import_source",
             "trace_provenance",
             "doctor",
+            "forget_record",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
