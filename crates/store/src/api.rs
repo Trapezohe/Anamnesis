@@ -2912,7 +2912,7 @@ mod tests {
             single_jobs.push(job);
         }
         for job in &single_jobs {
-            single.complete_job(job, &vec![0.5; 4]).unwrap();
+            single.complete_job(job, &[0.5; 4]).unwrap();
         }
 
         // batched: drain all jobs at once via complete_jobs_batch
