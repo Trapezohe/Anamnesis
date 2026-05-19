@@ -13,8 +13,9 @@ pub mod cjk;
 mod vec_ext;
 
 pub use api::{
-    ChunkHit, ChunkLookup, LineageChain, PendingEmbeddingJob, RecordHeader, RecordSummary,
-    SearchFilter, SourceRow, SourceWithCounts, StoreStats, MAX_LIST_LIMIT,
+    ChunkHit, ChunkLookup, LineageChain, McpRequestMetric, McpToolMetricSummary,
+    PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter, SourceRow, SourceWithCounts,
+    StoreStats, MAX_LIST_LIMIT, MCP_METRICS_CAP,
 };
 
 use std::path::Path;
@@ -36,6 +37,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0005_vec_index",
         include_str!("migrations/0005_vec_index.sql"),
+    ),
+    (
+        "0006_mcp_request_metrics",
+        include_str!("migrations/0006_mcp_request_metrics.sql"),
     ),
 ];
 
@@ -243,7 +248,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
     }
 
     #[test]

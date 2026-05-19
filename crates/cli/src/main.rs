@@ -2912,6 +2912,33 @@ async fn cmd_doctor(
     println!(
         "Summary: {ok_count} healthy, {bad_count} unhealthy, {unreg_count} unregistered{stale_blurb}."
     );
+    // Round-69: append a small "MCP request latency" footer if the
+    // local store has any recorded MCP tool calls in the last 24h.
+    // The JSON output path keeps its existing shape (a wire change is
+    // a separate PR — see Round 69 PR body).
+    let metrics_window_secs: i64 = 86_400;
+    if let Ok(summaries) = store.summarize_mcp_request_metrics(Some(now - metrics_window_secs)) {
+        if !summaries.is_empty() {
+            println!();
+            println!("Recent MCP tool latency (24h)");
+            for s in summaries {
+                let last_rc = s
+                    .last_result_count
+                    .map(|n| format!(" n_hits={n}"))
+                    .unwrap_or_default();
+                println!(
+                    "  {tool} n={count} err={errors} p50={p50}ms p95={p95}ms p99={p99}ms last={last}ms{last_rc}",
+                    tool = s.tool,
+                    count = s.count,
+                    errors = s.errors,
+                    p50 = s.p50_ms,
+                    p95 = s.p95_ms,
+                    p99 = s.p99_ms,
+                    last = s.last_ms,
+                );
+            }
+        }
+    }
     apply_doctor_exit_gate(&rows, strict, strict_staleness)
 }
 

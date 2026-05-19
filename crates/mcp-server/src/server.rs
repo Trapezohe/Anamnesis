@@ -34,7 +34,7 @@ use anamnesis_core::embedding::EmbeddingProvider;
 use anamnesis_core::model::RecordId;
 use anamnesis_importer::{ImportOptions, ImportService};
 use anamnesis_search::{pack, ContextBudget, HybridOpts, HybridSearcher, SearchMode};
-use anamnesis_store::Store;
+use anamnesis_store::{McpRequestMetric, Store};
 use serde_json::{json, Value};
 
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
@@ -189,15 +189,14 @@ impl AnamnesisServer {
     async fn handle_tools_call(&self, id: Value, params: Value) -> JsonRpcResponse {
         let name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.to_string(),
-            None => return JsonRpcResponse::err(id, -32602, "missing tools/call.name"),
+            None => {
+                self.record_metric_safely(None, "unknown", false, 0, None, Some("missing_name"));
+                return JsonRpcResponse::err(id, -32602, "missing tools/call.name");
+            }
         };
         // BLUEPRINT §17.5 PR-A — the load-bearing check.
-        //
-        // We don't only filter admin tools from `tools/list` because a
-        // client may have cached the schema (or hard-coded the name) and
-        // call `tools/call` directly. Rejecting at the dispatcher is the
-        // only thing that genuinely closes the hole.
         if is_admin_tool(&name) && !self.allow_admin_tools {
+            self.record_metric_safely(None, &name, false, 0, None, Some("admin_disabled"));
             return JsonRpcResponse::err(
                 id,
                 -32601,
@@ -209,25 +208,142 @@ impl AnamnesisServer {
             );
         }
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+        let started_at = chrono::Utc::now().timestamp();
+        let t0 = std::time::Instant::now();
         let result = match name.as_str() {
-            "search_memories" => self.tool_search_memories(args).await,
-            "get_record" => self.tool_get_record(args).await,
+            "search_memories" => self.tool_search_memories(args.clone()).await,
+            "get_record" => self.tool_get_record(args.clone()).await,
             "list_sources" => self.tool_list_sources().await,
-            "import_source" => self.tool_import_source(args).await,
-            "trace_provenance" => self.tool_trace_provenance(args).await,
-            "doctor" => self.tool_doctor(args).await,
-            other => return JsonRpcResponse::err(id, -32602, format!("unknown tool: {other}")),
+            "import_source" => self.tool_import_source(args.clone()).await,
+            "trace_provenance" => self.tool_trace_provenance(args.clone()).await,
+            "doctor" => self.tool_doctor(args.clone()).await,
+            other => {
+                self.record_metric_safely(
+                    Some(started_at),
+                    &name,
+                    false,
+                    t0.elapsed().as_millis() as i64,
+                    None,
+                    Some("unknown_tool"),
+                );
+                return JsonRpcResponse::err(id, -32602, format!("unknown tool: {other}"));
+            }
         };
+        let duration_ms = t0.elapsed().as_millis() as i64;
         match result {
-            Ok(payload) => JsonRpcResponse::ok(
-                id,
-                json!({
-                    "content": [{"type": "text", "text": payload.to_string()}],
-                    "structuredContent": payload,
-                }),
-            ),
-            Err(msg) => JsonRpcResponse::err(id, -32603, msg),
+            Ok(payload) => {
+                let result_count = if name == "search_memories" {
+                    payload
+                        .get("results")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len() as i64)
+                } else {
+                    None
+                };
+                self.record_metric(
+                    started_at,
+                    &name,
+                    true,
+                    duration_ms,
+                    result_count,
+                    None,
+                    &args,
+                );
+                JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "content": [{"type": "text", "text": payload.to_string()}],
+                        "structuredContent": payload,
+                    }),
+                )
+            }
+            Err(msg) => {
+                self.record_metric(
+                    started_at,
+                    &name,
+                    false,
+                    duration_ms,
+                    None,
+                    Some("tool_error"),
+                    &args,
+                );
+                JsonRpcResponse::err(id, -32603, msg)
+            }
         }
+    }
+
+    /// Persist one MCP request metric. Writes happen *after* the
+    /// response payload is built, so metric I/O cannot widen the
+    /// latency the client observes. Failures are warned-and-swallowed:
+    /// observability must not break MCP request handling.
+    ///
+    /// Extracts `mode` / `source` / `instance` / `limit` from the
+    /// caller's arguments when the tool is `search_memories` — these
+    /// are non-PII structured fields the caller already disclosed by
+    /// passing them. Query text and raw args are never stored.
+    #[allow(clippy::too_many_arguments)]
+    fn record_metric(
+        &self,
+        started_at: i64,
+        tool: &str,
+        ok: bool,
+        duration_ms: i64,
+        result_count: Option<i64>,
+        error_kind: Option<&str>,
+        args: &Value,
+    ) {
+        let (mode, source, instance, limit_value) = if tool == "search_memories" {
+            (
+                args.get("mode").and_then(|v| v.as_str()).map(str::to_owned),
+                args.get("source")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                args.get("instance")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                args.get("limit").and_then(|v| v.as_i64()),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let metric = McpRequestMetric {
+            started_at,
+            tool: tool.to_string(),
+            ok,
+            duration_ms,
+            result_count,
+            error_kind: error_kind.map(str::to_owned),
+            mode,
+            source,
+            instance,
+            limit_value,
+        };
+        if let Err(e) = self.store.record_mcp_request_metric(&metric) {
+            tracing::warn!(error = ?e, tool, "failed to record MCP request metric");
+        }
+    }
+
+    /// Variant for the dispatch-gate paths where we don't have args
+    /// to mine and don't want to allocate empty options. Equivalent
+    /// to `record_metric` with all arg-derived fields `None`.
+    fn record_metric_safely(
+        &self,
+        started_at: Option<i64>,
+        tool: &str,
+        ok: bool,
+        duration_ms: i64,
+        result_count: Option<i64>,
+        error_kind: Option<&str>,
+    ) {
+        self.record_metric(
+            started_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            tool,
+            ok,
+            duration_ms,
+            result_count,
+            error_kind,
+            &Value::Null,
+        );
     }
 
     async fn handle_prompts_get(&self, id: Value, params: Value) -> JsonRpcResponse {
@@ -859,6 +975,13 @@ impl AnamnesisServer {
             Some(spec) => Some(parse_doctor_since(spec)?),
             None => None,
         };
+        // Round-69: `metrics_since` defaults to 24h (86_400 s). The
+        // arg accepts the same `"24h" / "7d" / raw seconds` grammar as
+        // `since` so users don't have to remember two conventions.
+        let metrics_window_secs: i64 = match args.get("metrics_since").and_then(|v| v.as_str()) {
+            Some(spec) => parse_doctor_since(spec)?,
+            None => 86_400,
+        };
         let now = chrono::Utc::now().timestamp();
 
         let store = &self.store;
@@ -917,6 +1040,35 @@ impl AnamnesisServer {
             .filter(|r| r.get("stale").and_then(|v| v.as_bool()).unwrap_or(false))
             .count();
 
+        // Round-69: per-tool MCP request latency summary, additive
+        // field. Existing `summary` / `sources` shape is unchanged.
+        let metric_since_ts = now - metrics_window_secs;
+        let tool_metrics_payload = match self
+            .store
+            .summarize_mcp_request_metrics(Some(metric_since_ts))
+        {
+            Ok(summaries) => summaries
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "tool": s.tool,
+                        "count": s.count,
+                        "errors": s.errors,
+                        "p50_ms": s.p50_ms,
+                        "p95_ms": s.p95_ms,
+                        "p99_ms": s.p99_ms,
+                        "last_ms": s.last_ms,
+                        "last_result_count": s.last_result_count,
+                        "last_started_at": s.last_started_at,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(error = ?e, "doctor: failed to summarize mcp request metrics");
+                Vec::new()
+            }
+        };
+
         Ok(json!({
             "summary": {
                 "total": rows.len(),
@@ -925,6 +1077,10 @@ impl AnamnesisServer {
                 "stale": stale_count,
             },
             "sources": rows,
+            "request_metrics": {
+                "window_seconds": metrics_window_secs,
+                "tools": tool_metrics_payload,
+            },
         }))
     }
 
@@ -1534,6 +1690,11 @@ fn tools_list_payload_all() -> Value {
                                             relative window. Shapes: `Nd` (days), `Nh` (hours), `Nm` (minutes), \
                                             or a bare integer (seconds). Never-imported sources always count \
                                             as stale once `since` is set."
+                        },
+                        "metrics_since": {
+                            "type": "string",
+                            "description": "Window for the `request_metrics` summary (per-tool count / errors / \
+                                            p50 / p95 / p99 / last_ms). Same grammar as `since`. Defaults to 24h."
                         }
                     }
                 }
@@ -2928,5 +3089,98 @@ mod tests {
         assert!(parse_doctor_since("").is_err());
         assert!(parse_doctor_since("xyz").is_err());
         assert!(parse_doctor_since("-1d").is_err());
+    }
+
+    // ─── Round-69: MCP request metrics surfaced via doctor ──────────
+
+    /// After N `search_memories` calls, `doctor` must report exactly
+    /// those N requests under `request_metrics.tools[]` — proving the
+    /// dispatcher-side instrumentation actually records.
+    #[tokio::test]
+    async fn doctor_reports_recent_search_memories_metrics() {
+        let s = server_with_records(&[make_record("claude-code", "r1", "alpha bench", 1_700)]);
+        for _ in 0..3 {
+            let _ = s
+                .handle(req(
+                    "tools/call",
+                    json!({
+                        "name": "search_memories",
+                        "arguments": {"query": "alpha", "mode": "fulltext", "limit": 5}
+                    }),
+                ))
+                .await;
+        }
+        let resp = s.handle(req("tools/call", json!({"name": "doctor"}))).await;
+        let body = resp.result.unwrap();
+        let metrics = body["structuredContent"]["request_metrics"].clone();
+        assert_eq!(metrics["window_seconds"], 86_400);
+        let tools = metrics["tools"].as_array().unwrap();
+        // Find search_memories — at minimum present; doctor invocation
+        // itself also lands in metrics (and is fine to ignore here).
+        let sm = tools
+            .iter()
+            .find(|t| t["tool"] == "search_memories")
+            .expect("search_memories must appear in metrics");
+        assert_eq!(sm["count"], 3, "should record exactly 3 search calls");
+        assert_eq!(sm["errors"], 0);
+        // Percentiles are non-decreasing.
+        let p50 = sm["p50_ms"].as_u64().unwrap();
+        let p95 = sm["p95_ms"].as_u64().unwrap();
+        let p99 = sm["p99_ms"].as_u64().unwrap();
+        assert!(p50 <= p95 && p95 <= p99, "p50={p50} p95={p95} p99={p99}");
+        assert!(sm["last_result_count"].as_i64().unwrap() >= 1);
+    }
+
+    /// Calling an unknown tool name must record an error metric without
+    /// throwing — confirms the metric write itself never breaks the
+    /// dispatcher's error path.
+    #[tokio::test]
+    async fn doctor_reports_unknown_tool_as_error() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req("tools/call", json!({"name": "no_such_tool"})))
+            .await;
+        assert!(
+            resp.error.is_some(),
+            "unknown tool must return JSON-RPC error"
+        );
+
+        let body = s
+            .handle(req("tools/call", json!({"name": "doctor"})))
+            .await
+            .result
+            .unwrap();
+        let tools = body["structuredContent"]["request_metrics"]["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let bad = tools
+            .iter()
+            .find(|t| t["tool"] == "no_such_tool")
+            .expect("unknown_tool error must be recorded in metrics");
+        assert_eq!(bad["errors"], 1);
+        assert_eq!(bad["count"], 1);
+    }
+
+    /// Existing `doctor` shape (`summary` + `sources`) must remain
+    /// unchanged — this is the back-compat guard for any agent that
+    /// already pinned to the pre-Round-69 wire format.
+    #[tokio::test]
+    async fn doctor_preserves_existing_summary_and_sources_shape() {
+        let s = server_with_records(&[]);
+        let body = s
+            .handle(req("tools/call", json!({"name": "doctor"})))
+            .await
+            .result
+            .unwrap();
+        let body = &body["structuredContent"];
+        assert!(body["summary"].is_object());
+        assert!(body["sources"].is_array());
+        for key in ["total", "ok", "unhealthy", "stale"] {
+            assert!(
+                body["summary"][key].is_number(),
+                "summary.{key} must still be present"
+            );
+        }
     }
 }
