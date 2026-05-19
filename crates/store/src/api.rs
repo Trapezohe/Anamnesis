@@ -1933,6 +1933,225 @@ impl Store {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Round-69: MCP request metrics
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hard cap on `mcp_request_metrics` rows. The writer trims after
+/// each insert, so the table never grows beyond this — bounded
+/// memory + bounded backup size, regardless of how chatty an MCP
+/// client gets. See `0006_mcp_request_metrics.sql` for the rationale.
+pub const MCP_METRICS_CAP: i64 = 5_000;
+
+/// One MCP `tools/call` request. Created by the MCP server around
+/// the dispatcher and handed to [`Store::record_mcp_request_metric`]
+/// after the response has been built.
+///
+/// **Privacy contract**: every field is either a tool name, a
+/// success bit, a duration, a result count, or a pre-existing
+/// structured argument (`mode`, `source`, `instance`, `limit`) the
+/// caller already chose to disclose by passing them. Query text,
+/// raw arguments, snippets, and result payloads are NEVER stored.
+/// Adding a field here that could carry user content is a bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRequestMetric {
+    /// Unix seconds at request entry.
+    pub started_at: i64,
+    /// `tools/call.name`.
+    pub tool: String,
+    /// Whether the tool returned successfully.
+    pub ok: bool,
+    /// Wall time of the dispatch, in milliseconds.
+    pub duration_ms: i64,
+    /// `search_memories`: number of hits returned. `None` for tools
+    /// whose result shape isn't list-like.
+    pub result_count: Option<i64>,
+    /// Short stable token (`"missing_arg"`, `"unknown_tool"`, …) on
+    /// error. `None` on success.
+    pub error_kind: Option<String>,
+    /// `search_memories`: `hybrid` / `fulltext` / `vector`.
+    pub mode: Option<String>,
+    /// `search_memories`: adapter filter, if the caller supplied one.
+    pub source: Option<String>,
+    /// `search_memories`: instance filter.
+    pub instance: Option<String>,
+    /// `search_memories`: requested `limit`.
+    pub limit_value: Option<i64>,
+}
+
+/// Per-tool aggregate over a recent window. Returned by
+/// [`Store::summarize_mcp_request_metrics`] and surfaced by `doctor`.
+///
+/// Percentiles use nearest-rank — the smallest value `v` such that
+/// at least `p%` of samples are `<= v`. Computed in Rust over the
+/// in-memory durations vector after the SQL pull; nothing fancy
+/// is needed at our row cap (5000).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolMetricSummary {
+    /// `tools/call.name`.
+    pub tool: String,
+    /// Number of requests in the window.
+    pub count: u64,
+    /// Number that returned an error.
+    pub errors: u64,
+    /// p50 / p95 / p99 duration in milliseconds.
+    pub p50_ms: u64,
+    /// p95 duration in milliseconds.
+    pub p95_ms: u64,
+    /// p99 duration in milliseconds.
+    pub p99_ms: u64,
+    /// Last request's duration in milliseconds.
+    pub last_ms: u64,
+    /// Last request's `result_count`, when applicable.
+    pub last_result_count: Option<i64>,
+    /// Unix seconds of the most recent request in the window.
+    pub last_started_at: i64,
+}
+
+impl Store {
+    /// Persist one MCP request metric. Trims the table to
+    /// [`MCP_METRICS_CAP`] rows on each insert so the table is
+    /// self-bounded — the user does not need to schedule cleanup.
+    ///
+    /// All writes are tiny (one INSERT + at most one DELETE) and
+    /// happen *after* the MCP response is built, so this cannot
+    /// affect tool latency observed by the client.
+    pub fn record_mcp_request_metric(&self, m: &McpRequestMetric) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO mcp_request_metrics( \
+                 started_at, tool, ok, duration_ms, \
+                 result_count, error_kind, \
+                 mode, source, instance, limit_value) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                m.started_at,
+                m.tool,
+                if m.ok { 1_i64 } else { 0_i64 },
+                m.duration_ms,
+                m.result_count,
+                m.error_kind,
+                m.mode,
+                m.source,
+                m.instance,
+                m.limit_value,
+            ],
+        )?;
+        // Self-trim: keep the most recent CAP rows. Cheap because
+        // `id` is the primary key and the row-count cap is tiny.
+        conn.execute(
+            "DELETE FROM mcp_request_metrics \
+             WHERE id <= (SELECT MAX(id) FROM mcp_request_metrics) - ?1",
+            params![MCP_METRICS_CAP],
+        )?;
+        Ok(())
+    }
+
+    /// Per-tool summary over the last `since_ts` (None = all-time).
+    /// Tools with zero requests in the window are absent from the
+    /// returned vec — callers default to "no data" semantics.
+    pub fn summarize_mcp_request_metrics(
+        &self,
+        since_ts: Option<i64>,
+    ) -> Result<Vec<McpToolMetricSummary>> {
+        let conn = self.conn.lock();
+        let rows: Vec<(String, i64, i64, i64, Option<i64>, i64)> = if let Some(t) = since_ts {
+            let mut stmt = conn.prepare(
+                "SELECT tool, ok, duration_ms, started_at, result_count, id \
+                 FROM mcp_request_metrics \
+                 WHERE started_at >= ?1 \
+                 ORDER BY tool ASC, started_at ASC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![t], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT tool, ok, duration_ms, started_at, result_count, id \
+                 FROM mcp_request_metrics \
+                 ORDER BY tool ASC, started_at ASC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+
+        // Group by tool. Per-tool: collect durations for percentile
+        // (nearest-rank), keep last started_at + last duration + last
+        // result_count (highest id wins because we ORDER BY started_at
+        // ASC, id ASC).
+        //
+        // Tuple = (ok_flag, duration_ms, started_at, result_count, id).
+        // Aliased so clippy::type_complexity stays quiet.
+        type Sample = (i64, i64, i64, Option<i64>, i64);
+        let mut by_tool: std::collections::BTreeMap<String, Vec<Sample>> =
+            std::collections::BTreeMap::new();
+        for (tool, ok, duration_ms, started_at, result_count, id) in rows {
+            by_tool
+                .entry(tool)
+                .or_default()
+                .push((ok, duration_ms, started_at, result_count, id));
+        }
+
+        let mut out = Vec::with_capacity(by_tool.len());
+        for (tool, mut samples) in by_tool {
+            // Already in (started_at, id) ASC order from the SQL.
+            let count = samples.len() as u64;
+            let errors = samples.iter().filter(|(ok, ..)| *ok == 0).count() as u64;
+            let last = samples.last().copied().expect("group has >=1 sample");
+            let last_started_at = last.2;
+            let last_ms = last.1.max(0) as u64;
+            let last_result_count = last.3;
+
+            samples.sort_by_key(|(_ok, d, _ts, _rc, _id)| *d);
+            let durations: Vec<i64> = samples.iter().map(|(_o, d, ..)| *d).collect();
+            let p = |q: f64| -> u64 {
+                if durations.is_empty() {
+                    return 0;
+                }
+                // Nearest-rank: ceil(q * N) - 1, clamped to [0, N-1].
+                let n = durations.len();
+                let rank = ((q * n as f64).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(n - 1);
+                durations[rank].max(0) as u64
+            };
+            out.push(McpToolMetricSummary {
+                tool,
+                count,
+                errors,
+                p50_ms: p(0.50),
+                p95_ms: p(0.95),
+                p99_ms: p(0.99),
+                last_ms,
+                last_result_count,
+                last_started_at,
+            });
+        }
+        Ok(out)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3561,5 +3780,165 @@ mod tests {
             count_after, 0,
             "stale vec0 rows from the old chunks should be deleted; found {count_after}"
         );
+    }
+
+    // ─── Round-69: MCP request metrics ──────────────────────────────
+
+    fn mk_metric(tool: &str, ok: bool, duration_ms: i64, started_at: i64) -> McpRequestMetric {
+        McpRequestMetric {
+            started_at,
+            tool: tool.into(),
+            ok,
+            duration_ms,
+            result_count: if ok && tool == "search_memories" {
+                Some(3)
+            } else {
+                None
+            },
+            error_kind: if ok { None } else { Some("missing_arg".into()) },
+            mode: if tool == "search_memories" {
+                Some("hybrid".into())
+            } else {
+                None
+            },
+            source: None,
+            instance: None,
+            limit_value: None,
+        }
+    }
+
+    #[test]
+    fn record_mcp_metric_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_mcp_request_metric(&mk_metric("search_memories", true, 12, 1_000))
+            .unwrap();
+        let summaries = store.summarize_mcp_request_metrics(None).unwrap();
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.tool, "search_memories");
+        assert_eq!(s.count, 1);
+        assert_eq!(s.errors, 0);
+        assert_eq!(s.p50_ms, 12);
+        assert_eq!(s.last_ms, 12);
+        assert_eq!(s.last_result_count, Some(3));
+    }
+
+    /// Percentiles must be ordered (p50 ≤ p95 ≤ p99) for any sample
+    /// distribution. Easiest invariant to catch off-by-one bugs in
+    /// the nearest-rank computation.
+    #[test]
+    fn summarize_mcp_metrics_percentiles_are_ordered() {
+        let store = Store::open_in_memory().unwrap();
+        for (i, d) in [3_i64, 8, 12, 15, 22, 41, 80, 110, 250, 1_400]
+            .iter()
+            .enumerate()
+        {
+            store
+                .record_mcp_request_metric(&mk_metric(
+                    "search_memories",
+                    true,
+                    *d,
+                    1_000 + i as i64,
+                ))
+                .unwrap();
+        }
+        let s = &store.summarize_mcp_request_metrics(None).unwrap()[0];
+        assert_eq!(s.count, 10);
+        assert!(
+            s.p50_ms <= s.p95_ms && s.p95_ms <= s.p99_ms,
+            "p50={} p95={} p99={}",
+            s.p50_ms,
+            s.p95_ms,
+            s.p99_ms,
+        );
+        // Tail of the synthetic distribution.
+        assert_eq!(s.p99_ms, 1_400);
+    }
+
+    /// `ok = false` entries must count toward `errors`, not `count -
+    /// errors`. Guards against a flag flip in the SQL or summary path.
+    #[test]
+    fn summarize_mcp_metrics_counts_errors_separately() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_mcp_request_metric(&mk_metric("search_memories", true, 10, 1_000))
+            .unwrap();
+        store
+            .record_mcp_request_metric(&mk_metric("search_memories", false, 7, 1_001))
+            .unwrap();
+        let s = &store.summarize_mcp_request_metrics(None).unwrap()[0];
+        assert_eq!(s.count, 2);
+        assert_eq!(s.errors, 1);
+    }
+
+    /// The 5000-row cap is the privacy + size guarantee. Writer must
+    /// trim on every insert so the table never grows past it,
+    /// regardless of how many requests show up.
+    #[test]
+    fn record_mcp_metric_self_caps_table() {
+        let store = Store::open_in_memory().unwrap();
+        // Punch past the cap by a small margin so the test stays fast.
+        let extra = 25;
+        for i in 0..(MCP_METRICS_CAP + extra) {
+            store
+                .record_mcp_request_metric(&mk_metric("search_memories", true, 10, 1_000 + i))
+                .unwrap();
+        }
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM mcp_request_metrics", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            n <= MCP_METRICS_CAP,
+            "row count {n} must be <= cap {MCP_METRICS_CAP}",
+        );
+        // The trimmed rows must be the *oldest*, so the most recent
+        // started_at is still present.
+        let most_recent: i64 = store
+            .conn()
+            .query_row("SELECT MAX(started_at) FROM mcp_request_metrics", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(most_recent, 1_000 + MCP_METRICS_CAP + extra - 1);
+    }
+
+    /// Privacy contract: the table must not contain *any* column
+    /// capable of carrying user-typed content. If a future migration
+    /// adds something like `query_text`, this guard fires and the
+    /// reviewer has to think before approving.
+    #[test]
+    fn mcp_metrics_table_has_no_user_content_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let cols: Vec<String> = {
+            let conn = store.conn();
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('mcp_request_metrics')")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let allowed = [
+            "id",
+            "started_at",
+            "tool",
+            "ok",
+            "duration_ms",
+            "result_count",
+            "error_kind",
+            "mode",
+            "source",
+            "instance",
+            "limit_value",
+        ];
+        for c in &cols {
+            assert!(
+                allowed.contains(&c.as_str()),
+                "unexpected column {c}: would need a privacy review before landing"
+            );
+        }
     }
 }
