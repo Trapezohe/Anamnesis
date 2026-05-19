@@ -139,6 +139,32 @@ enum Command {
         json: bool,
     },
 
+    /// Forget a record permanently.
+    ///
+    /// Writes a tombstone (`record_tombstones`) keyed on
+    /// `(adapter, instance, native_id)` and removes the live record
+    /// row + its chunks / embeddings / raw artifact. Re-importing
+    /// the same source will *not* resurrect this record — the
+    /// tombstone gate suppresses it inside `upsert_record` /
+    /// `upsert_records_batch` before any chunking work runs.
+    ///
+    /// Idempotent: re-running on an already-forgotten id exits 0
+    /// with `status: already-forgotten`. An id that never existed
+    /// exits non-zero with `status: not-found` so a typo in
+    /// scripted usage is loud.
+    Forget {
+        /// Record id (e.g. `claude-code:default:session-42`'s
+        /// hashed form, as printed by `anamnesis search`).
+        record_id: String,
+        /// Optional operator-supplied reason — stored on the
+        /// tombstone for the future `list_forgotten` view.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Emit JSON instead of the human one-liner.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Score retrieval quality (MRR@k / nDCG@k) over a judged query
     /// set and gate the result on configurable thresholds.
     ///
@@ -666,6 +692,11 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
+        Command::Forget {
+            record_id,
+            reason,
+            json,
+        } => cmd_forget(&data_dir, &record_id, reason.as_deref(), json),
         Command::EvalQuality {
             judgments,
             mode,
@@ -2211,6 +2242,99 @@ async fn cmd_search(
             }
             println!();
         }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// forget (Round 72 PR-72a)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis forget <record_id>` — write a tombstone + clear the
+/// live record. Future imports of the same `(adapter, instance,
+/// native_id)` triple are suppressed at the store layer.
+///
+/// Exit codes:
+///   - 0 on `Forgotten` or `AlreadyForgotten` (idempotent success).
+///   - non-zero on `NotFound` so a typo in scripted usage is loud.
+fn cmd_forget(
+    data_dir: &std::path::Path,
+    record_id: &str,
+    reason: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let id = anamnesis_core::model::RecordId(record_id.to_string());
+    let outcome = store.forget_record(&id, reason)?;
+
+    // §-1.5 PR-6 audit: every state-mutating CLI action lands in
+    // the stage-2 audit log so `anamnesis audit` can reconstruct
+    // who-forgot-what-when.
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "forget",
+        serde_json::json!({
+            "record_id": record_id,
+            "reason": reason,
+            "outcome": match &outcome {
+                anamnesis_store::ForgetRecordOutcome::Forgotten(_) => "forgotten",
+                anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(_) => "already-forgotten",
+                anamnesis_store::ForgetRecordOutcome::NotFound => "not-found",
+            },
+        }),
+    ));
+
+    if json {
+        let payload = match &outcome {
+            anamnesis_store::ForgetRecordOutcome::Forgotten(r)
+            | anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(r) => serde_json::json!({
+                "status": match outcome {
+                    anamnesis_store::ForgetRecordOutcome::Forgotten(_) => "forgotten",
+                    _ => "already-forgotten",
+                },
+                "record_id": r.record_id.0,
+                "adapter": r.adapter,
+                "instance": if r.instance.is_empty() { None } else { Some(&r.instance) },
+                "native_id": r.native_id,
+                "native_path": r.native_path,
+                "reason": r.reason,
+                "forgotten_at": r.forgotten_at,
+            }),
+            anamnesis_store::ForgetRecordOutcome::NotFound => serde_json::json!({
+                "status": "not-found",
+                "record_id": record_id,
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        match &outcome {
+            anamnesis_store::ForgetRecordOutcome::Forgotten(r) => {
+                let inst = if r.instance.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{}", r.instance)
+                };
+                println!(
+                    "forgotten {} (adapter={}{inst}, native_id={})",
+                    r.record_id.0, r.adapter, r.native_id
+                );
+                if let Some(reason) = &r.reason {
+                    println!("  reason: {reason}");
+                }
+            }
+            anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(r) => {
+                println!(
+                    "already forgotten at {}: {} (adapter={}, native_id={})",
+                    r.forgotten_at, r.record_id.0, r.adapter, r.native_id,
+                );
+            }
+            anamnesis_store::ForgetRecordOutcome::NotFound => {}
+        }
+    }
+
+    if matches!(outcome, anamnesis_store::ForgetRecordOutcome::NotFound) {
+        return Err(anyhow!(
+            "no record with id {record_id:?} — nothing to forget"
+        ));
     }
     Ok(())
 }

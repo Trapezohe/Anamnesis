@@ -224,6 +224,59 @@ pub struct ImportErrorRow {
     pub occurred_at: i64,
 }
 
+/// One row from `record_tombstones` — what `forget_record` writes
+/// and what `list_forgotten` (future) would surface.
+///
+/// Round 72 (PR-72a): the tombstone is keyed on the same
+/// `(adapter, instance, native_id)` natural tuple every adapter
+/// already uses, so the importer can short-circuit a forgotten
+/// record before it touches chunking / embedding.
+///
+/// `raw_hash` is captured so a future "allow only changed content"
+/// resurrection policy can compare the live source payload against
+/// what got forgotten. This PR is the conservative baseline — a
+/// tombstone is permanent until an explicit `unforget` (future).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgottenRecord {
+    /// Hashed `records.id` — primary key + the same id `forget_record` was called with.
+    pub record_id: RecordId,
+    /// Adapter id (e.g. `"claude-code"`).
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// Native id at the source.
+    pub native_id: String,
+    /// Native path at the source (when the adapter has one).
+    pub native_path: Option<String>,
+    /// `raw_hash` captured at forget time — pinned for a future
+    /// resurrection policy.
+    pub raw_hash: String,
+    /// Operator-supplied reason. Optional.
+    pub reason: Option<String>,
+    /// Unix seconds at the moment `forget_record` was committed.
+    pub forgotten_at: i64,
+}
+
+/// Result of [`Store::forget_record`]. Distinguishes the three
+/// observable outcomes so the CLI / future MCP surface can render
+/// them differently — and so repeated `forget` calls stay
+/// idempotent without becoming silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetRecordOutcome {
+    /// The record existed and is now forgotten. Carries the
+    /// tombstone that was just written.
+    Forgotten(ForgottenRecord),
+    /// A tombstone was already present for this record — nothing
+    /// changed, but the call is still a success from the operator's
+    /// point of view (the record remains forgotten).
+    AlreadyForgotten(ForgottenRecord),
+    /// Neither the record nor a tombstone exists. Callers that
+    /// treat this as user error (CLI) should exit non-zero; callers
+    /// that treat it as benign (future MCP idempotent path) can
+    /// ignore.
+    NotFound,
+}
+
 /// Lightweight projection of `records` — everything the search +
 /// packer + MCP wire format actually need, *without* the heavy
 /// content / tags / metadata payload that an `AnamnesisRecord` carries.
@@ -553,7 +606,22 @@ impl Store {
     ) -> Result<(u64, u64)> {
         let active = self.active_model()?;
         let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        // Immediate transaction so the (check tombstone) -> (write
+        // record) sequence is atomic against concurrent `forget` from
+        // another process — otherwise a forget that lands between
+        // those two statements would be silently overwritten.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Round 72 (PR-72a): tombstone gate. Forgotten records are
+        // suppressed at the *importer* layer too — but the store
+        // owns the final write, so this is the canonical
+        // enforcement point. The natural key
+        // (adapter, instance, native_id) is what every adapter uses,
+        // so the check covers all 13 sources uniformly.
+        if record_is_tombstoned(&tx, record)? {
+            tx.commit()?;
+            return Ok((0, 0));
+        }
 
         // Fast-path. The check must run before write_record / write_chunks
         // so neither the records UPSERT nor the chunks DELETE+INSERT fires
@@ -617,7 +685,9 @@ impl Store {
         }
         let active = self.active_model()?;
         let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        // Immediate transaction — see `upsert_record` for the
+        // forget-race-prevention rationale.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut total_records = 0u64;
         let mut total_chunks = 0u64;
         for (record, chunks, raw_payload_json) in items {
@@ -625,6 +695,12 @@ impl Store {
             // and `embedding_jobs.enqueued_at` semantics match per-record
             // `upsert_record`. Cheap; `Utc::now()` is microseconds.
             let now = chrono::Utc::now().timestamp();
+            // Round 72: skip forgotten records before raw_hash fast-path.
+            // The check is per-row inside the batch tx so a forget that
+            // lands mid-batch from a concurrent process still wins.
+            if record_is_tombstoned(&tx, record)? {
+                continue;
+            }
             let existing_hash: Option<String> = tx
                 .query_row(
                     "SELECT raw_hash FROM records WHERE id = ?1",
@@ -651,6 +727,152 @@ impl Store {
         Ok((total_records, total_chunks))
     }
 
+    /// Forget a record permanently: write a tombstone, delete the
+    /// record row (cascading raw_artifacts / record_chunks /
+    /// chunk_embeddings / embedding_jobs via FK), and remove any
+    /// vec0 rows for the record's chunks (vec0 is a virtual table
+    /// without FK cascade — same gotcha [`vec_ext::delete_vec_rows_for_record`]
+    /// solves in `write_chunks`).
+    ///
+    /// Idempotent: a second `forget_record` on the same id returns
+    /// [`ForgetRecordOutcome::AlreadyForgotten`] without touching the
+    /// store. If neither the record nor a tombstone exists,
+    /// returns [`ForgetRecordOutcome::NotFound`] — the caller decides
+    /// whether that's user error.
+    ///
+    /// The tombstone is keyed on `(adapter, instance, native_id)` so
+    /// `upsert_record` / `upsert_records_batch` can short-circuit a
+    /// re-import before any chunking / embedding work. This is what
+    /// makes "forget" mean "stay forgotten" instead of "delete until
+    /// the next `anamnesis import`."
+    pub fn forget_record(
+        &self,
+        id: &RecordId,
+        reason: Option<&str>,
+    ) -> Result<ForgetRecordOutcome> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Look up the live record's natural key + raw_hash. If the
+        // record is gone, fall back to checking the tombstone table
+        // so a repeat-forget remains idempotent.
+        let live: Option<(String, String, String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT adapter, instance, native_id, native_path, raw_hash \
+                 FROM records WHERE id = ?1",
+                params![id.0],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if live.is_none() {
+            // Maybe already forgotten — return the existing tombstone
+            // so the caller can render "already forgotten at <when>".
+            // Columns: adapter, instance, native_id, native_path,
+            //          raw_hash, reason, forgotten_at — aliased to
+            //          quiet clippy::type_complexity.
+            type TombstoneCols = (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                i64,
+            );
+            let existing: Option<TombstoneCols> = tx.query_row(
+                    "SELECT adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                     FROM record_tombstones WHERE record_id = ?1",
+                    params![id.0],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            tx.commit()?;
+            return Ok(match existing {
+                Some((
+                    adapter,
+                    instance,
+                    native_id,
+                    native_path,
+                    raw_hash,
+                    reason,
+                    forgotten_at,
+                )) => ForgetRecordOutcome::AlreadyForgotten(ForgottenRecord {
+                    record_id: id.clone(),
+                    adapter,
+                    instance,
+                    native_id,
+                    native_path,
+                    raw_hash,
+                    reason,
+                    forgotten_at,
+                }),
+                None => ForgetRecordOutcome::NotFound,
+            });
+        }
+
+        let (adapter, instance, native_id, native_path, raw_hash) = live.unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // Vec0 has no FK cascade — must drop manually *before* the
+        // records row goes (the helper joins through record_chunks).
+        crate::vec_ext::delete_vec_rows_for_record(&tx, &id.0)?;
+
+        tx.execute(
+            "INSERT INTO record_tombstones( \
+                 record_id, adapter, instance, native_id, native_path, \
+                 raw_hash, reason, forgotten_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id.0,
+                adapter,
+                instance,
+                native_id,
+                native_path,
+                raw_hash,
+                reason,
+                now
+            ],
+        )?;
+
+        // The cascade clears raw_artifacts / record_chunks /
+        // chunk_embeddings / embedding_jobs — all of those have
+        // FK ON DELETE CASCADE to records (or to record_chunks, which
+        // itself cascades). Verified at `0002_phase1.sql`.
+        tx.execute("DELETE FROM records WHERE id = ?1", params![id.0])?;
+
+        tx.commit()?;
+
+        Ok(ForgetRecordOutcome::Forgotten(ForgottenRecord {
+            record_id: id.clone(),
+            adapter,
+            instance,
+            native_id,
+            native_path,
+            raw_hash,
+            reason: reason.map(str::to_owned),
+            forgotten_at: now,
+        }))
+    }
+
     /// Re-enqueue embedding jobs for every chunk under a different model.
     /// Used by `anamnesis model use <other>` to trigger a full re-embed.
     pub fn rebuild_embedding_jobs(&self, model_id: &str) -> Result<u64> {
@@ -663,6 +885,25 @@ impl Store {
         )?;
         Ok(n as u64)
     }
+}
+
+/// Round 72 (PR-72a): is this `(adapter, instance, native_id)`
+/// triple in `record_tombstones`? Used by the upsert paths to
+/// short-circuit a forgotten record before any chunking work.
+///
+/// Lives as a free fn (not a method) so it can be called from
+/// inside an already-open `Transaction`. The store-public
+/// [`Store::forget_record`] guarantees the tombstone is keyed on
+/// the same triple every adapter's `RecordId::from_parts` builds.
+fn record_is_tombstoned(tx: &Transaction<'_>, r: &AnamnesisRecord) -> Result<bool> {
+    let instance = r.source.instance.as_deref().unwrap_or("");
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(1) FROM record_tombstones \
+         WHERE adapter = ?1 AND instance = ?2 AND native_id = ?3",
+        params![&r.source.adapter, instance, &r.provenance.native_id],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 fn write_record(tx: &Transaction<'_>, r: &AnamnesisRecord) -> Result<()> {
@@ -3940,5 +4181,193 @@ mod tests {
                 "unexpected column {c}: would need a privacy review before landing"
             );
         }
+    }
+
+    // ─── Round-72 PR-72a: forget_record + tombstone suppression ─────
+
+    /// Forget removes the record + cascades chunk_embeddings + vec0 +
+    /// raw_artifacts (via FK), and writes the tombstone the importer
+    /// can later consult.
+    #[test]
+    fn forget_record_deletes_indexes_and_writes_tombstone() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_active_model("local:fake:1").unwrap();
+        let mut r = make_record("claude-code", "rec-1", "secret content", Kind::Fact);
+        r.provenance.raw_hash = "h-1".into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        // Drive an embedding so vec0 has something to drop.
+        let jobs = store.claim_next_jobs("local:fake:1", 16).unwrap();
+        let vecs: Vec<Vec<f32>> = jobs.iter().map(|_| vec![0.1, 0.2, 0.3, 0.4]).collect();
+        store.complete_jobs_batch(&jobs, &vecs).unwrap();
+        // Sanity: record + chunks + embeddings + tombstone all in expected state.
+        let n_records: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_records, 1);
+        let n_tombstones_before: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_tombstones", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(n_tombstones_before, 0);
+
+        let outcome = store.forget_record(&r.id, Some("user requested")).unwrap();
+        match outcome {
+            ForgetRecordOutcome::Forgotten(rec) => {
+                assert_eq!(rec.adapter, "claude-code");
+                assert_eq!(rec.native_id, "rec-1");
+                assert_eq!(rec.raw_hash, "h-1");
+                assert_eq!(rec.reason.as_deref(), Some("user requested"));
+            }
+            other => panic!("expected Forgotten, got {other:?}"),
+        }
+
+        let n_records_after: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_records_after, 0, "record row should be gone");
+        // FK cascade should have cleared the chunk rows too.
+        let n_chunks: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM record_chunks WHERE record_id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_chunks, 0);
+        let n_embeddings: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM chunk_embeddings_vec_d4", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            n_embeddings, 0,
+            "vec0 rows for forgotten chunks should be cleared"
+        );
+        let n_tombstones_after: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_tombstones", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(n_tombstones_after, 1);
+    }
+
+    /// A second `forget` on the same id must return `AlreadyForgotten`
+    /// with the original tombstone — never silently double-write.
+    #[test]
+    fn forget_record_second_call_returns_already_forgotten() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("mem0", "m1", "x", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        let first = store.forget_record(&r.id, Some("once")).unwrap();
+        let second = store.forget_record(&r.id, Some("twice")).unwrap();
+        assert!(matches!(first, ForgetRecordOutcome::Forgotten(_)));
+        match second {
+            ForgetRecordOutcome::AlreadyForgotten(rec) => {
+                assert_eq!(
+                    rec.reason.as_deref(),
+                    Some("once"),
+                    "must preserve original reason"
+                );
+            }
+            other => panic!("expected AlreadyForgotten, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forget_record_returns_not_found_when_id_never_existed() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId::from_parts("claude-code", None, "never-existed");
+        let outcome = store.forget_record(&phantom, None).unwrap();
+        assert!(matches!(outcome, ForgetRecordOutcome::NotFound));
+    }
+
+    /// After a record is forgotten, re-running upsert with the same
+    /// natural key (i.e. what a re-import would do) must be a no-op
+    /// — no `records` row resurrected, no chunks written, no
+    /// embedding jobs enqueued.
+    #[test]
+    fn tombstoned_record_upsert_is_suppressed() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_active_model("local:fake:1").unwrap();
+        let mut r = make_record("claude-code", "rec-x", "first body", Kind::Fact);
+        r.provenance.raw_hash = "h-first".into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store.forget_record(&r.id, None).unwrap();
+
+        // Simulate a re-import — same natural key, but the source
+        // content may have drifted (raw_hash changes too).
+        let mut reimport = make_record("claude-code", "rec-x", "second body", Kind::Fact);
+        reimport.provenance.raw_hash = "h-second".into();
+        let new_chunks = Chunker::default().chunk(&reimport.id, &reimport.content);
+        let (recs, chunks_n) = store.upsert_record(&reimport, &new_chunks, None).unwrap();
+        assert_eq!(
+            (recs, chunks_n),
+            (0, 0),
+            "tombstone must suppress re-upsert"
+        );
+
+        let n: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE id = ?1",
+                params![reimport.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        let n_jobs: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM embedding_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            n_jobs, 0,
+            "no embedding jobs should be enqueued for a forgotten record"
+        );
+    }
+
+    /// Same suppression, batched. Importer-side path goes through
+    /// `upsert_records_batch` for the 1795-record corpus, so the
+    /// tombstone gate has to be inside the batch loop too.
+    #[test]
+    fn tombstoned_record_batch_upsert_is_suppressed() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("claude-code", "a", "alpha", Kind::Fact);
+        r1.provenance.raw_hash = "h-a".into();
+        let mut r2 = make_record("claude-code", "b", "beta", Kind::Fact);
+        r2.provenance.raw_hash = "h-b".into();
+        let c1 = Chunker::default().chunk(&r1.id, &r1.content);
+        let c2 = Chunker::default().chunk(&r2.id, &r2.content);
+        let batch = vec![(&r1, c1.as_slice(), None), (&r2, c2.as_slice(), None)];
+        let (recs, _) = store.upsert_records_batch(&batch).unwrap();
+        assert_eq!(recs, 2);
+
+        store.forget_record(&r1.id, None).unwrap();
+
+        // Re-import the same batch — r1 is tombstoned and must be
+        // suppressed, r2 is unchanged so it's a raw_hash no-op.
+        let (re_recs, re_chunks) = store.upsert_records_batch(&batch).unwrap();
+        assert_eq!(
+            (re_recs, re_chunks),
+            (0, 0),
+            "tombstoned r1 must not resurrect; unchanged r2 is raw_hash no-op",
+        );
     }
 }
