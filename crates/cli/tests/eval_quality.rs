@@ -82,10 +82,21 @@ fn judgments_jsonl(home: &Path) -> String {
     // instance to `""` and the JudgedRecordRef matcher does the same on
     // `None`, so they meet at "" naturally. Adding `"instance": "default"`
     // here would *create* a mismatch.
+    //
+    // Build the JSON via `serde_json::json!` so Windows-style native_ids
+    // (which contain backslashes from `path::Display`) get properly
+    // escaped — hand-formatting blew up on the Windows CI runner.
     let line = |id: &str, q: &str, nid: &str| {
-        format!(
-            "{{\"id\":\"{id}\",\"query\":\"{q}\",\"relevant\":[{{\"adapter\":\"claude-code\",\"native_id\":\"{nid}\",\"grade\":3}}]}}\n"
-        )
+        let v = serde_json::json!({
+            "id": id,
+            "query": q,
+            "relevant": [{
+                "adapter": "claude-code",
+                "native_id": nid,
+                "grade": 3,
+            }],
+        });
+        format!("{}\n", serde_json::to_string(&v).unwrap())
     };
     let mut out = String::new();
     out.push_str(&line("q-alpha", "crocodileTeaRocket", &alpha));
