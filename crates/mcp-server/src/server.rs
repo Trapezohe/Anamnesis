@@ -48,7 +48,12 @@ pub const PROTOCOL_VERSION: &str = "2025-03-26";
 /// filesystem paths, or otherwise stray outside read-only memory access.
 /// Hidden from `tools/list` and rejected by `tools/call` unless
 /// `AnamnesisServer::allow_admin_tools` is true. See BLUEPRINT §17.5 PR-A.
-pub const ADMIN_TOOLS: &[&str] = &["import_source", "forget_record", "list_forgotten"];
+pub const ADMIN_TOOLS: &[&str] = &[
+    "import_source",
+    "forget_record",
+    "unforget_record",
+    "list_forgotten",
+];
 
 /// Was this tool tagged as admin?
 fn is_admin_tool(name: &str) -> bool {
@@ -234,6 +239,7 @@ impl AnamnesisServer {
             "trace_provenance" => self.tool_trace_provenance(args.clone()).await,
             "doctor" => self.tool_doctor(args.clone()).await,
             "forget_record" => self.tool_forget_record(args.clone()).await,
+            "unforget_record" => self.tool_unforget_record(args.clone()).await,
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             other => {
                 self.record_metric_safely(
@@ -1197,6 +1203,56 @@ impl AnamnesisServer {
         }
     }
 
+    /// Round 75 (PR-75): MCP-side counterpart to `anamnesis unforget`.
+    /// Admin-gated. Removes the tombstone so the source can resurrect
+    /// the memory on its next `import_source`. Does NOT recreate the
+    /// `records` row — same truthful-design constraint as the CLI:
+    /// Anamnesis is a read-only mirror of source data.
+    ///
+    /// `NotForgotten` is a tool error (not a silent success) because
+    /// the operator almost certainly typoed an id from
+    /// `list_forgotten` — better to surface the mistake than to log
+    /// a successful no-op.
+    async fn tool_unforget_record(&self, args: Value) -> Result<Value, String> {
+        let record_id = args
+            .get("record_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "unforget_record.record_id is required".to_string())?;
+
+        let outcome = self
+            .store
+            .unforget_record(&RecordId(record_id.to_string()))
+            .map_err(|e| format!("unforget_record: {e}"))?;
+
+        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
+            "unforget",
+            json!({
+                "record_id": record_id,
+                "outcome": match &outcome {
+                    anamnesis_store::UnforgetRecordOutcome::Unforgotten(_) => "unforgotten",
+                    anamnesis_store::UnforgetRecordOutcome::NotForgotten   => "not-forgotten",
+                },
+                "via": "mcp",
+            }),
+        ));
+
+        match outcome {
+            anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => Ok(json!({
+                "outcome":             "unforgotten",
+                "record_id":           r.record_id.0,
+                "adapter":             r.adapter,
+                "instance":            if r.instance.is_empty() { Value::Null } else { Value::String(r.instance) },
+                "native_id":           r.native_id,
+                "forgotten_at":        r.forgotten_at,
+                "record_resurrected":  false,
+                "requires_reimport":   true,
+            })),
+            anamnesis_store::UnforgetRecordOutcome::NotForgotten => Err(format!(
+                "unforget_record: no tombstone for id {record_id:?} — nothing to unforget"
+            )),
+        }
+    }
+
     /// Round 74 (PR-74): MCP audit view for `record_tombstones`.
     /// Admin-gated and redaction-by-default — `native_path`,
     /// `raw_hash`, `reason` are reported as `has_*` booleans
@@ -1915,6 +1971,27 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "unforget_record",
+                "description": "Remove a tombstone so the source can resurrect the memory on its \
+                                next `import_source`. Does NOT recreate the record itself — the \
+                                tombstone only stored provenance, so 'unforget' means 'allowed to \
+                                come back if the source re-emits.' Anamnesis stays a read-only \
+                                mirror; resurrection happens through the source's own re-import, \
+                                not through this tool. ADMIN-GATED. Calling with an id that has \
+                                no tombstone is a tool error (likely typo from `list_forgotten`).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "record_id": {
+                            "type": "string",
+                            "description": "Record id to unforget — same shape as \
+                                            `list_forgotten.rows[].record_id`."
+                        }
+                    },
+                    "required": ["record_id"]
+                }
+            },
+            {
                 "name": "list_forgotten",
                 "description": "List tombstoned records, newest-first. Read-only audit view over \
                                 `record_tombstones`. ADMIN-GATED — hidden from `tools/list` and \
@@ -2225,8 +2302,9 @@ mod tests {
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        // R73 added forget_record (6→7). R74 added list_forgotten (7→8).
-        assert_eq!(names.len(), 8);
+        // R73 added forget_record (6→7). R74 added list_forgotten
+        // (7→8). R75 added unforget_record (8→9).
+        assert_eq!(names.len(), 9);
         for expected in [
             "search_memories",
             "get_record",
@@ -2235,6 +2313,7 @@ mod tests {
             "trace_provenance",
             "doctor",
             "forget_record",
+            "unforget_record",
             "list_forgotten",
         ] {
             assert!(
