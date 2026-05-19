@@ -55,7 +55,10 @@ jobs:
       - name: build (no-default-features)
         run: cargo build --workspace --all-targets --no-default-features
       - name: test (no-default-features)
-        run: cargo test --workspace --all-targets --no-default-features -- --test-threads=2
+        # Exclude benches: criterion's harness=false binaries reject libtest
+        # args like --test-threads. Benches are still compiled by the build
+        # step above and by clippy (--all-targets), just not executed here.
+        run: cargo test --workspace --lib --bins --tests --examples --no-default-features -- --test-threads=2
 
   # Separate job: build + test with the `sse` feature so the HTTP
   # transport (axum) + generic-mcp loopback are exercised. Still skips
