@@ -818,6 +818,45 @@ impl Store {
         Ok(row)
     }
 
+    /// Batch variant of `get_record` — fetches many records in a single
+    /// `WHERE id IN (?, ?, …)` query, returning a `HashMap<RecordId,
+    /// AnamnesisRecord>` indexed by id. Missing ids are simply absent
+    /// from the map (callers like the search packer want "skip vanished
+    /// records" semantics, not an error).
+    ///
+    /// Used by the search packer to retire its per-id `get_record` loop.
+    pub fn get_records_by_ids(
+        &self,
+        ids: &[RecordId],
+    ) -> Result<std::collections::HashMap<RecordId, AnamnesisRecord>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, adapter, instance, content, scope, kind, \
+                    created_at, updated_at, tags, metadata, \
+                    native_id, native_path, captured_at, raw_hash, schema_version, \
+                    derived_from \
+             FROM records WHERE id IN ({})",
+            placeholders
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| &id.0 as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_iter), record_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for r in rows {
+            out.insert(r.id.clone(), r);
+        }
+        Ok(out)
+    }
+
     /// Direct children of `parent` — records whose
     /// `provenance.derived_from == parent`. Hits the
     /// `idx_records_derived_from` partial index (see migration 0004).
@@ -1334,6 +1373,119 @@ impl Store {
     }
 
     /// Mark a job done and persist its embedding.
+    /// Batch variant of `claim_next_job` — atomically claims up to `limit`
+    /// pending jobs in FIFO order in a single transaction. Used by the
+    /// embedding worker's batched drain path so it can hand a whole
+    /// `embed_batch` worth of texts to the provider in one call.
+    ///
+    /// Empty queue → returns `Vec::new()` (not an error).
+    pub fn claim_next_jobs(
+        &self,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingEmbeddingJob>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, chunk_id, content_hash FROM embedding_jobs \
+                 WHERE status = 'pending' AND model_id = ?1 \
+                 ORDER BY enqueued_at ASC LIMIT ?2",
+            )?;
+            let mapped = stmt
+                .query_map(params![model_id, limit as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        let mut jobs = Vec::with_capacity(rows.len());
+        for (job_id, chunk_id, content_hash) in rows {
+            tx.execute(
+                "UPDATE embedding_jobs SET status = 'in_progress', claimed_at = ?1 \
+                 WHERE id = ?2",
+                params![now, job_id],
+            )?;
+            let content: String = tx.query_row(
+                "SELECT content FROM record_chunks WHERE id = ?1",
+                params![chunk_id],
+                |r| r.get(0),
+            )?;
+            jobs.push(PendingEmbeddingJob {
+                job_id,
+                chunk_id,
+                content_hash: ContentHash(content_hash),
+                model_id: model_id.to_string(),
+                content,
+            });
+        }
+        tx.commit()?;
+        Ok(jobs)
+    }
+
+    /// Batch variant of `complete_job` — persists embeddings for an entire
+    /// batch of jobs in one transaction, paired with their `complete` state
+    /// transitions. Vector slice length must equal `jobs.len()`.
+    ///
+    /// Either the whole batch commits or the whole batch rolls back; callers
+    /// that need per-job error isolation should fall back to `complete_job`.
+    pub fn complete_jobs_batch(
+        &self,
+        jobs: &[PendingEmbeddingJob],
+        vectors: &[Vec<f32>],
+    ) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        if jobs.len() != vectors.len() {
+            return Err(StoreError::Corruption(format!(
+                "complete_jobs_batch: jobs.len()={} != vectors.len()={}",
+                jobs.len(),
+                vectors.len()
+            )));
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        for (job, vector) in jobs.iter().zip(vectors.iter()) {
+            let dim = vector.len() as i64;
+            let blob = f32_to_blob(vector);
+            tx.execute(
+                "INSERT INTO chunk_embeddings(chunk_id, model_id, content_hash, dim, embedding, created_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(chunk_id, model_id) DO UPDATE SET \
+                    content_hash = excluded.content_hash, \
+                    dim = excluded.dim, \
+                    embedding = excluded.embedding, \
+                    created_at = excluded.created_at",
+                params![
+                    job.chunk_id,
+                    job.model_id,
+                    job.content_hash.0,
+                    dim,
+                    blob,
+                    now,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE embedding_jobs SET status = 'done', finished_at = ?1, error = NULL \
+                 WHERE id = ?2",
+                params![now, job.job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark a job done and persist its embedding.
     pub fn complete_job(&self, job: &PendingEmbeddingJob, vector: &[f32]) -> Result<()> {
         let dim = vector.len() as i64;
         let blob = f32_to_blob(vector);
@@ -1433,7 +1585,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::chunker::{Chunker, ChunkerConfig};
     use anamnesis_core::model::{Embedding, Provenance, SourceDescriptor};
     use chrono::Utc;
 
@@ -2651,6 +2803,151 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM record_chunks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(single_chunks_n, batched_chunks_n);
+    }
+
+    // ─── Round-63: claim/complete batch parity + get_records_by_ids ──
+
+    /// `claim_next_jobs(model, n)` must return the same jobs in the same
+    /// order as `n` consecutive `claim_next_job` calls would.
+    #[test]
+    fn claim_next_jobs_parity_with_claim_next_job() {
+        let single = Store::open_in_memory().unwrap();
+        let batched = Store::open_in_memory().unwrap();
+        single.set_active_model("test:model:1").unwrap();
+        batched.set_active_model("test:model:1").unwrap();
+
+        // Seed both stores with the same 5 chunks (one record, fan-out by
+        // tiny chunker budget so we get N distinct embedding_jobs).
+        let r = make_record("claude-code", "p", &"x ".repeat(40), Kind::Fact);
+        let chunker = Chunker::new(ChunkerConfig {
+            max_tokens: 10,
+            min_tokens: 1,
+        });
+        let chunks = chunker.chunk(&r.id, &r.content);
+        assert!(
+            chunks.len() >= 5,
+            "test needs >=5 chunks; got {}",
+            chunks.len()
+        );
+        single.upsert_record(&r, &chunks, None).unwrap();
+        batched.upsert_record(&r, &chunks, None).unwrap();
+
+        let mut single_drained = Vec::new();
+        while let Some(job) = single.claim_next_job("test:model:1").unwrap() {
+            single_drained.push((job.chunk_id, job.content_hash.0));
+        }
+        let batched_drained: Vec<(String, String)> = batched
+            .claim_next_jobs("test:model:1", chunks.len() + 4)
+            .unwrap()
+            .into_iter()
+            .map(|j| (j.chunk_id, j.content_hash.0))
+            .collect();
+
+        assert_eq!(single_drained, batched_drained);
+    }
+
+    /// `get_records_by_ids` must match what N independent `get_record`
+    /// calls would return, with missing ids simply absent from the map.
+    #[test]
+    fn get_records_by_ids_parity_with_get_record() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("claude-code", "one", "first", Kind::Fact);
+        r1.provenance.raw_hash = "h1".into();
+        let mut r2 = make_record("claude-code", "two", "second", Kind::Fact);
+        r2.provenance.raw_hash = "h2".into();
+        let mut r3 = make_record("claude-code", "three", "third", Kind::Fact);
+        r3.provenance.raw_hash = "h3".into();
+        store
+            .upsert_record(&r1, &Chunker::default().chunk(&r1.id, &r1.content), None)
+            .unwrap();
+        store
+            .upsert_record(&r2, &Chunker::default().chunk(&r2.id, &r2.content), None)
+            .unwrap();
+        store
+            .upsert_record(&r3, &Chunker::default().chunk(&r3.id, &r3.content), None)
+            .unwrap();
+
+        let phantom = RecordId::from_parts("claude-code", None, "missing");
+        let single_results: Vec<Option<AnamnesisRecord>> = [&r1.id, &phantom, &r2.id, &r3.id]
+            .iter()
+            .map(|id| store.get_record(id).unwrap())
+            .collect();
+        let batched_map = store
+            .get_records_by_ids(&[r1.id.clone(), phantom.clone(), r2.id.clone(), r3.id.clone()])
+            .unwrap();
+
+        // The map must hold exactly the 3 existing ids (no entry for `phantom`).
+        assert_eq!(batched_map.len(), 3);
+        assert!(!batched_map.contains_key(&phantom));
+        for (idx, id) in [&r1.id, &phantom, &r2.id, &r3.id].iter().enumerate() {
+            let single = &single_results[idx];
+            let batched = batched_map.get(id);
+            assert_eq!(single.as_ref(), batched);
+        }
+    }
+
+    /// `complete_jobs_batch` must leave the store in the same end-state
+    /// as N independent `complete_job` calls would.
+    #[test]
+    fn complete_jobs_batch_parity_with_complete_job() {
+        let single = Store::open_in_memory().unwrap();
+        let batched = Store::open_in_memory().unwrap();
+        single.set_active_model("test:model:1").unwrap();
+        batched.set_active_model("test:model:1").unwrap();
+
+        // Seed with 3 chunks via per-record path.
+        let r = make_record("claude-code", "p", &"x ".repeat(40), Kind::Fact);
+        let chunker = Chunker::new(ChunkerConfig {
+            max_tokens: 15,
+            min_tokens: 1,
+        });
+        let chunks = chunker.chunk(&r.id, &r.content);
+        assert!(chunks.len() >= 3);
+        single.upsert_record(&r, &chunks, None).unwrap();
+        batched.upsert_record(&r, &chunks, None).unwrap();
+
+        // single: drain jobs one at a time via complete_job
+        let mut single_jobs = Vec::new();
+        while let Some(job) = single.claim_next_job("test:model:1").unwrap() {
+            single_jobs.push(job);
+        }
+        for job in &single_jobs {
+            single.complete_job(job, &[0.5; 4]).unwrap();
+        }
+
+        // batched: drain all jobs at once via complete_jobs_batch
+        let batch_jobs = batched
+            .claim_next_jobs("test:model:1", single_jobs.len() + 10)
+            .unwrap();
+        let vectors: Vec<Vec<f32>> = batch_jobs.iter().map(|_| vec![0.5; 4]).collect();
+        batched.complete_jobs_batch(&batch_jobs, &vectors).unwrap();
+
+        // Both stores should now have the same status mix.
+        for store in [&single, &batched] {
+            let done: i64 = store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'done'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(done as usize, single_jobs.len());
+        }
+        // …and the same chunk_embeddings rows.
+        let single_n: i64 = single
+            .conn()
+            .query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let batched_n: i64 = batched
+            .conn()
+            .query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(single_n, batched_n);
     }
 
     /// A batch that mixes already-imported (raw_hash-equal → no-op) records
