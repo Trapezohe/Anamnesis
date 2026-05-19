@@ -35,8 +35,8 @@
 
 use anamnesis_core::chunker::estimate_tokens;
 use anamnesis_core::error::{Error, Result};
-use anamnesis_core::model::{AnamnesisRecord, Kind, RecordId};
-use anamnesis_store::Store;
+use anamnesis_core::model::{Kind, RecordId};
+use anamnesis_store::{RecordHeader, Store};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
@@ -83,10 +83,24 @@ impl Default for ContextBudget {
 }
 
 /// One record returned by the packer, with the chunks that matched.
+///
+/// `record` is a [`RecordHeader`] (Round-68 change), *not* a full
+/// `AnamnesisRecord`. The packer + every downstream consumer
+/// (MCP wire, CLI rendering, `find_related` prompt) only reads
+/// metadata — adapter / instance / kind / scope / created_at /
+/// provenance — and gets the actual chunk text from
+/// [`RankedChunk::content`] on `matched_chunks`. Carrying full
+/// `record.content` through the search path would only repeat the
+/// transcript data already in chunks (and chew through 64 KiB+ per
+/// hit for Claude Code / Codex records) for fields nobody reads.
+///
+/// Callers that genuinely need full record content (e.g. the MCP
+/// `get_record` tool) should call [`Store::get_record`] /
+/// [`Store::get_records_by_ids`] directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackedRecord {
-    /// Full record metadata (provenance, scope, kind, tags, …).
-    pub record: AnamnesisRecord,
+    /// Metadata projection of the parent record.
+    pub record: RecordHeader,
     /// Chunks that hit the query, score-descending.
     pub matched_chunks: Vec<RankedChunk>,
     /// Best chunk score in this record — the record-level rank key.
@@ -113,13 +127,17 @@ pub fn pack(
         groups.entry(key).or_default().push(h.clone());
     }
     // 2. Materialize: look up record metadata in one batched query.
-    //    Round 63 perf: replace per-id `get_record` loop (one prepare +
-    //    query per record) with a single `get_records_by_ids` IN(?) call.
+    //    Round 63 perf: replace per-id `get_record` loop with a single
+    //    IN(?) call. Round 68 perf: fetch `RecordHeader` instead of
+    //    `AnamnesisRecord` — drops `content` / `tags` / `metadata` from
+    //    the SQL projection, which matters at scale because Claude
+    //    Code / Codex adapter records carry multi-KB rendered
+    //    transcripts in `content` that the wire format never returns.
     //    Skip vanished records (missing from the returned map).
     let record_ids: Vec<RecordId> = order_seen.iter().map(|rid| RecordId(rid.clone())).collect();
     let mut record_map = store
-        .get_records_by_ids(&record_ids)
-        .map_err(|e| Error::Other(format!("store get_records_by_ids: {e}")))?;
+        .get_record_headers_by_ids(&record_ids)
+        .map_err(|e| Error::Other(format!("store get_record_headers_by_ids: {e}")))?;
 
     let mut materialized: Vec<PackedRecord> = Vec::new();
     for rid in &order_seen {
@@ -269,7 +287,7 @@ fn score_band(score: f64) -> i64 {
 /// (a Claude Code memory file rewritten, a mem0 row touched) outranks
 /// one that hasn't been seen in a year, even if its original creation
 /// is older.
-fn best_timestamp(record: &AnamnesisRecord) -> DateTime<Utc> {
+fn best_timestamp(record: &RecordHeader) -> DateTime<Utc> {
     record
         .updated_at
         .unwrap_or(record.created_at)

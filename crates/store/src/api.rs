@@ -224,6 +224,44 @@ pub struct ImportErrorRow {
     pub occurred_at: i64,
 }
 
+/// Lightweight projection of `records` — everything the search +
+/// packer + MCP wire format actually need, *without* the heavy
+/// content / tags / metadata payload that an `AnamnesisRecord` carries.
+///
+/// Round 68 motivation: `pack()` in the search crate used to call
+/// `get_records_by_ids` for every hit, which selected `records.content`
+/// (a multi-KB transcript blob for Claude Code / Codex adapters) and
+/// JSON-parsed `tags` / `metadata` per row — only to discard the
+/// content downstream because the MCP wire shape returns chunk snippets,
+/// not full records. `RecordHeader` is the projection MCP / CLI / packer
+/// actually consume, so the read path can skip the expensive columns.
+///
+/// If a caller does need the full record (e.g. `tool_get_record`), it
+/// should still call [`Store::get_record`] / [`Store::get_records_by_ids`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordHeader {
+    /// Record id (e.g. `"claude-code:/Users/.../session.jsonl:42"`).
+    pub id: RecordId,
+    /// Adapter + instance + (empty) version. Version is unused by the
+    /// store; kept for shape parity with `AnamnesisRecord.source`.
+    pub source: SourceDescriptor,
+    /// `User` / `Project` / `Global`.
+    pub scope: Scope,
+    /// Record kind (`Fact`, `Preference`, `Skill`, …).
+    pub kind: Kind,
+    /// When the record was first ingested.
+    pub created_at: DateTime<Utc>,
+    /// Last update time if the record has been re-imported.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Provenance — caller (CLI / MCP) uses `native_path` to render
+    /// "where this came from" and `native_id` for the trace UI.
+    pub provenance: Provenance,
+    /// Schema version of the row at write time. Kept so a future
+    /// migration that wants to fan out by version doesn't have to
+    /// add another projection.
+    pub schema_version: u32,
+}
+
 /// Full row from `sources` — what `list_sources_full` and `get_source`
 /// return. The legacy `list_sources` 3-tuple shape stays for back-compat.
 ///
@@ -889,6 +927,55 @@ impl Store {
         Ok(out)
     }
 
+    /// Round-68: the metadata-only variant of `get_records_by_ids`.
+    ///
+    /// Returns a `HashMap` of `RecordHeader` keyed by id — every field
+    /// the search packer / MCP wire / CLI rendering actually consume,
+    /// without selecting or deserialising `content`, `tags`, or
+    /// `metadata`. For long-transcript records (Claude Code / Codex
+    /// adapter records can carry 64KiB+ of rendered session text) this
+    /// is dramatically cheaper on the search hot path, where the
+    /// downstream caller would have thrown the content away anyway.
+    ///
+    /// Missing ids are absent from the map — same semantics as
+    /// `get_records_by_ids`. Callers that still need the full record
+    /// (e.g. the MCP `get_record` tool) should keep calling
+    /// `get_records_by_ids` / `get_record`.
+    pub fn get_record_headers_by_ids(
+        &self,
+        ids: &[RecordId],
+    ) -> Result<std::collections::HashMap<RecordId, RecordHeader>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, adapter, instance, scope, kind, \
+                    created_at, updated_at, \
+                    native_id, native_path, captured_at, raw_hash, \
+                    schema_version, derived_from \
+             FROM records WHERE id IN ({})",
+            placeholders
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| &id.0 as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_iter),
+                record_header_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for r in rows {
+            out.insert(r.id.clone(), r);
+        }
+        Ok(out)
+    }
+
     /// Direct children of `parent` — records whose
     /// `provenance.derived_from == parent`. Hits the
     /// `idx_records_derived_from` partial index (see migration 0004).
@@ -1140,6 +1227,45 @@ pub struct ChunkLookup {
     pub content_hash: ContentHash,
     /// Heuristic token count used by the chunker.
     pub token_estimate: u32,
+}
+
+/// Light-weight row mapper for `get_record_headers_by_ids`. Mirrors
+/// the same source-of-truth ordering as `record_from_row` but skips
+/// `content`, `tags`, and `metadata` — the three columns that
+/// dominate row-materialization cost for Claude Code / Codex records.
+///
+/// Projection (must match the SQL in `get_record_headers_by_ids`):
+///   0 id, 1 adapter, 2 instance, 3 scope, 4 kind,
+///   5 created_at, 6 updated_at,
+///   7 native_id, 8 native_path, 9 captured_at, 10 raw_hash,
+///   11 schema_version, 12 derived_from.
+fn record_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordHeader> {
+    let instance: String = row.get(2)?;
+    let updated_at: Option<i64> = row.get(6)?;
+    Ok(RecordHeader {
+        id: RecordId(row.get(0)?),
+        source: SourceDescriptor {
+            adapter: row.get(1)?,
+            instance: if instance.is_empty() {
+                None
+            } else {
+                Some(instance)
+            },
+            version: String::new(),
+        },
+        scope: scope_from(&row.get::<_, String>(3)?),
+        kind: kind_from(&row.get::<_, String>(4)?),
+        created_at: dt(row.get(5)?),
+        updated_at: updated_at.map(dt),
+        provenance: Provenance {
+            native_id: row.get(7)?,
+            native_path: row.get(8)?,
+            captured_at: dt(row.get(9)?),
+            raw_hash: row.get(10)?,
+            derived_from: row.get::<_, Option<String>>(12)?.map(RecordId),
+        },
+        schema_version: row.get::<_, i64>(11)? as u32,
+    })
 }
 
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnamnesisRecord> {
@@ -3111,6 +3237,56 @@ mod tests {
             let single = &single_results[idx];
             let batched = batched_map.get(id);
             assert_eq!(single.as_ref(), batched);
+        }
+    }
+
+    /// Round-68: `get_record_headers_by_ids` must agree with
+    /// `get_records_by_ids` on every header-projection field. The point
+    /// of the lighter method is to drop `content / tags / metadata`
+    /// from the SQL projection — *not* to drift on the columns that
+    /// remain (anything wire-visible to MCP / CLI would silently
+    /// regress otherwise).
+    #[test]
+    fn get_record_headers_by_ids_parity_with_get_records_by_ids() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("claude-code", "one", "first content body", Kind::Fact);
+        r1.provenance.raw_hash = "h1".into();
+        let mut r2 = make_record("codex", "two", "second content body", Kind::Preference);
+        r2.provenance.raw_hash = "h2".into();
+        let mut r3 = make_record(
+            "mem0",
+            "three",
+            &"long body ".repeat(2_000), /* ~22 KB body */
+            Kind::Fact,
+        );
+        r3.provenance.raw_hash = "h3".into();
+        for r in [&r1, &r2, &r3] {
+            store
+                .upsert_record(r, &Chunker::default().chunk(&r.id, &r.content), None)
+                .unwrap();
+        }
+
+        let phantom = RecordId::from_parts("claude-code", None, "missing");
+        let ids = [r1.id.clone(), phantom.clone(), r2.id.clone(), r3.id.clone()];
+
+        let full = store.get_records_by_ids(&ids).unwrap();
+        let heads = store.get_record_headers_by_ids(&ids).unwrap();
+
+        assert_eq!(full.len(), heads.len(), "vanished id stays absent");
+        assert!(!heads.contains_key(&phantom));
+
+        for id in [&r1.id, &r2.id, &r3.id] {
+            let f = full.get(id).expect("full present");
+            let h = heads.get(id).expect("head present");
+            assert_eq!(h.id, f.id);
+            assert_eq!(h.source.adapter, f.source.adapter);
+            assert_eq!(h.source.instance, f.source.instance);
+            assert_eq!(h.scope, f.scope);
+            assert_eq!(h.kind, f.kind);
+            assert_eq!(h.created_at, f.created_at);
+            assert_eq!(h.updated_at, f.updated_at);
+            assert_eq!(h.provenance, f.provenance);
+            assert_eq!(h.schema_version, f.schema_version);
         }
     }
 
