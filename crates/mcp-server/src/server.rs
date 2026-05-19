@@ -1128,6 +1128,31 @@ impl AnamnesisServer {
             .map(|n| n as u32)
             .unwrap_or(5);
 
+        // Round-65: optional filter args. SearchFilter has been complete
+        // on the store side since round-22 (api.rs::SearchFilter); the
+        // MCP prompt just hadn't exposed any way to set it, so every
+        // find_related call ran against the entire corpus. With a real
+        // multi-adapter install (claude-code + codex + letta + mem0 …)
+        // this dilutes the top-N. These args let the caller scope the
+        // recall to one source / kind / scope without breaking any
+        // existing text/limit-only invocation.
+        let filter = anamnesis_store::SearchFilter {
+            source: args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            instance: args
+                .get("instance")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            kind: args.get("kind").and_then(|v| v.as_str()).map(str::to_owned),
+            scope: args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            ..Default::default()
+        };
+
         let store = &self.store;
         let opts = HybridOpts {
             limit,
@@ -1136,11 +1161,11 @@ impl AnamnesisServer {
         };
         let hits = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
-                .search(store, text, &opts)
+                .search_filtered(store, text, &filter, &opts)
                 .await
                 .map_err(|e| format!("search: {e}"))?,
             None => HybridSearcher::<NoProvider>::fulltext_only()
-                .search(store, text, &opts.fulltext_fallback())
+                .search_filtered(store, text, &filter, &opts.fulltext_fallback())
                 .await
                 .map_err(|e| format!("search: {e}"))?,
         };
@@ -1212,7 +1237,11 @@ fn prompts_list_payload() -> Value {
                 "description": "Inject the top-N Anamnesis memories related to a free-text description.",
                 "arguments": [
                     {"name": "text", "description": "What the user is working on or asking about", "required": true},
-                    {"name": "limit", "description": "Max related memories to include (default 5)", "required": false}
+                    {"name": "limit", "description": "Max related memories to include (default 5)", "required": false},
+                    {"name": "source", "description": "Restrict to one adapter id, e.g. `claude-code`, `codex`, `mem0` (default: all sources)", "required": false},
+                    {"name": "instance", "description": "Restrict to one instance discriminator (only meaningful when `source` is also set)", "required": false},
+                    {"name": "kind", "description": "Restrict to one Kind: fact | preference | feedback | reference | episode | skill | unknown", "required": false},
+                    {"name": "scope", "description": "Restrict to one Scope: user | project | session | ephemeral", "required": false}
                 ]
             }
         ]
@@ -2592,6 +2621,100 @@ mod tests {
         let text = result["messages"][0]["content"]["text"].as_str().unwrap();
         assert!(text.contains("most relevant memories"));
         assert!(text.contains("alpha bright morning"));
+    }
+
+    /// Round-65: `source` filter scopes find_related to one adapter.
+    /// Two records, one per adapter, both containing "alpha"; filtering
+    /// by `source = "claude-code"` should only surface the claude-code
+    /// memory in the rendered prompt.
+    #[tokio::test]
+    async fn prompt_find_related_honors_source_filter() {
+        let r1 = make_record(
+            "claude-code",
+            "x1",
+            "alpha bright morning from claude",
+            1700000000,
+        );
+        let r2 = make_record("mem0", "x2", "alpha bright morning from mem0", 1700000010);
+        let s = server_with_records(&[r1, r2]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {
+                        "text": "alpha",
+                        "limit": 10,
+                        "source": "claude-code",
+                    }
+                }),
+            ))
+            .await;
+        let result = resp.result.unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("from claude"),
+            "claude-code memory should be present"
+        );
+        assert!(
+            !text.contains("from mem0"),
+            "mem0 memory must be filtered out: {text}"
+        );
+    }
+
+    /// Round-65: a non-existent `source` filter returns the empty
+    /// rendered "(no related memories found)" stub, not the unfiltered
+    /// corpus. Guards against silently dropping the filter.
+    #[tokio::test]
+    async fn prompt_find_related_empty_when_source_does_not_match() {
+        let r = make_record("claude-code", "z", "alpha bright morning", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {
+                        "text": "alpha",
+                        "limit": 5,
+                        "source": "nonexistent-adapter",
+                    }
+                }),
+            ))
+            .await;
+        let result = resp.result.unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("(no related memories found)"),
+            "unmatched source must short-circuit to empty bullets, got: {text}"
+        );
+    }
+
+    /// Round-65: the new filter args are advertised in `prompts/list`
+    /// so MCP clients know they exist.
+    #[tokio::test]
+    async fn prompts_list_advertises_find_related_filter_args() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("prompts/list", json!({}))).await;
+        let result = resp.result.unwrap();
+        let find_related = result["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "find_related")
+            .expect("find_related prompt present");
+        let arg_names: Vec<String> = find_related["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        for expected in ["text", "limit", "source", "instance", "kind", "scope"] {
+            assert!(
+                arg_names.iter().any(|n| n == expected),
+                "prompts/list should advertise `{expected}`; got {arg_names:?}"
+            );
+        }
     }
 
     #[tokio::test]
