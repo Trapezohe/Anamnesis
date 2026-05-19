@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use anamnesis_adapter_codex::codex_adapter;
 use anamnesis_adapter_generic_mcp::generic_mcp_adapter;
-use anamnesis_adapter_ghast::ghast_adapter;
 use anamnesis_adapter_hermes::hermes_adapter;
 use anamnesis_adapter_letta::letta_adapter;
 use anamnesis_adapter_mem0::sqlite_adapter as mem0_sqlite_adapter;
@@ -663,18 +662,6 @@ impl AnamnesisServer {
                     .await
                     .map_err(|e| format!("import: {e}"))?
             }
-            anamnesis_adapter_ghast::ADAPTER_ID => {
-                let root = registered
-                    .location
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| self.home().join("Documents").join("ghast_desktop"));
-                let adapter = ghast_adapter(root, instance);
-                service
-                    .import(&adapter, opts)
-                    .await
-                    .map_err(|e| format!("import: {e}"))?
-            }
             anamnesis_adapter_tdai::ADAPTER_ID => {
                 let data_dir = registered
                     .location
@@ -989,11 +976,6 @@ impl AnamnesisServer {
             anamnesis_adapter_openclaw::ADAPTER_ID => {
                 let path = location_path.unwrap_or_else(|| self.home().join(".openclaw"));
                 Some(openclaw_adapter(path, instance).health().await)
-            }
-            anamnesis_adapter_ghast::ADAPTER_ID => {
-                let path = location_path
-                    .unwrap_or_else(|| self.home().join("Documents").join("ghast_desktop"));
-                Some(ghast_adapter(path, instance).health().await)
             }
             anamnesis_adapter_tdai::ADAPTER_ID => {
                 let path = location_path
@@ -1449,7 +1431,7 @@ fn tools_list_payload_all() -> Value {
                                 The source's location (path or URL) and credentials (env-var name only — value \
                                 never leaves the operator's shell) are taken from the registry; MCP clients \
                                 cannot pass `path` or `url` directly. Adapter ids: claude-code, codex, mem0, \
-                                letta, hermes, openclaw, ghast, tdai, openviking, mempalace, memori, memos, memary, generic-mcp. \
+                                letta, hermes, openclaw, tdai, openviking, mempalace, memori, memos, memary, generic-mcp. \
                                 Admin-gated — server must be started with --allow-admin-tools \
                                 or have it enabled in config.",
                 "inputSchema": {
@@ -1457,8 +1439,8 @@ fn tools_list_payload_all() -> Value {
                     "properties": {
                         "adapter": {
                             "type": "string",
-                            "description": "claude-code | codex | mem0 | letta | hermes | openclaw | ghast | tdai | openviking | mempalace | memori | memos | memary | generic-mcp",
-                            "enum": ["claude-code", "codex", "mem0", "letta", "hermes", "openclaw", "ghast", "tdai", "openviking", "mempalace", "memori", "memos", "memary", "generic-mcp"]
+                            "description": "claude-code | codex | mem0 | letta | hermes | openclaw | tdai | openviking | mempalace | memori | memos | memary | generic-mcp",
+                            "enum": ["claude-code", "codex", "mem0", "letta", "hermes", "openclaw", "tdai", "openviking", "mempalace", "memori", "memos", "memary", "generic-mcp"]
                         },
                         "instance": {
                             "type": "string",

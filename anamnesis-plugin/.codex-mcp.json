@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "anamnesis": {
+      "command": "anamnesis",
+      "args": ["serve"]
+    }
+  }
+}

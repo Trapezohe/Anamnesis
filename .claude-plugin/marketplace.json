@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "anamnesis-plugins",
+  "owner": {
+    "name": "Ghast AI",
+    "email": "support@ghast.ai"
+  },
+  "metadata": {
+    "description": "Official Anamnesis plugins for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "anamnesis",
+      "source": "./anamnesis-plugin",
+      "description": "Use Anamnesis as a local-first cross-agent memory bridge inside Claude Code.",
+      "version": "0.1.0",
+      "category": "memory",
+      "tags": ["memory", "mcp", "rag", "local-first", "agent-memory"]
+    }
+  ]
+}
