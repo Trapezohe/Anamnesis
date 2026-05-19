@@ -8,6 +8,7 @@ use anamnesis_core::model::{AnamnesisRecord, Kind, Provenance, RecordId, Scope, 
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, OptionalExtension, Transaction};
 
+use crate::vec_ext;
 use crate::{Result, Store, StoreError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,7 +715,10 @@ fn write_raw_artifact(
 }
 
 fn write_chunks(tx: &Transaction<'_>, r: &AnamnesisRecord, chunks: &[Chunk]) -> Result<()> {
-    // Re-chunking is a clean replace.
+    // Re-chunking is a clean replace. The BLOB table has FK ON DELETE
+    // CASCADE, but vec0 virtual tables don't honor FKs — manually drop
+    // any vec0 rows for this record's chunks before the BLOBs go away.
+    vec_ext::delete_vec_rows_for_record(tx, &r.id.0)?;
     tx.execute(
         "DELETE FROM record_chunks WHERE record_id = ?1",
         params![r.id.0],
@@ -1246,16 +1250,97 @@ impl Store {
         Ok(rows)
     }
 
-    /// Linear-scan vector search over `chunk_embeddings` filtered by
-    /// `model_id`. Acceptable for Phase-1 corpora (<100k chunks per
-    /// BLUEPRINT §12). sqlite-vec swap-in lives behind the same API.
+    /// Vector top-k over `chunk_embeddings` filtered by `model_id`.
     ///
-    /// `filter` is pushed into the SQL `WHERE` (joined against
-    /// `record_chunks` → `records`) so the cosine pass only scores
-    /// candidates that already match — this matters at 1700+:7
-    /// distributions where any post-filter would leave the minority
-    /// adapter empty.
+    /// PR-67a path: route through the per-dim sqlite-vec `vec0` table,
+    /// which evaluates cosine in C and applies `SearchFilter` predicates
+    /// (`adapter` / `instance` / `kind` / `scope`) *inside* the KNN scan
+    /// via vec0 metadata + `model_id` PARTITION KEY pruning. This avoids
+    /// the post-filter regression where minority adapters in a heavily-
+    /// skewed corpus (1700+:7 distributions) would be evicted before any
+    /// of their hits surfaced.
+    ///
+    /// Fallback: if no vec0 table exists for this dim yet — e.g. fresh
+    /// DB with no embeddings, or a new model whose embeddings haven't
+    /// been completed since the backfill ran — use the original BLOB
+    /// full-scan path so behaviour matches pre-PR-67a exactly.
     pub fn search_chunks_vec(
+        &self,
+        query_vec: &[f32],
+        model_id: &str,
+        filter: &SearchFilter,
+        limit: u32,
+    ) -> Result<Vec<ChunkHit>> {
+        if limit == 0 || query_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dim = query_vec.len() as i64;
+
+        let table = {
+            let conn = self.conn.lock();
+            vec_ext::vec_table_for_dim(&conn, dim)?
+        };
+        let Some(table) = table else {
+            return self.search_chunks_vec_blob_scan(query_vec, model_id, filter, limit);
+        };
+
+        // vec0 KNN: `embedding MATCH ?` + `k = ?` are sqlite-vec syntax;
+        // partition + metadata predicates are folded into the same WHERE
+        // so vec0 narrows the candidate pool *before* distance is scored.
+        //
+        // `AS MATERIALIZED` is load-bearing: without it SQLite's CTE
+        // inliner pushes the outer `JOIN record_chunks ON rc.id =
+        // knn.chunk_id` predicate back into the vec0 scan, and vec0
+        // rejects any WHERE constraint on auxiliary columns (chunk_id
+        // is stored as `+chunk_id` for return-only access).
+        let mut sql = format!(
+            "WITH knn AS MATERIALIZED ( \
+                 SELECT chunk_id, distance \
+                 FROM {table} \
+                 WHERE embedding MATCH ?1 \
+                   AND k = ?2 \
+                   AND model_id = ?3"
+        );
+        let filter_params = append_vec0_filter_predicates(&mut sql, filter);
+        sql.push_str(
+            " ) \
+             SELECT knn.chunk_id, rc.record_id, rc.seq, rc.content, knn.distance \
+             FROM knn \
+             JOIN record_chunks rc ON rc.id = knn.chunk_id \
+             ORDER BY knn.distance ASC",
+        );
+
+        let query_blob = f32_to_blob(query_vec);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(3 + filter_params.len());
+        bound.push(rusqlite::types::Value::Blob(query_blob));
+        bound.push(rusqlite::types::Value::Integer(limit as i64));
+        bound.push(rusqlite::types::Value::Text(model_id.to_string()));
+        bound.extend(filter_params);
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+                let distance: f64 = r.get(4)?;
+                Ok(ChunkHit {
+                    chunk_id: r.get(0)?,
+                    record_id: RecordId(r.get(1)?),
+                    seq: r.get::<_, i64>(2)? as u32,
+                    content: r.get(3)?,
+                    // vec0 reports cosine *distance* (1 - cos). Existing
+                    // call sites expect "higher = better" similarity.
+                    score: 1.0 - distance,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// BLOB-scan fallback. Kept private and only used by
+    /// `search_chunks_vec` when no per-dim vec0 table exists for the
+    /// query's dim. Behaviour mirrors the pre-PR-67a implementation
+    /// exactly so existing tests + corpora keep their semantics.
+    fn search_chunks_vec_blob_scan(
         &self,
         query_vec: &[f32],
         model_id: &str,
@@ -1273,9 +1358,6 @@ impl Store {
         }
         sql.push_str(" WHERE e.model_id = ?");
         let filter_params = append_filter_predicates(&mut sql, filter);
-        // No LIMIT on the SQL — we still have to score every survivor; the
-        // top-k cut happens in Rust after cosine. But the survivor set is
-        // now bounded by the filter, not by the entire embedding table.
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
@@ -1352,6 +1434,45 @@ fn append_filter_predicates(
     }
     if let Some(to) = filter.time_to {
         sql.push_str(" AND r.created_at <= ?");
+        params.push(V::Integer(to));
+    }
+    params
+}
+
+/// vec0 flavor of `append_filter_predicates`. The vec0 KNN scan reads
+/// metadata columns *directly* from the virtual table (we mirror
+/// `adapter / instance / kind / scope / created_at` into the per-dim
+/// table at backfill + upsert time), so predicates are unqualified
+/// (no `r.` prefix) and never need a `records` join. This is what makes
+/// the filter pushdown happen *inside* the KNN scan rather than after.
+fn append_vec0_filter_predicates(
+    sql: &mut String,
+    filter: &SearchFilter,
+) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value as V;
+    let mut params: Vec<V> = Vec::new();
+    if let Some(s) = &filter.source {
+        sql.push_str(" AND adapter = ?");
+        params.push(V::Text(s.clone()));
+    }
+    if let Some(i) = &filter.instance {
+        sql.push_str(" AND instance = ?");
+        params.push(V::Text(i.clone()));
+    }
+    if let Some(k) = &filter.kind {
+        sql.push_str(" AND kind = ?");
+        params.push(V::Text(k.clone()));
+    }
+    if let Some(sc) = &filter.scope {
+        sql.push_str(" AND scope = ?");
+        params.push(V::Text(sc.clone()));
+    }
+    if let Some(from) = filter.time_from {
+        sql.push_str(" AND created_at >= ?");
+        params.push(V::Integer(from));
+    }
+    if let Some(to) = filter.time_to {
+        sql.push_str(" AND created_at <= ?");
         params.push(V::Integer(to));
     }
     params
@@ -1503,6 +1624,9 @@ impl Store {
                     now,
                 ],
             )?;
+            // Mirror into the per-dim vec0 table so the live write path
+            // keeps the search index in step with the BLOB row.
+            vec_ext::upsert_vec_row(&tx, &job.chunk_id, &job.model_id, dim, &blob)?;
             tx.execute(
                 "UPDATE embedding_jobs SET status = 'done', finished_at = ?1, error = NULL \
                  WHERE id = ?2",
@@ -1537,6 +1661,7 @@ impl Store {
                 now,
             ],
         )?;
+        vec_ext::upsert_vec_row(&tx, &job.chunk_id, &job.model_id, dim, &blob)?;
         tx.execute(
             "UPDATE embedding_jobs SET status = 'done', finished_at = ?1, error = NULL WHERE id = ?2",
             params![now, job.job_id],
@@ -3156,6 +3281,109 @@ mod tests {
         assert_eq!(
             total_records, 3,
             "store should now hold all 3 distinct records"
+        );
+    }
+
+    /// Two models with the same dim must coexist in the same per-dim
+    /// vec0 table without collision. `model_id` is a PARTITION KEY so
+    /// a search constrained to one model never sees the other's rows
+    /// — proves the partition pruning is hooked up correctly.
+    #[test]
+    fn vec0_partition_isolates_models_at_same_dim() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_active_model("model-a").unwrap();
+        let r = make_record("a", "x", "shared content", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+
+        // Manually enqueue + complete for both models so the same chunk
+        // ends up with two embeddings (same dim, different model).
+        store.rebuild_embedding_jobs("model-b").unwrap();
+
+        let jobs_a = store.claim_next_jobs("model-a", 16).unwrap();
+        let jobs_b = store.claim_next_jobs("model-b", 16).unwrap();
+        assert!(!jobs_a.is_empty() && !jobs_b.is_empty());
+
+        let vec_a: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+        let vec_b: Vec<f32> = vec![0.0, 1.0, 0.0, 0.0];
+        let vecs_a: Vec<Vec<f32>> = jobs_a.iter().map(|_| vec_a.clone()).collect();
+        let vecs_b: Vec<Vec<f32>> = jobs_b.iter().map(|_| vec_b.clone()).collect();
+        store.complete_jobs_batch(&jobs_a, &vecs_a).unwrap();
+        store.complete_jobs_batch(&jobs_b, &vecs_b).unwrap();
+
+        // A search for model-a's vector must hit model-a's row only.
+        let hits = store
+            .search_chunks_vec(&vec_a, "model-a", &SearchFilter::default(), 10)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].score > 0.99,
+            "model-a query should match model-a embedding closely; got {}",
+            hits[0].score
+        );
+
+        // Same query under a different model id must not return that
+        // row — partition pruning kicks in.
+        let cross = store
+            .search_chunks_vec(&vec_a, "model-b", &SearchFilter::default(), 10)
+            .unwrap();
+        // Either: empty (no model-b chunk matches `vec_a` well) or hits
+        // belong only to model-b. The contract is "no cross-model
+        // leakage", which we verify by checking that the top model-b
+        // hit's score is not the artificial 1.0 we'd see if we mixed.
+        if let Some(h) = cross.first() {
+            assert!(
+                h.score < 0.99,
+                "model-b query must not see model-a's perfect-match row; got {}",
+                h.score
+            );
+        }
+    }
+
+    /// vec0 rows must be cleaned up when a record is re-chunked.
+    /// `write_chunks` does `DELETE FROM record_chunks` which cascades
+    /// the BLOB rows via FK, but vec0 is a virtual table without FK
+    /// support — `delete_vec_rows_for_record` is the manual sync.
+    #[test]
+    fn vec0_rows_are_dropped_when_chunks_replaced() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_active_model("model-x").unwrap();
+        let r = make_record("a", "x", "first content for chunking", Kind::Fact);
+        let c1 = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c1, None).unwrap();
+
+        let jobs = store.claim_next_jobs("model-x", 16).unwrap();
+        let vecs: Vec<Vec<f32>> = jobs.iter().map(|_| vec![1.0, 2.0, 3.0, 4.0]).collect();
+        store.complete_jobs_batch(&jobs, &vecs).unwrap();
+
+        let count_before: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM chunk_embeddings_vec_d4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count_before as usize, c1.len());
+
+        // Re-chunk under brand-new content — write_chunks should clear
+        // the vec0 rows for the old chunk_ids before the BLOB rows go.
+        let mut r2 = r.clone();
+        r2.content = "completely different second content".into();
+        r2.provenance.raw_hash = "h2".into();
+        let c2 = Chunker::default().chunk(&r2.id, &r2.content);
+        store.upsert_record(&r2, &c2, None).unwrap();
+
+        let count_after: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM chunk_embeddings_vec_d4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // The old chunks' vec rows must be gone; only whatever embeddings
+        // exist for the new content remain (jobs are pending; no new vec
+        // rows yet).
+        assert_eq!(
+            count_after, 0,
+            "stale vec0 rows from the old chunks should be deleted; found {count_after}"
         );
     }
 }

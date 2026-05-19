@@ -87,6 +87,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
 
 [profile.release]
 lto = "thin"
