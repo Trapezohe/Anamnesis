@@ -270,3 +270,147 @@ async fn forget_record_unknown_id_is_tool_error() {
         "error must explain why; got {msg}"
     );
 }
+
+// ─── Round-74 PR-74: list_forgotten ─────────────────────────────────
+
+#[tokio::test]
+async fn list_forgotten_is_listed_as_admin_tool() {
+    assert!(
+        ADMIN_TOOLS.contains(&"list_forgotten"),
+        "list_forgotten must be admin-gated"
+    );
+}
+
+#[tokio::test]
+async fn list_forgotten_hidden_from_tools_list_without_admin() {
+    let (bundle, _id) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"list_forgotten"),
+        "list_forgotten must NOT appear in default tools/list; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_forgotten_rejected_when_admin_disabled() {
+    let (bundle, _id) = build_bundle(false);
+    let resp = bundle
+        .server
+        .handle(tool_call("list_forgotten", json!({})))
+        .await;
+    assert!(
+        resp.error.is_some(),
+        "list_forgotten must error without admin gate"
+    );
+}
+
+/// Default payload must redact sensitive fields. We seed a tombstone
+/// with distinctive markers in `reason` and `native_path`, list, and
+/// then grep the serialised payload to be sure neither string leaked.
+#[tokio::test]
+async fn list_forgotten_redacts_sensitive_fields_by_default() {
+    let (bundle, id) = build_bundle(true);
+    // Forget it first with a known marker reason.
+    let _ = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "secretReasonMarkerR74"}),
+        ))
+        .await;
+    let body = bundle
+        .server
+        .handle(tool_call("list_forgotten", json!({})))
+        .await
+        .result
+        .unwrap();
+    let payload = body["structuredContent"].clone();
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["sensitive_included"], false);
+    let row = &payload["rows"][0];
+    assert_eq!(row["record_id"], id.0);
+    assert_eq!(row["adapter"], "claude-code");
+    assert_eq!(row["native_id"], "doomed-r73");
+    assert_eq!(row["has_reason"], true);
+    assert_eq!(row["has_native_path"], true);
+    // Sensitive fields must be absent (not just null).
+    assert!(row.get("reason").is_none(), "reason must be absent: {row}");
+    assert!(row.get("native_path").is_none());
+    assert!(row.get("raw_hash").is_none());
+    let serialised = serde_json::to_string(&payload).unwrap();
+    assert!(
+        !serialised.contains("secretReasonMarkerR74"),
+        "reason marker must not appear in redacted payload"
+    );
+    assert!(
+        !serialised.contains("/tmp/doomed.md"),
+        "native_path must not appear in redacted payload"
+    );
+    assert!(
+        !serialised.contains("h-doomed-r73"),
+        "raw_hash must not appear in redacted payload"
+    );
+}
+
+#[tokio::test]
+async fn list_forgotten_reveals_sensitive_fields_when_opted_in() {
+    let (bundle, id) = build_bundle(true);
+    let _ = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "secretReasonMarkerR74"}),
+        ))
+        .await;
+    let body = bundle
+        .server
+        .handle(tool_call(
+            "list_forgotten",
+            json!({"include_sensitive": true}),
+        ))
+        .await
+        .result
+        .unwrap();
+    let payload = body["structuredContent"].clone();
+    assert_eq!(payload["sensitive_included"], true);
+    let row = &payload["rows"][0];
+    assert_eq!(row["reason"], "secretReasonMarkerR74");
+    assert_eq!(row["native_path"], "/tmp/doomed.md");
+    assert_eq!(row["raw_hash"], "h-doomed-r73");
+}
+
+#[tokio::test]
+async fn list_forgotten_filters_by_source() {
+    let (bundle, id) = build_bundle(true);
+    let _ = bundle
+        .server
+        .handle(tool_call("forget_record", json!({"record_id": id.0})))
+        .await;
+    // Wrong source → empty.
+    let body = bundle
+        .server
+        .handle(tool_call("list_forgotten", json!({"source": "mem0"})))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(body["structuredContent"]["count"], 0);
+    // Right source → 1.
+    let body = bundle
+        .server
+        .handle(tool_call(
+            "list_forgotten",
+            json!({"source": "claude-code"}),
+        ))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(body["structuredContent"]["count"], 1);
+}

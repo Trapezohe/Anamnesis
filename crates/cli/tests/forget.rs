@@ -192,3 +192,90 @@ fn forget_record_second_call_is_idempotent_success() {
         .success()
         .stdout(contains("already forgotten"));
 }
+
+// ─── Round-74 PR-74: list-forgotten ─────────────────────────────────
+
+/// Default `list-forgotten --json` includes the tombstone but
+/// *redacts* `native_path`, `raw_hash`, and `reason`. Critical
+/// behaviour — keeps the audit view safe for casual operator use.
+#[test]
+fn list_forgotten_default_json_redacts_sensitive_fields() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid, "--reason", "secretReasonMarkerCli"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["sensitive_included"], false);
+    let row = &v["rows"][0];
+    assert_eq!(row["record_id"], rid);
+    assert_eq!(row["has_reason"], true);
+    assert_eq!(row["has_native_path"], true);
+    assert!(row.get("reason").is_none(), "reason must be absent: {row}");
+    assert!(row.get("native_path").is_none());
+    assert!(row.get("raw_hash").is_none());
+    assert!(
+        !stdout.contains("secretReasonMarkerCli"),
+        "reason marker must not leak into redacted output"
+    );
+}
+
+#[test]
+fn list_forgotten_include_sensitive_reveals_fields() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid, "--reason", "secretReasonMarkerCli"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json", "--include-sensitive"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["sensitive_included"], true);
+    let row = &v["rows"][0];
+    assert_eq!(row["reason"], "secretReasonMarkerCli");
+    assert!(row["native_path"].is_string());
+    assert!(row["raw_hash"].is_string());
+}
+
+#[test]
+fn list_forgotten_empty_store_says_so() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten"])
+        .assert()
+        .success()
+        .stdout(contains("no forgotten records"));
+}
