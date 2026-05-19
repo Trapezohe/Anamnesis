@@ -241,6 +241,7 @@ impl AnamnesisServer {
             "forget_record" => self.tool_forget_record(args.clone()).await,
             "unforget_record" => self.tool_unforget_record(args.clone()).await,
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
+            "dedupe" => self.tool_dedupe(args.clone()).await,
             other => {
                 self.record_metric_safely(
                     Some(started_at),
@@ -1319,6 +1320,61 @@ impl AnamnesisServer {
         }))
     }
 
+    /// Round 77 (PR-77): MCP audit view for raw-hash duplicates.
+    /// NOT admin-gated — this is a read-only diagnostic with the
+    /// same redaction discipline as `list_forgotten`. The action
+    /// half (`forget_record`) still requires admin.
+    async fn tool_dedupe(&self, args: Value) -> Result<Value, String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(20);
+        let include_sensitive = args
+            .get("include_sensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let groups = self
+            .store
+            .list_duplicate_raw_hashes(limit)
+            .map_err(|e| format!("dedupe: {e}"))?;
+        let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
+        let payload_groups: Vec<Value> = groups
+            .iter()
+            .map(|g| {
+                let mut group = json!({
+                    "record_count": g.records.len(),
+                    "records": g.records.iter().map(|r| {
+                        let mut row = json!({
+                            "record_id":       r.record_id.0,
+                            "adapter":         r.adapter,
+                            "instance":        if r.instance.is_empty() { Value::Null } else { Value::String(r.instance.clone()) },
+                            "native_id":       r.native_id,
+                            "created_at":      r.created_at,
+                            "updated_at":      r.updated_at,
+                            "has_native_path": r.native_path.is_some(),
+                        });
+                        if include_sensitive {
+                            row["native_path"] = json!(r.native_path);
+                        }
+                        row
+                    }).collect::<Vec<_>>(),
+                });
+                if include_sensitive {
+                    group["raw_hash"] = json!(g.raw_hash);
+                }
+                group
+            })
+            .collect();
+        Ok(json!({
+            "count":              groups.len(),
+            "limit":              effective_limit,
+            "sensitive_included": include_sensitive,
+            "groups":             payload_groups,
+        }))
+    }
+
     /// Build the right adapter for a registered source and call
     /// `MemoryAdapter::health().await`. Mirrors the CLI's
     /// `run_adapter_health` — the dispatch table stays in lockstep with
@@ -2024,6 +2080,32 @@ fn tools_list_payload_all() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "dedupe",
+                "description": "Report records sharing identical `raw_hash` (exact source-payload \
+                                duplicates). Read-only diagnostic, NOT admin-gated — the action \
+                                half is `forget_record` (which is admin-gated). Default response \
+                                is redacted: `raw_hash` and `native_path` are omitted unless \
+                                `include_sensitive=true`. Limit clamped to [1, 100]. Only catches \
+                                byte-identical duplicates; semantic / near-duplicate detection is \
+                                out of scope.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 20,
+                            "description": "Max number of groups. Clamped to [1, 100] by the store."
+                        },
+                        "include_sensitive": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Reveal `raw_hash` and `native_path`. Off by default."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -2280,6 +2362,8 @@ mod tests {
             "list_sources",
             "trace_provenance",
             "doctor",
+            // Round 77: read-only diagnostic, not admin-gated.
+            "dedupe",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -2290,7 +2374,8 @@ mod tests {
             !names.contains(&"import_source".to_string()),
             "import_source MUST be hidden by default — found in tools/list",
         );
-        assert_eq!(names.len(), 5, "expect exactly 5 non-admin tools");
+        // R77 added `dedupe` to the non-admin catalogue (5 → 6).
+        assert_eq!(names.len(), 6, "expect exactly 6 non-admin tools");
     }
 
     #[tokio::test]
@@ -2303,8 +2388,9 @@ mod tests {
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
         // R73 added forget_record (6→7). R74 added list_forgotten
-        // (7→8). R75 added unforget_record (8→9).
-        assert_eq!(names.len(), 9);
+        // (7→8). R75 added unforget_record (8→9). R77 added
+        // dedupe (9→10).
+        assert_eq!(names.len(), 10);
         for expected in [
             "search_memories",
             "get_record",
@@ -2315,6 +2401,7 @@ mod tests {
             "forget_record",
             "unforget_record",
             "list_forgotten",
+            "dedupe",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
