@@ -22,7 +22,13 @@ use anamnesis_store::{SearchFilter, Store};
 pub const RRF_K: f64 = 60.0;
 
 /// Which retrieval modalities to combine.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `Serialize` is `rename_all = "lowercase"` so the wire shape stays
+/// `"fulltext" / "vector" / "hybrid"` — same casing as
+/// `HybridOpts.mode` accepts on input and as the CLI / MCP have
+/// always rendered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     /// FTS5 BM25 only — no vector lookup, no embedding call.
     Fulltext,
@@ -139,6 +145,13 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
     /// `filter` shapes the candidate pool *before* `LIMIT` truncates it,
     /// so e.g. `source = "mem0"` returns mem0 chunks even when the
     /// overall corpus is dominated by another adapter.
+    ///
+    /// Returns only the ranked chunks — the per-stage timing/count
+    /// breakdown is computed but discarded. Callers that need the
+    /// breakdown (e.g. MCP `search_memories(trace=true)`) should
+    /// invoke [`Self::search_filtered_traced`] directly. Round 71's
+    /// refactor guarantees the two share a single code path so the
+    /// trace can't drift from the live search.
     pub async fn search_filtered(
         &self,
         store: &Store,
@@ -146,6 +159,35 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
         filter: &SearchFilter,
         opts: &HybridOpts,
     ) -> Result<Vec<RankedChunk>> {
+        Ok(self
+            .search_filtered_traced(store, query, filter, opts)
+            .await?
+            .hits)
+    }
+
+    /// Same as [`Self::search_filtered`], but also returns a per-stage
+    /// breakdown of timings and candidate counts.
+    ///
+    /// Round 71: built so `search_memories(trace=true)` can report
+    /// `embed_query / fts / vec / rrf` wall-time + candidate-pool
+    /// shape without us duplicating search logic in a second path.
+    /// The MCP / CLI default path goes through
+    /// [`Self::search_filtered`], which drops the trace — there's no
+    /// observable cost when the trace isn't asked for (timings are
+    /// `Instant::elapsed()` on stages we'd run anyway).
+    ///
+    /// **Privacy**: this primitive only collects sizes and durations.
+    /// No query text, snippets, or record/chunk ids cross the
+    /// boundary into the trace struct — callers wrapping this for an
+    /// external surface (MCP / CLI) can serialise the trace verbatim
+    /// without worrying about leaking user content.
+    pub async fn search_filtered_traced(
+        &self,
+        store: &Store,
+        query: &str,
+        filter: &SearchFilter,
+        opts: &HybridOpts,
+    ) -> Result<TracedSearchResult> {
         let effective_mode = if self.provider.is_none() {
             SearchMode::Fulltext
         } else {
@@ -154,26 +196,39 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
 
         let pool = opts.candidate_pool.max(opts.limit);
 
-        let fts_hits = if matches!(effective_mode, SearchMode::Fulltext | SearchMode::Hybrid) {
-            store
-                .search_chunks_fts(query, filter, pool)
-                .map_err(|e| Error::Other(format!("store fts: {e}")))?
-        } else {
-            Vec::new()
-        };
+        let (fts_hits, fts_ms) =
+            if matches!(effective_mode, SearchMode::Fulltext | SearchMode::Hybrid) {
+                let t = std::time::Instant::now();
+                let hits = store
+                    .search_chunks_fts(query, filter, pool)
+                    .map_err(|e| Error::Other(format!("store fts: {e}")))?;
+                (hits, Some(t.elapsed().as_millis() as u64))
+            } else {
+                (Vec::new(), None)
+            };
 
-        let vec_hits = if matches!(effective_mode, SearchMode::Vector | SearchMode::Hybrid) {
-            let provider = self
-                .provider
-                .ok_or_else(|| Error::Other("Vector/Hybrid mode requires a provider".into()))?;
-            let qvec = provider.embed_query(query).await?;
-            store
-                .search_chunks_vec(&qvec, &provider.model_id().0, filter, pool)
-                .map_err(|e| Error::Other(format!("store vec: {e}")))?
-        } else {
-            Vec::new()
-        };
+        let (vec_hits, embed_query_ms, vec_ms) =
+            if matches!(effective_mode, SearchMode::Vector | SearchMode::Hybrid) {
+                let provider = self
+                    .provider
+                    .ok_or_else(|| Error::Other("Vector/Hybrid mode requires a provider".into()))?;
+                let t_embed = std::time::Instant::now();
+                let qvec = provider.embed_query(query).await?;
+                let embed_ms = t_embed.elapsed().as_millis() as u64;
+                let t_vec = std::time::Instant::now();
+                let hits = store
+                    .search_chunks_vec(&qvec, &provider.model_id().0, filter, pool)
+                    .map_err(|e| Error::Other(format!("store vec: {e}")))?;
+                (
+                    hits,
+                    Some(embed_ms),
+                    Some(t_vec.elapsed().as_millis() as u64),
+                )
+            } else {
+                (Vec::new(), None, None)
+            };
 
+        let t_rrf = std::time::Instant::now();
         let mut merged = rrf::merge(&fts_hits, &vec_hits, opts.limit as usize);
 
         // For each merged hit, look up the actual content from whichever
@@ -190,8 +245,89 @@ impl<'a, P: EmbeddingProvider + ?Sized> HybridSearcher<'a, P> {
                 }
             }
         }
-        Ok(merged)
+        let rrf_ms = t_rrf.elapsed().as_millis() as u64;
+
+        let trace = SearchTrace {
+            effective_mode,
+            candidate_pool: pool,
+            stages_ms: SearchStageTimings {
+                embed_query_ms,
+                fts_ms,
+                vec_ms,
+                rrf_ms: Some(rrf_ms),
+            },
+            counts: SearchStageCounts {
+                fts_hits: fts_hits.len() as u32,
+                vec_hits: vec_hits.len() as u32,
+                ranked_chunks: merged.len() as u32,
+            },
+        };
+        Ok(TracedSearchResult {
+            hits: merged,
+            trace,
+        })
     }
+}
+
+/// Output of [`HybridSearcher::search_filtered_traced`] — the ranked
+/// chunks plus a per-stage performance breakdown.
+#[derive(Debug, Clone)]
+pub struct TracedSearchResult {
+    /// Top-`limit` chunks, same shape as [`HybridSearcher::search_filtered`].
+    pub hits: Vec<RankedChunk>,
+    /// Per-stage timing + candidate-count breakdown. Carries no user
+    /// content — safe to surface to MCP / CLI clients verbatim.
+    pub trace: SearchTrace,
+}
+
+/// Run-time breakdown of one search invocation. Strictly numeric +
+/// the resolved `effective_mode`; no query text, snippets, or ids.
+///
+/// Round 71 adds this so `search_memories(trace=true)` can answer
+/// "why was that search slow" with the same level of detail an
+/// engineer would want from a profiler — without persisting anything,
+/// and without exposing what the user typed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchTrace {
+    /// `Fulltext`/`Vector`/`Hybrid` actually used. Differs from
+    /// `HybridOpts.mode` when no provider is wired (e.g. the
+    /// fastembed model isn't on disk and we fell back to
+    /// fulltext-only).
+    pub effective_mode: SearchMode,
+    /// Per-modality `LIMIT` handed to the recall stage. Mirrors
+    /// `opts.candidate_pool.max(opts.limit)`.
+    pub candidate_pool: u32,
+    /// Per-stage wall time in milliseconds. `None` on stages that
+    /// didn't run for this query (e.g. `vec_ms` in fulltext mode).
+    pub stages_ms: SearchStageTimings,
+    /// Per-stage candidate counts. Useful for "did FTS surface
+    /// anything?" diagnostics where `fts_hits = 0` is the answer.
+    pub counts: SearchStageCounts,
+}
+
+/// Per-stage wall time, milliseconds. `None` for stages skipped
+/// under the effective mode.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchStageTimings {
+    /// Time spent in `provider.embed_query(...)`. `None` when fulltext.
+    pub embed_query_ms: Option<u64>,
+    /// Time spent in `store.search_chunks_fts(...)`. `None` when vector-only.
+    pub fts_ms: Option<u64>,
+    /// Time spent in `store.search_chunks_vec(...)`. `None` when fulltext.
+    pub vec_ms: Option<u64>,
+    /// Time spent in `rrf::merge(...)` + snippet backfill. Always set.
+    pub rrf_ms: Option<u64>,
+}
+
+/// Per-stage candidate-count shape.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchStageCounts {
+    /// Number of chunks returned by the FTS recall stage.
+    pub fts_hits: u32,
+    /// Number of chunks returned by the vector recall stage.
+    pub vec_hits: u32,
+    /// Number of merged chunks after RRF + `limit`.
+    pub ranked_chunks: u32,
 }
 
 /// Pure RRF logic — separated for unit testing without a DB.
@@ -522,5 +658,145 @@ mod tests {
         };
         let hits = searcher.search(&store, "alpha", &opts).await.unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    // ─── Round-71: per-stage search tracing ─────────────────────────
+
+    #[tokio::test]
+    async fn search_trace_reports_fulltext_stage_counts_only() {
+        let store = Store::open_in_memory().unwrap();
+        let provider = ToyProvider::new();
+        seed_with_embeddings(&store, &provider).await;
+        let searcher = HybridSearcher::<ToyProvider>::fulltext_only();
+        let opts = HybridOpts::fulltext_only(10);
+        let traced = searcher
+            .search_filtered_traced(&store, "alpha", &SearchFilter::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(traced.trace.effective_mode, SearchMode::Fulltext);
+        assert_eq!(
+            traced.trace.candidate_pool,
+            opts.candidate_pool.max(opts.limit)
+        );
+        // Fulltext mode: FTS ran, embed/vec did not.
+        assert!(
+            traced.trace.stages_ms.fts_ms.is_some(),
+            "fts stage should be timed"
+        );
+        assert!(traced.trace.stages_ms.embed_query_ms.is_none());
+        assert!(traced.trace.stages_ms.vec_ms.is_none());
+        assert!(traced.trace.stages_ms.rrf_ms.is_some());
+        // Counts: FTS saw something; vec untouched.
+        assert!(traced.trace.counts.fts_hits >= 1);
+        assert_eq!(traced.trace.counts.vec_hits, 0);
+        assert_eq!(
+            traced.trace.counts.ranked_chunks as usize,
+            traced.hits.len(),
+            "ranked_chunks should match returned hits len",
+        );
+    }
+
+    #[tokio::test]
+    async fn search_trace_reports_all_stages_in_hybrid_mode() {
+        let store = Store::open_in_memory().unwrap();
+        let provider = ToyProvider::new();
+        seed_with_embeddings(&store, &provider).await;
+        let searcher = HybridSearcher::new(&provider);
+        let opts = HybridOpts {
+            mode: SearchMode::Hybrid,
+            ..HybridOpts::default()
+        };
+        let traced = searcher
+            .search_filtered_traced(&store, "alpha", &SearchFilter::default(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(traced.trace.effective_mode, SearchMode::Hybrid);
+        // Every stage must have a timing in hybrid mode.
+        assert!(traced.trace.stages_ms.fts_ms.is_some());
+        assert!(traced.trace.stages_ms.embed_query_ms.is_some());
+        assert!(traced.trace.stages_ms.vec_ms.is_some());
+        assert!(traced.trace.stages_ms.rrf_ms.is_some());
+        // Both modalities contributed.
+        assert!(traced.trace.counts.fts_hits >= 1);
+        assert!(traced.trace.counts.vec_hits >= 1);
+    }
+
+    /// `search_filtered` is now defined as
+    /// `search_filtered_traced(...).hits` — this guards against a
+    /// future refactor accidentally re-introducing a second search
+    /// code path with subtly different ranking.
+    #[tokio::test]
+    async fn search_filtered_returns_same_hits_as_traced_primitive() {
+        let store = Store::open_in_memory().unwrap();
+        let provider = ToyProvider::new();
+        seed_with_embeddings(&store, &provider).await;
+        let searcher = HybridSearcher::new(&provider);
+        let opts = HybridOpts {
+            mode: SearchMode::Hybrid,
+            ..HybridOpts::default()
+        };
+        let plain = searcher
+            .search_filtered(&store, "alpha", &SearchFilter::default(), &opts)
+            .await
+            .unwrap();
+        let traced = searcher
+            .search_filtered_traced(&store, "alpha", &SearchFilter::default(), &opts)
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), traced.hits.len());
+        for (a, b) in plain.iter().zip(traced.hits.iter()) {
+            assert_eq!(a.chunk_id, b.chunk_id);
+            assert_eq!(a.record_id, b.record_id);
+            assert!((a.score - b.score).abs() < 1e-9);
+        }
+    }
+
+    /// Privacy guard: the serialised trace payload must contain only
+    /// numeric stage shape + mode. Specifically: no query text, no
+    /// chunk content, no record/chunk ids, no path strings. Any
+    /// future field that smuggles user content trips this test.
+    #[tokio::test]
+    async fn search_trace_serialised_payload_excludes_user_content() {
+        let store = Store::open_in_memory().unwrap();
+        let provider = ToyProvider::new();
+        seed_with_embeddings(&store, &provider).await;
+        let searcher = HybridSearcher::new(&provider);
+        let opts = HybridOpts::default();
+        let traced = searcher
+            .search_filtered_traced(
+                &store,
+                "alpha distinct phrase",
+                &SearchFilter::default(),
+                &opts,
+            )
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&traced.trace).unwrap();
+        for forbidden in [
+            "alpha distinct phrase",
+            "bright morning",
+            "evening tea",
+            // Chunk ids embed the record id, which is the sha hash.
+            // We don't try to enumerate hashes; the content checks
+            // above + the field-list whitelist below cover it.
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "trace payload must not contain {forbidden:?}: {json}",
+            );
+        }
+        // Whitelist top-level shape — any new field that isn't one of
+        // these needs an explicit privacy review.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().expect("trace serialises to an object");
+        let allowed = ["effective_mode", "candidate_pool", "stages_ms", "counts"];
+        for k in obj.keys() {
+            assert!(
+                allowed.contains(&k.as_str()),
+                "unexpected top-level trace field {k:?}: would need a privacy review",
+            );
+        }
     }
 }
