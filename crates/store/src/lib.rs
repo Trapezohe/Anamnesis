@@ -5,11 +5,12 @@
 //! raw `Connection` is intentionally kept private to callers outside this
 //! crate; only tests use `conn()` directly.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod api;
 pub mod cjk;
+mod vec_ext;
 
 pub use api::{
     ChunkHit, ChunkLookup, LineageChain, PendingEmbeddingJob, RecordSummary, SearchFilter,
@@ -31,6 +32,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0004_provenance_derived_from",
         include_str!("migrations/0004_provenance_derived_from.sql"),
+    ),
+    (
+        "0005_vec_index",
+        include_str!("migrations/0005_vec_index.sql"),
     ),
 ];
 
@@ -89,6 +94,10 @@ pub struct Store {
 impl Store {
     /// Open (or create) a store at the given path and run pending migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        // Must run BEFORE `Connection::open` so sqlite-vec's auto-extension
+        // is registered when SQLite materialises the connection (and thus
+        // the vec0 module is available on this and every later connection).
+        vec_ext::register()?;
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -99,11 +108,13 @@ impl Store {
         };
         store.run_migrations()?;
         store.reindex_fts_if_pending()?;
+        store.backfill_vec_if_pending()?;
         Ok(store)
     }
 
     /// Open an in-memory store (useful for tests).
     pub fn open_in_memory() -> Result<Self> {
+        vec_ext::register()?;
         let conn = Connection::open_in_memory()?;
         register_cjk_function(&conn)?;
         let store = Self {
@@ -111,6 +122,7 @@ impl Store {
         };
         store.run_migrations()?;
         store.reindex_fts_if_pending()?;
+        store.backfill_vec_if_pending()?;
         Ok(store)
     }
 
@@ -160,6 +172,15 @@ impl Store {
         )?;
         tx.commit()?;
         tracing::info!(reindexed_rows = n, "0003_cjk_fts: chunks_fts rebuilt");
+        Ok(())
+    }
+
+    /// One-shot: populate the per-dim vec0 tables from existing
+    /// `chunk_embeddings` BLOB rows the first time a PR-67a binary
+    /// opens a pre-PR-67a database. No-op on subsequent opens.
+    fn backfill_vec_if_pending(&self) -> Result<()> {
+        let mut conn = self.conn.lock();
+        vec_ext::backfill_if_pending(&mut conn)?;
         Ok(())
     }
 
@@ -222,7 +243,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
     }
 
     #[test]

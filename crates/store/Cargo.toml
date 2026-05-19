@@ -19,6 +19,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
+sqlite-vec = { workspace = true }
 parking_lot = "0.12"
 jieba-rs = "0.7"
 
