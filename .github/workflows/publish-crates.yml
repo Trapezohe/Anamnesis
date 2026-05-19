@@ -63,31 +63,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -101,31 +108,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -136,31 +150,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -174,31 +195,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -209,31 +237,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -244,31 +279,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -283,31 +325,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -318,31 +367,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -353,31 +409,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -388,31 +451,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -423,31 +493,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -458,31 +535,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -493,31 +577,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -528,31 +619,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -563,31 +661,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -598,31 +703,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -633,31 +745,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -668,31 +787,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -703,31 +829,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -753,32 +886,42 @@ jobs:
             cargo publish --dry-run $publish_flags -p $crate || true
             cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
           else
-            out=$(cargo publish $publish_flags -p $crate 2>&1) || true
-            cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            if out=$(cargo publish $publish_flags -p $crate 2>&1); then
+              cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                # Re-strip dev-deps for the retry attempt.
+                sed -i 's/^anamnesis-mcp-server = /# anamnesis-mcp-server = /' crates/adapter-generic-mcp/Cargo.toml
+                sed -i 's/^anamnesis-store = /# anamnesis-store = /' crates/adapter-generic-mcp/Cargo.toml
+                if out2=$(cargo publish $publish_flags -p $crate 2>&1); then
+                  cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  cp /tmp/generic-mcp-Cargo.toml.bak crates/adapter-generic-mcp/Cargo.toml
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -792,31 +935,38 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
 
@@ -830,30 +980,37 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish --dry-run -p $crate || true
           else
-            out=$(cargo publish -p $crate 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -qE 'already uploaded|already exists'; then
-              echo "✓ $crate is already on crates.io — skipping (idempotent)"
-            elif echo "$out" | grep -q 'Uploading'; then
+            # cargo exit code is truth — grep output only to classify failures.
+            # Prior grep-based success detection mis-matched "Uploading" lines
+            # that cargo also prints on 429 (before the server rejects), so
+            # rate-limited publishes were reported as success.
+            if out=$(cargo publish -p $crate 2>&1); then
+              echo "$out"
               echo "✓ $crate uploaded"
               sleep 60
-            elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
-              # crates.io: 5-token burst then 1/10min refill. Wait 11 min and retry.
-              echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
-              sleep 660
-              out2=$(cargo publish ${publish_flags:-} -p $crate 2>&1) || true
-              echo "$out2"
-              if echo "$out2" | grep -qE 'already uploaded|already exists'; then
-                echo "✓ $crate now on crates.io (race with another publisher) — skipping"
-              elif echo "$out2" | grep -q 'Uploading'; then
-                echo "✓ $crate uploaded after rate-limit wait"
-                sleep 60
+            else
+              echo "$out"
+              if echo "$out" | grep -qE 'already uploaded|already exists'; then
+                echo "✓ $crate is already on crates.io — skipping (idempotent)"
+              elif echo "$out" | grep -qE '429|rate limit|Too Many Requests'; then
+                echo "⏳ $crate hit rate limit, waiting 660s and retrying once..."
+                sleep 660
+                if out2=$(cargo publish -p $crate 2>&1); then
+                  echo "$out2"
+                  echo "✓ $crate uploaded after rate-limit wait"
+                  sleep 60
+                else
+                  echo "$out2"
+                  if echo "$out2" | grep -qE 'already uploaded|already exists'; then
+                    echo "✓ $crate now on crates.io (race with another publisher) — skipping"
+                  else
+                    echo "✗ $crate still failing after rate-limit wait" >&2
+                    exit 1
+                  fi
+                fi
               else
-                echo "✗ $crate still failing after rate-limit wait" >&2
+                echo "✗ $crate publish failed (see output above)" >&2
                 exit 1
               fi
-            else
-              echo "✗ $crate publish failed (see output above)" >&2
-              exit 1
             fi
           fi
