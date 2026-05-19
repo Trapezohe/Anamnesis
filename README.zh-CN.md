@@ -31,33 +31,6 @@
 
 ---
 
-## 30 秒上手
-
-```bash
-cargo install --locked anamnesis-cli anamnesis-mcp-server
-```
-
-```bash
-# 1. 初始化本地 store
-anamnesis init
-
-# 2. 注册一个你已经在用的源 —— 比如 Claude Code
-anamnesis source add claude-code --path ~/.claude/projects
-
-# 3. 导入 + 建索引（在真实 ~/.claude/projects 上：1795 records / 50K chunks）
-anamnesis import claude-code
-
-# 4. 跨所有已导入的源做检索
-anamnesis search "用户喜欢用什么方式写测试？"
-
-# 5. 把 Anamnesis 接到 Claude Desktop / Cursor / ghast 作为 MCP server
-anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json
-```
-
-其它安装路径（一行 curl、Homebrew、源码、二进制 tarball）见 [快速开始](#快速开始)；14 个一等 adapter + generic MCP 见 [当前支持的记忆框架与 Agent](#当前支持的记忆框架与-agent)。
-
----
-
 ## 概览
 
 **Anamnesis（搜魂术）** 是一个开源、本地优先的跨 Agent 记忆层。它通过 **14 个一等 adapter** 读取数据 —— Agent 框架（Claude Code、Codex、Hermes、OpenClaw、ghast）与记忆系统（mem0、Letta、TencentDB Agent Memory、OpenViking、MemPalace、Memori、MemOS、Memary） —— 加上 Generic MCP adapter 兜底任意 MCP-aware 项目，把它们归一化到同一套 schema、SQLite 存储和 Anamnesis 自有 RAG 索引中，再通过 CLI 与 MCP 提供给任何可信 Agent 使用。**两阶段 session extractor** 把原始 `Episode` 记忆蒸馏成持久的 `Fact` / `Preference` / `Feedback` / `Skill`，每次 LLM 调用都可审计、有显式 gating、并通过 provenance 链回源 Episode。
@@ -87,56 +60,60 @@ anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_conf
 
 ## 当前支持的记忆框架与 Agent
 
-### 可导入的记忆源
+Anamnesis 提供 **14 个一等 adapter** —— 5 个 Agent 框架 + 8 个记忆框架 + 1 个通用 MCP —— 全部通过共享 `MemoryAdapter` 不变量验证（62 个测试）。每个都可以用 `anamnesis source add <name> --path <location>` 直接接入。
 
-#### §-2.2 Agents
+### Agent 框架（5 个）
 
-| Source / Agent | 状态 | 当前读取内容 | 精准度 |
+| Agent | 默认源路径 | 导入命令 | License |
 |---|---|---|---|
-| Claude Code | 可用 | `~/.claude/projects/*/memory/*.md`、项目 `*.jsonl` session | memory md 中高；session 中低 |
-| Codex | 可用 | `~/.codex/` 下 session JSON / JSONL | 中 |
-| Hermes (Nous Research) | 可用 | `~/.hermes/MEMORY.md` + `USER.md` + SQLite session DB | 中高 |
-| OpenClaw | 可用 | `~/.openclaw/` workspace MD + `skills/`、`sessions/*.json[l]` | 中高 |
-| ghast | 可用 | `~/Documents/ghast_desktop/prompts/`、bundled skills；检测加密 profile DB | 中高 |
+| **Claude Code** | `~/.claude/projects/` | `anamnesis source add claude-code --path ~/.claude/projects` | Apache-2.0 |
+| **Codex** (OpenAI CLI) | `~/.codex/` | `anamnesis source add codex --path ~/.codex` | Apache-2.0 |
+| **Hermes** (Nous Research) | `~/.hermes/` | `anamnesis source add hermes --path ~/.hermes` | Apache-2.0 |
+| **OpenClaw** | `~/.openclaw/` | `anamnesis source add openclaw --path ~/.openclaw` | MIT |
+| **ghast** | `~/Documents/ghast_desktop/` | `anamnesis source add ghast --path ~/Documents/ghast_desktop` | Apache-2.0 |
 
-#### §-2.3 记忆框架
+### 记忆框架（8 个）
 
-| Source / Framework | 状态 | 当前读取内容 | License |
+| Framework | Backend | 导入命令 | License |
 |---|---|---|---|
-| mem0 | 可用 | self-hosted SQLite `memories` 表 | Apache-2.0 |
-| Letta (前 MemGPT) | 可用 | SQLite `block` 表 (`~/.letta/letta.db`) | Apache-2.0 |
-| TencentDB Agent Memory | 可用 | `~/.openclaw/memory-tdai/` 4 层（L0 refs / L1 JSONL facts / L2 scenarios / L3 persona）| MIT |
-| OpenViking | 可用 | VikingFS AGFS workspace（resources/user/agent/session × L0/L1/L2）| AGPLv3（只读，不链接代码）|
-| MemPalace | 可用 | `~/.mempalace/identity.txt` + ChromaDB drawers/closets | AGPLv3（只读，不链接代码）|
-| Memori | 可用 | SQLite —— entity_facts、process_attrs、conversation messages + summaries、KG triples | Apache-2.0 |
-| MemOS | 可用 | MemCube dump (`textual_memory.json`)，按 `memory_type` 分类 | Apache-2.0 |
-| Memary | 可用 | 本地 cache 文件（`memory_stream.json`、entity tally、past chat、personas）| MIT |
+| **mem0** | SQLite | `anamnesis source add mem0 --path ~/.mem0/db.sqlite` | Apache-2.0 |
+| **Letta** (前 MemGPT) | SQLite | `anamnesis source add letta --path ~/.letta/letta.db` | Apache-2.0 |
+| **TencentDB Agent Memory** (TDAI 4 层) | 文件系统 | `anamnesis source add tdai --path ~/.tdai` | MIT |
+| **OpenViking** (VikingFS AGFS) | 文件系统 | `anamnesis source add openviking --path <workspace>` | AGPLv3（只读）|
+| **MemPalace** | ChromaDB SQLite | `anamnesis source add mempalace --path ~/.mempalace` | AGPLv3（只读）|
+| **Memori** | SQLite (entity_facts + KG triples) | `anamnesis source add memori --path <db>` | Apache-2.0 |
+| **MemOS** | JSON MemCube | `anamnesis source add memos --path <cube-root>` | Apache-2.0 |
+| **Memary** | 本地 JSON cache 文件 | `anamnesis source add memary --path <data-dir>` | MIT |
 
-#### §-2.4 长尾（任意 MCP-aware 源）
+### 通用 MCP（1 个）
 
-| 协议 | 状态 | 当前读取内容 |
+| Adapter | Backend | 导入命令 | 用途 |
+|---|---|---|---|
+| **Generic MCP** | 任意 MCP-aware HTTP server | `anamnesis source add generic-mcp --url http://... --token-env <NAME>` | Cognee、Zep、Mistral Memory 或任意未来 MCP server |
+
+> 14 个 adapter 全部通过端到端验证（真实数据或上游格式 fixture）。完整宿主接入指南：[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)；自动化烟测脚本：[docs/demo/quickstart.sh](docs/demo/quickstart.sh)。
+
+### 可消费 Anamnesis 的工具（Anamnesis-as-MCP-server）
+
+Anamnesis 自身就是 MCP server，任何 MCP-aware 客户端都能调用它。用 `anamnesis mcp config` 生成配置片段：
+
+| 客户端 | 接入方式 | 说明 |
 |---|---|---|
-| Generic MCP Server | 可用 | `resources/list` + `resources/read` —— 适用于任何暴露 MCP server 的项目（Cognee、Zep 等）|
+| **Claude Desktop** | `anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json` | 示例为 macOS 路径；Linux / Windows 见 [INTEGRATIONS](docs/INTEGRATIONS.md) |
+| **Cursor** | `anamnesis mcp config > ~/.cursor/mcp.json` | 用户级或项目级均可 |
+| **ghast** | `anamnesis mcp config > ~/.ghast/mcp.json` | 第一消费者 |
+| **Continue.dev / Zed / Windsurf** | `anamnesis mcp config` 然后 merge 到客户端 MCP block | 任意 MCP-spec 客户端 |
+| **脚本 / 自动化** | `anamnesis search --json`、`anamnesis export`、`anamnesis status --json` | 直接 CLI，不走 MCP |
+| **远程（HTTP / SSE）** | `anamnesis-mcp --sse 7878 --token-env ANAMNESIS_MCP_TOKEN` | 适合 daemon 或非 stdio 客户端 |
 
-### 可消费 Anamnesis 的工具
+### 计划中
 
-| Consumer | 接入方式 | 状态 | 说明 |
-|---|---|---|---|
-| ghast | MCP server config | 计划集成 | ghast 是第一消费者，但 Anamnesis 保持独立开源项目 |
-| Claude Desktop / Claude Code MCP client | `anamnesis-mcp` stdio | 可接入 | 适合本地检索和 provenance 查询 |
-| Codex / CLI Agent | MCP stdio 或 CLI | 可接入 | 可以通过 MCP 或 shell 命令消费 |
-| Cursor / Zed / 其他 MCP-aware tools | MCP stdio / SSE | 可接入 | 取决于各客户端 MCP 能力 |
-| 自定义脚本 | CLI + JSON 输出 | 可接入 | `search --json`、`export`、`status --json` |
-
-### 计划支持
-
-| Source / Consumer | 类型 | 计划 |
+| Item | 类型 | 说明 |
 |---|---|---|
-| Zep / Graphiti | 时序知识图 | 双时序 fact 突破当前 `created_at/updated_at` schema；§-1.4 schema 演进前先通过 `generic-mcp` 消费 |
-| Cognee | DuckDB + Kuzu graph | 当前通过 Cognee 自带 MCP server + `generic-mcp` 消费；待官方落地可移植本地导出后再做 native adapter |
-| LangMem | LangChain SDK | 实际读取 backend 跟随 LangGraph Store；case-by-case |
-| OpenAI / Voyage / 其他云 embedding | Embedding provider | 只做显式 opt-in，永不默认外发 |
-| Session extractor (§-1.5 PR-6) | 流水线 | 两阶段 LLM-gated `Episode → Fact / Preference / Skill / Feedback` 蒸馏 |
+| Zep / Graphiti | 时序知识图 | 双时序 fact 突破当前 `created_at/updated_at` schema；今天已可通过 `generic-mcp` 消费，等 §-1.4 schema 演进后再做 native adapter |
+| Cognee | DuckDB + Kuzu graph | 今天通过 Cognee 自带 MCP server + `generic-mcp` 消费；等可移植本地导出落地后做 native adapter |
+| LangMem | LangChain SDK | 实际 backend 跟随 LangGraph Store —— case-by-case |
+| 云 embedding（OpenAI / Voyage / Cohere）| Embedding provider | 只做显式 opt-in，永不默认外发 |
 | Agent Memory Interchange Format | 标准化方向 | 后续 RFC，推动跨 Agent 记忆交换 |
 
 ## 为什么需要 Anamnesis
@@ -339,6 +316,26 @@ sequenceDiagram
 > 安全说明：`import_source` 属于 admin 能力。pre-release 阶段只建议在可信本地 client 中使用；下一轮 P0 会默认关闭 MCP admin tools。
 
 ## 快速开始
+
+### 30 秒上手
+
+```bash
+# 安装
+cargo install --locked anamnesis-cli anamnesis-mcp-server
+
+# 初始化本地 store
+anamnesis init
+
+# 注册并导入一个你已经在用的源
+anamnesis source add claude-code --path ~/.claude/projects
+anamnesis import claude-code           # 在真实 ~/.claude/projects 上：1795 records / 50K chunks
+
+# 跨所有已导入的源做检索
+anamnesis search "用户喜欢用什么方式写测试？"
+
+# 把 Anamnesis 接到 Claude Desktop / Cursor / ghast 作为 MCP server
+anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json
+```
 
 ### 从 crates.io 安装（推荐）
 

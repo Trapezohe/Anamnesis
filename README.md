@@ -31,33 +31,6 @@
 
 ---
 
-## 30-second install
-
-```bash
-cargo install --locked anamnesis-cli anamnesis-mcp-server
-```
-
-```bash
-# 1. Initialize the local store
-anamnesis init
-
-# 2. Register a source you already use — e.g. Claude Code
-anamnesis source add claude-code --path ~/.claude/projects
-
-# 3. Import + index (1795 records / 50K chunks on a real ~/.claude/projects)
-anamnesis import claude-code
-
-# 4. Search across everything Anamnesis has imported
-anamnesis search "how does the user prefer tests to be written?"
-
-# 5. Wire Anamnesis into Claude Desktop / Cursor / ghast as an MCP server
-anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json
-```
-
-See [Quick Start](#quick-start) for other install paths (one-liner, Homebrew, source, binary tarball), and [Supported Sources](#supported-sources--agents) for the 14 first-class adapters + generic MCP.
-
----
-
 ## Overview
 
 **Anamnesis** is an open-source memory infrastructure project for the agent era. It reads memories and sessions from **14 first-class adapters** — agent frameworks (Claude Code, Codex, Hermes, OpenClaw, ghast) and memory systems (mem0, Letta, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary) — plus any MCP-aware project through the Generic MCP adapter, then normalizes them into one local schema, one local database, and one Anamnesis-owned RAG stack. A two-stage **session extractor** distills raw `Episode` records into long-lived `Fact` / `Preference` / `Feedback` / `Skill` records, with every LLM call auditable, gated, and provenance-linked back to the source Episode.
@@ -87,56 +60,60 @@ It is not another chat interface. It is the memory layer underneath your tools:
 
 ## Supported Sources & Agents
 
-### Importable memory sources
+Anamnesis ships **14 first-class adapters** — 5 agent frameworks + 8 memory frameworks + 1 universal MCP — all passing the shared `MemoryAdapter` contract suite (62 invariant tests). Drop in any of them with `anamnesis source add <name> --path <location>`.
 
-#### §-2.2 Agents
+### Agent frameworks (5)
 
-| Source / Agent | Status | What is read today | Precision |
+| Agent | Default source path | Import command | License |
 |---|---|---|---|
-| Claude Code | Usable | `~/.claude/projects/*/memory/*.md`, project `*.jsonl` sessions | Medium-high for memory markdown; medium-low for sessions |
-| Codex | Usable | `~/.codex/` session JSON/JSONL | Medium |
-| Hermes (Nous Research) | Usable | `~/.hermes/MEMORY.md` + `USER.md` + SQLite session DBs | Medium-high |
-| OpenClaw | Usable | `~/.openclaw/` workspace MD + `skills/`, `sessions/*.json[l]` | Medium-high |
-| ghast | Usable | `~/Documents/ghast_desktop/prompts/`, bundled skills; detects encrypted profile DB | Medium-high |
+| **Claude Code** | `~/.claude/projects/` | `anamnesis source add claude-code --path ~/.claude/projects` | Apache-2.0 |
+| **Codex** (OpenAI CLI) | `~/.codex/` | `anamnesis source add codex --path ~/.codex` | Apache-2.0 |
+| **Hermes** (Nous Research) | `~/.hermes/` | `anamnesis source add hermes --path ~/.hermes` | Apache-2.0 |
+| **OpenClaw** | `~/.openclaw/` | `anamnesis source add openclaw --path ~/.openclaw` | MIT |
+| **ghast** | `~/Documents/ghast_desktop/` | `anamnesis source add ghast --path ~/Documents/ghast_desktop` | Apache-2.0 |
 
-#### §-2.3 Memory frameworks
+### Memory frameworks (8)
 
-| Source / Framework | Status | What is read today | License |
+| Framework | Backend | Import command | License |
 |---|---|---|---|
-| mem0 | Usable | Self-hosted SQLite `memories` table | Apache-2.0 |
-| Letta (formerly MemGPT) | Usable | SQLite `block` table (`~/.letta/letta.db`) | Apache-2.0 |
-| TencentDB Agent Memory | Usable | `~/.openclaw/memory-tdai/` 4-tier (L0 refs, L1 JSONL facts, L2 scenarios, L3 persona) | MIT |
-| OpenViking | Usable | VikingFS AGFS workspace (resources/user/agent/session × L0/L1/L2) | AGPLv3 (read-only, no link) |
-| MemPalace | Usable | `~/.mempalace/identity.txt` + ChromaDB drawers/closets | AGPLv3 (read-only, no link) |
-| Memori | Usable | SQLite — entity_facts, process_attrs, conversation messages + summaries, KG triples | Apache-2.0 |
-| MemOS | Usable | MemCube dumps (`textual_memory.json`) per `memory_type` | Apache-2.0 |
-| Memary | Usable | Local cache files (`memory_stream.json`, entity tally, past chat, personas) | MIT |
+| **mem0** | SQLite | `anamnesis source add mem0 --path ~/.mem0/db.sqlite` | Apache-2.0 |
+| **Letta** (formerly MemGPT) | SQLite | `anamnesis source add letta --path ~/.letta/letta.db` | Apache-2.0 |
+| **Hermes Memory** (TDAI 4-tier) | Filesystem | `anamnesis source add tdai --path ~/.tdai` | MIT |
+| **OpenViking** (VikingFS AGFS) | Filesystem | `anamnesis source add openviking --path <workspace>` | AGPLv3 (read-only) |
+| **MemPalace** | ChromaDB SQLite | `anamnesis source add mempalace --path ~/.mempalace` | AGPLv3 (read-only) |
+| **Memori** | SQLite (entity_facts + KG triples) | `anamnesis source add memori --path <db>` | Apache-2.0 |
+| **MemOS** | JSON MemCubes | `anamnesis source add memos --path <cube-root>` | Apache-2.0 |
+| **Memary** | Local JSON cache files | `anamnesis source add memary --path <data-dir>` | MIT |
 
-#### §-2.4 Long-tail (any MCP-aware source)
+### Universal MCP (1)
 
-| Protocol | Status | What is read today |
+| Adapter | Backend | Import command | Use case |
+|---|---|---|---|
+| **Generic MCP** | Any MCP-aware HTTP server | `anamnesis source add generic-mcp --url http://... --token-env <NAME>` | Cognee, Zep, Mistral Memory, or any future MCP server you can point at |
+
+> All 14 adapters were e2e-verified against real data or upstream-format fixtures: see [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for the full per-host setup walkthrough and [docs/demo/quickstart.sh](docs/demo/quickstart.sh) for an automated smoke test.
+
+### Consumers (Anamnesis-as-MCP-server)
+
+Anamnesis is itself an MCP server, so any MCP-aware client can call it. Generate the config snippet with `anamnesis mcp config`:
+
+| Consumer | Setup | Notes |
 |---|---|---|
-| Generic MCP server | Usable | `resources/list` + `resources/read` — works for any project that exposes an MCP server (Cognee, Zep, etc.) |
+| **Claude Desktop** | `anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json` | macOS path shown; Linux & Windows variants in [INTEGRATIONS](docs/INTEGRATIONS.md) |
+| **Cursor** | `anamnesis mcp config > ~/.cursor/mcp.json` | Per-user or per-project |
+| **ghast** | `anamnesis mcp config > ~/.ghast/mcp.json` | First-class consumer |
+| **Continue.dev / Zed / Windsurf** | `anamnesis mcp config` then merge into the client's MCP block | Any MCP-spec client |
+| **Scripts / automation** | `anamnesis search --json`, `anamnesis export`, `anamnesis status --json` | Direct CLI use, no MCP layer |
+| **Remote (HTTP/SSE)** | `anamnesis-mcp --sse 7878 --token-env ANAMNESIS_MCP_TOKEN` | For daemonized or non-stdio clients |
 
-### Consumers that can use Anamnesis
+### Planned
 
-| Consumer | Integration | Status | Notes |
-|---|---|---|---|
-| ghast | MCP server config | Planned first consumer | Anamnesis remains an independent OSS project |
-| Claude Desktop / Claude Code MCP clients | `anamnesis-mcp` stdio | Ready to wire | Suitable for local retrieval and provenance lookup |
-| Codex / CLI agents | MCP stdio or CLI | Ready to wire | Can consume Anamnesis via MCP or shell commands |
-| Cursor / Zed / MCP-aware tools | MCP stdio / SSE | Ready to wire | Depends on each client’s MCP support |
-| Scripts and automation | CLI + JSON output | Ready | `search --json`, `export`, `status --json` |
-
-### Planned support
-
-| Source / Consumer | Type | Plan |
+| Item | Type | Notes |
 |---|---|---|
-| Zep / Graphiti | Temporal knowledge graph | Bi-temporal facts push beyond the current `created_at/updated_at` schema; integration via `generic-mcp` until §-1.4 schema evolves |
-| Cognee | DuckDB + Kuzu graph | Today: via Cognee's own MCP server through `generic-mcp`. Native adapter pending if/when a portable on-disk export lands |
-| LangMem | LangChain SDK | Reads whichever backend LangGraph Store points at; case-by-case |
-| OpenAI / Voyage / other cloud embeddings | Embedding provider | Explicit opt-in only; never called silently |
-| Session extractor (§-1.5 PR-6) | Pipeline | Two-stage LLM-gated `Episode → Fact / Preference / Skill / Feedback` distillation |
+| Zep / Graphiti | Temporal knowledge graph | Bi-temporal facts beyond current `created_at/updated_at` schema; works today via `generic-mcp`, native adapter awaits §-1.4 schema evolution |
+| Cognee | DuckDB + Kuzu graph | Today via Cognee's own MCP server through `generic-mcp`; native adapter pending portable on-disk export |
+| LangMem | LangChain SDK | Backend-dependent (LangGraph Store) — case-by-case |
+| Cloud embeddings (OpenAI / Voyage / Cohere) | Embedding provider | Explicit opt-in only, never called silently |
 | Agent Memory Interchange Format | Standardization | Future RFC for cross-agent memory exchange |
 
 ## Why Anamnesis
@@ -339,6 +316,26 @@ Current MCP surface:
 > Security note: `import_source` is an admin capability. During pre-release, use it only with trusted local clients. The next P0 hardening step is to gate MCP admin tools by default.
 
 ## Quick Start
+
+### 30-second tour
+
+```bash
+# Install
+cargo install --locked anamnesis-cli anamnesis-mcp-server
+
+# Bootstrap a local store
+anamnesis init
+
+# Register and import a source you already use
+anamnesis source add claude-code --path ~/.claude/projects
+anamnesis import claude-code           # → 1795 records / 50K chunks on a real ~/.claude/projects
+
+# Search across all imported sources
+anamnesis search "how does the user prefer tests to be written?"
+
+# Wire Anamnesis into Claude Desktop / Cursor / ghast as an MCP server
+anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json
+```
 
 ### Install from crates.io (recommended)
 
