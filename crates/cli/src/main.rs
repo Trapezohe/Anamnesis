@@ -137,6 +137,14 @@ enum Command {
         /// Emit JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+        /// Append per-stage search timings (`embed_query` / `fts` /
+        /// `vec` / `rrf` / `pack`, in milliseconds) and candidate
+        /// counts. Mirrors the MCP `search_memories(trace=true)`
+        /// payload byte-for-byte; never includes the query text or
+        /// snippet content. Default off, keeps the existing wire
+        /// shape unchanged.
+        #[arg(long)]
+        trace: bool,
     },
 
     /// Remove a tombstone so the source can resurrect the memory
@@ -682,6 +690,7 @@ async fn main() -> Result<()> {
             limit,
             mode,
             json,
+            trace,
         } => {
             cmd_search(
                 &data_dir,
@@ -695,6 +704,7 @@ async fn main() -> Result<()> {
                 limit,
                 &mode,
                 json,
+                trace,
             )
             .await
         }
@@ -2108,6 +2118,7 @@ async fn cmd_search(
     limit: u32,
     mode_str: &str,
     json: bool,
+    trace: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let mode = match mode_str {
@@ -2165,8 +2176,17 @@ async fn cmd_search(
         time_to,
     };
 
-    let hits = run_search(&store, query, &store_filter, limit, mode, provider.as_ref()).await?;
+    // Round 76: always use the traced primitive so the live search
+    // and the optional --trace output can never drift. The trace
+    // struct is dropped when `trace=false`, so this is free at the
+    // default wire — same pattern the MCP `search_memories` tool
+    // uses since R71.
+    let traced =
+        run_search_traced(&store, query, &store_filter, limit, mode, provider.as_ref()).await?;
+    let hits = traced.hits;
+    let search_trace = traced.trace;
 
+    let t_pack = std::time::Instant::now();
     let packed = pack(
         &store,
         &hits,
@@ -2175,6 +2195,7 @@ async fn cmd_search(
             ..ContextBudget::default()
         },
     )?;
+    let pack_ms = t_pack.elapsed().as_millis() as u64;
 
     let filtered: Vec<_> = packed
         .into_iter()
@@ -2197,7 +2218,7 @@ async fn cmd_search(
     ));
 
     if json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "query": query,
             "mode": mode_str,
             // Round-8: same expanded wire format as the MCP server so
@@ -2225,9 +2246,37 @@ async fn cmd_search(
                 })
             }).collect::<Vec<_>>(),
         });
+        if trace {
+            // Same byte-shape as the MCP `search_memories(trace=true)`
+            // payload from R71 — so any tooling that already parses
+            // one can parse the other. Strictly numeric stage shape +
+            // resolved mode; query text and snippet stay outside the
+            // trace object.
+            let returned_records = filtered.len() as u32;
+            payload["trace"] = serde_json::json!({
+                "effective_mode": search_trace.effective_mode,
+                "candidate_pool": search_trace.candidate_pool,
+                "stages_ms": {
+                    "embed_query": search_trace.stages_ms.embed_query_ms,
+                    "fts":         search_trace.stages_ms.fts_ms,
+                    "vec":         search_trace.stages_ms.vec_ms,
+                    "rrf":         search_trace.stages_ms.rrf_ms,
+                    "pack":        pack_ms,
+                },
+                "counts": {
+                    "fts_hits":         search_trace.counts.fts_hits,
+                    "vec_hits":         search_trace.counts.vec_hits,
+                    "ranked_chunks":    search_trace.counts.ranked_chunks,
+                    "returned_records": returned_records,
+                },
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if filtered.is_empty() {
         println!("no results");
+        if trace {
+            print_human_search_trace(&search_trace, pack_ms, 0);
+        }
     } else {
         // Round-12: human-readable card mirrors the JSON wire format
         // (PR-#16) — same fields, same names, same semantics. CLI
@@ -2306,8 +2355,43 @@ async fn cmd_search(
             }
             println!();
         }
+        if trace {
+            print_human_search_trace(&search_trace, pack_ms, filtered.len() as u32);
+        }
     }
     Ok(())
+}
+
+/// Render the search trace as a compact block under the human
+/// results card. Same numeric shape as the JSON payload (and the
+/// MCP `search_memories(trace=true)` wire shape from R71).
+fn print_human_search_trace(
+    t: &anamnesis_search::SearchTrace,
+    pack_ms: u64,
+    returned_records: u32,
+) {
+    let fmt = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+    println!("Search trace:");
+    println!(
+        "  effective_mode={mode:?} candidate_pool={pool} returned_records={ret}",
+        mode = t.effective_mode,
+        pool = t.candidate_pool,
+        ret = returned_records,
+    );
+    println!(
+        "  stages_ms embed_query={eq} fts={fts} vec={vec} rrf={rrf} pack={pack}",
+        eq = fmt(t.stages_ms.embed_query_ms),
+        fts = fmt(t.stages_ms.fts_ms),
+        vec = fmt(t.stages_ms.vec_ms),
+        rrf = fmt(t.stages_ms.rrf_ms),
+        pack = pack_ms,
+    );
+    println!(
+        "  counts fts_hits={fh} vec_hits={vh} ranked_chunks={rc}",
+        fh = t.counts.fts_hits,
+        vh = t.counts.vec_hits,
+        rc = t.counts.ranked_chunks,
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4208,27 +4292,44 @@ async fn run_search(
     mode: SearchMode,
     provider: Option<&ProviderHandle>,
 ) -> Result<Vec<anamnesis_search::RankedChunk>> {
+    Ok(
+        run_search_traced(store, query, filter, limit, mode, provider)
+            .await?
+            .hits,
+    )
+}
+
+/// Round 76: traced variant of `run_search`. Returns both the
+/// ranked chunks and the per-stage timing/count breakdown so the
+/// CLI `--trace` flag can render the same shape MCP's
+/// `search_memories(trace=true)` returns. The plain `run_search`
+/// is a `.hits`-projection wrapper around this — same single-path
+/// discipline the search crate uses (avoid trace-vs-live drift).
+async fn run_search_traced(
+    store: &Store,
+    query: &str,
+    filter: &anamnesis_store::SearchFilter,
+    limit: u32,
+    mode: SearchMode,
+    provider: Option<&ProviderHandle>,
+) -> Result<anamnesis_search::TracedSearchResult> {
     let opts = HybridOpts {
         limit,
         candidate_pool: (limit * 4).max(limit),
         mode,
     };
-    // PR-C: `search_filtered` pushes the filter into the SQL recall
-    // stage so the candidate pool can't be dominated by a majority
-    // adapter. The old post-RRF filter (still applied below as a safety
-    // net) becomes a no-op rather than the only line of defense.
     match provider {
         Some(handle) => match handle {
             #[cfg(feature = "local-fastembed")]
             ProviderHandle::Local(p) => Ok(HybridSearcher::new(p.as_ref())
-                .search_filtered(store, query, filter, &opts)
+                .search_filtered_traced(store, query, filter, &opts)
                 .await?),
             ProviderHandle::None => Ok(HybridSearcher::<DummyProvider>::fulltext_only()
-                .search_filtered(store, query, filter, &opts)
+                .search_filtered_traced(store, query, filter, &opts)
                 .await?),
         },
         None => Ok(HybridSearcher::<DummyProvider>::fulltext_only()
-            .search_filtered(store, query, filter, &opts)
+            .search_filtered_traced(store, query, filter, &opts)
             .await?),
     }
 }

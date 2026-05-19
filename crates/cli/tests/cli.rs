@@ -755,6 +755,112 @@ fn search_json_mode_emits_parseable_json() {
     assert_eq!(parsed["query"], "nothing here");
     assert_eq!(parsed["mode"], "fulltext");
     assert!(parsed["results"].is_array());
+    // Round 76: default search JSON must NOT include the `trace`
+    // field. Guards against accidentally always emitting it (which
+    // would inflate every existing CLI consumer's payload).
+    assert!(
+        parsed.get("trace").is_none(),
+        "trace must be absent without --trace; got {parsed}"
+    );
+}
+
+// ─── Round-76: `anamnesis search --trace` ───────────────────────────
+
+#[test]
+fn search_trace_json_emits_stage_breakdown() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let output = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search", "anything", "--mode", "fulltext", "--json", "--trace",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(output.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let trace = &v["trace"];
+    assert_eq!(trace["effective_mode"], "fulltext");
+    assert!(trace["candidate_pool"].is_u64());
+    // Fulltext mode: fts and rrf and pack all ran; embed_query and vec did not.
+    assert!(trace["stages_ms"]["fts"].is_u64());
+    assert!(trace["stages_ms"]["rrf"].is_u64());
+    assert!(trace["stages_ms"]["pack"].is_u64());
+    assert!(trace["stages_ms"]["embed_query"].is_null());
+    assert!(trace["stages_ms"]["vec"].is_null());
+    // Counts align with what came back in results[].
+    let returned = v["results"].as_array().unwrap().len();
+    assert_eq!(
+        trace["counts"]["returned_records"].as_u64().unwrap() as usize,
+        returned
+    );
+}
+
+/// Privacy guard: the trace sub-object must not carry user-typed
+/// content. Same contract as the R71 MCP test. Note: the top-level
+/// CLI JSON intentionally already exposes `query` / `snippet` /
+/// `record_id` outside the trace, so we restrict the check to the
+/// `trace` value, mirroring how the MCP-side test scopes it.
+#[test]
+fn search_trace_payload_excludes_user_content() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let output = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search",
+            "uniqueQueryMarkerR76",
+            "--mode",
+            "fulltext",
+            "--json",
+            "--trace",
+        ])
+        .output()
+        .expect("run cli");
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let trace_str = v["trace"].to_string();
+    assert!(
+        !trace_str.contains("uniqueQueryMarkerR76"),
+        "query text must not appear in trace payload: {trace_str}"
+    );
+    // Whitelist top-level trace fields.
+    let trace = v["trace"].as_object().unwrap();
+    let allowed = ["effective_mode", "candidate_pool", "stages_ms", "counts"];
+    for k in trace.keys() {
+        assert!(
+            allowed.contains(&k.as_str()),
+            "unexpected trace top-level field {k:?}: needs a privacy review"
+        );
+    }
+}
+
+#[test]
+fn search_trace_human_mode_appends_trace_block() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "still nothing", "--mode", "fulltext", "--trace"])
+        .assert()
+        .success()
+        .stdout(
+            contains("no results")
+                .and(contains("Search trace:"))
+                .and(contains("effective_mode=Fulltext"))
+                .and(contains("stages_ms")),
+        );
 }
 
 // ─── PR-B: source registry is the canonical truth for import ───
