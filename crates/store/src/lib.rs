@@ -13,8 +13,8 @@ pub mod cjk;
 mod vec_ext;
 
 pub use api::{
-    ChunkHit, ChunkLookup, LineageChain, PendingEmbeddingJob, RecordSummary, SearchFilter,
-    SourceRow, SourceWithCounts, StoreStats, MAX_LIST_LIMIT,
+    ChunkHit, ChunkLookup, LineageChain, PendingEmbeddingJob, RecordHeader, RecordSummary,
+    SearchFilter, SourceRow, SourceWithCounts, StoreStats, MAX_LIST_LIMIT,
 };
 
 use std::path::Path;

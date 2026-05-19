@@ -29,3 +29,8 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 name = "hybrid_search"
 harness = false
 test = false
+
+[[bench]]
+name = "pack_long_records"
+harness = false
+test = false
