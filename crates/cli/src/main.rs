@@ -147,6 +147,33 @@ enum Command {
         trace: bool,
     },
 
+    /// Apply or remove user tags on a record (local overlay).
+    ///
+    /// User tags live in a separate table from the adapter-
+    /// derived `records.tags`, so they survive `import` /
+    /// re-`import` cycles. Read paths (`search`, `get_record`)
+    /// surface them as `user_tags`; the adapter-derived `tags`
+    /// stays untouched so source provenance is unambiguous.
+    ///
+    /// Set semantics: re-adding an existing tag or removing a
+    /// missing one is a no-op (the JSON `changed` count tells
+    /// the caller how many rows actually moved). Tags are
+    /// trimmed + lower-cased + deduped before write.
+    TagRecord {
+        /// Record id (as returned by `anamnesis search` /
+        /// `list-forgotten`).
+        record_id: String,
+        /// One or more tags to apply.
+        #[arg(required = true)]
+        tags: Vec<String>,
+        /// Remove the tags instead of adding them.
+        #[arg(long)]
+        remove: bool,
+        /// Emit JSON instead of the human one-liner.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Report records that share an identical `raw_hash` — the
     /// source-payload byte-fingerprint. Useful when 13 adapters'
     /// worth of imports surface the same Slack message twice, or
@@ -777,6 +804,12 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
+        Command::TagRecord {
+            record_id,
+            tags,
+            remove,
+            json,
+        } => cmd_tag_record(&data_dir, &record_id, &tags, remove, json),
         Command::Dedupe {
             limit,
             json,
@@ -2274,6 +2307,9 @@ async fn cmd_search(
                     "native_path": p.record.provenance.native_path,
                     "created_at": p.record.created_at.timestamp(),
                     "updated_at": p.record.updated_at.map(|t| t.timestamp()),
+                    // Round 78: user-tag overlay. Always emitted —
+                    // empty array when the record has no user tags.
+                    "user_tags": p.record.user_tags,
                 })
             }).collect::<Vec<_>>(),
         });
@@ -2383,6 +2419,12 @@ async fn cmd_search(
                     snippet
                 };
                 println!("     snippet: {snippet}");
+            }
+            // Round 78: user-tag overlay. Only printed when non-
+            // empty so untagged records stay quiet — most records
+            // have zero tags and noise would dilute the card.
+            if !p.record.user_tags.is_empty() {
+                println!("     user_tags: {}", p.record.user_tags.join(", "));
             }
             println!();
         }
@@ -2592,6 +2634,69 @@ fn cmd_unforget(data_dir: &std::path::Path, record_id: &str, json: bool) -> Resu
         return Err(anyhow!(
             "no tombstone for id {record_id:?} — nothing to unforget"
         ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tag-record (Round 78 PR-78)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis tag-record <record_id> <tag>...` — apply or remove
+/// user tags on a record. Writes to the `user_record_tags`
+/// overlay (R78), which is distinct from the adapter-derived
+/// `records.tags`. Re-import will not overwrite the user tags.
+///
+/// Audit-logged so the §-1.5 stage-2 audit trail captures
+/// who-tagged-what-when, parity with `forget` / `unforget`.
+fn cmd_tag_record(
+    data_dir: &std::path::Path,
+    record_id: &str,
+    tags: &[String],
+    remove: bool,
+    json: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let id = anamnesis_core::model::RecordId(record_id.to_string());
+    let op = if remove {
+        anamnesis_store::UserTagOperation::Remove
+    } else {
+        anamnesis_store::UserTagOperation::Add
+    };
+    let mutation = store.tag_record(&id, tags, op)?;
+
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "tag_record",
+        serde_json::json!({
+            "record_id": record_id,
+            "operation": if remove { "remove" } else { "add" },
+            "requested": mutation.requested,
+            "changed": mutation.changed,
+        }),
+    ));
+
+    if json {
+        let payload = serde_json::json!({
+            "record_id": mutation.record_id.0,
+            "operation": if remove { "remove" } else { "add" },
+            "requested": mutation.requested,
+            "changed": mutation.changed,
+            "user_tags": mutation.user_tags,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let verb = if remove { "removed" } else { "added" };
+        println!(
+            "{verb} {n} tag(s) on {id} (requested: {req})",
+            n = mutation.changed,
+            id = mutation.record_id.0,
+            req = mutation.requested.join(", "),
+        );
+        if mutation.user_tags.is_empty() {
+            println!("  user_tags: (none)");
+        } else {
+            println!("  user_tags: {}", mutation.user_tags.join(", "));
+        }
     }
     Ok(())
 }

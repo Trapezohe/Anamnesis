@@ -338,6 +338,12 @@ pub struct RecordHeader {
     /// migration that wants to fan out by version doesn't have to
     /// add another projection.
     pub schema_version: u32,
+    /// Round 78: user-applied tags from the `user_record_tags`
+    /// overlay. Distinct from `AnamnesisRecord.tags`, which is
+    /// adapter-derived and gets overwritten on every re-import.
+    /// Sorted ASCII-ascending so the wire is stable. Empty
+    /// vector when the record has no user tags (the common case).
+    pub user_tags: Vec<String>,
 }
 
 /// Full row from `sources` — what `list_sources_full` and `get_source`
@@ -400,6 +406,55 @@ pub const LIST_FORGOTTEN_MAX_LIMIT: u32 = 100;
 /// diagnostic surface — no single operator request should
 /// exfiltrate thousands of records at once).
 pub const LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT: u32 = 100;
+
+/// Round 78: per-tag length limit. Tags are operator-supplied
+/// short labels (`"todo"`, `"keep-forever"`, …); 64 bytes is
+/// already generous. Bounds enforced before the SQL write so
+/// pathological input never reaches `user_record_tags`.
+pub const USER_TAG_MAX_LEN: usize = 64;
+
+/// Round 78: max distinct tags applied in a single `tag_record`
+/// call. A user with thousands of memories that genuinely wants
+/// to bulk-apply tags should script per-record calls; this cap
+/// exists to keep one shell typo from blasting thousands of
+/// rows into the overlay table.
+pub const TAG_RECORD_MAX_BATCH: usize = 32;
+
+/// Which direction a `tag_record` call is moving the overlay.
+/// Distinguished as an enum (not a `bool add: true`) so the
+/// CLI / MCP wire stays readable and a future `Toggle` /
+/// `Replace` semantic doesn't need a third boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserTagOperation {
+    /// Insert each tag; existing rows are a no-op (set semantics).
+    Add,
+    /// Delete each tag; missing rows are a no-op (set semantics).
+    Remove,
+}
+
+/// Result of `Store::tag_record`. Carries the resolved tags the
+/// call acted on, the count of rows actually changed (so the
+/// caller can render "added 2 of 3 — `dog` was already there"),
+/// and the post-call set on the record so the CLI / MCP surface
+/// doesn't need a second round-trip to show the new state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserTagMutation {
+    /// Record the call mutated.
+    pub record_id: RecordId,
+    /// Which direction the call moved (mirrors the input).
+    pub operation: UserTagOperation,
+    /// The caller's tag list after normalisation
+    /// (`trim().to_lowercase()` + dedup + validation). Order
+    /// preserved from input minus collapsed duplicates.
+    pub requested: Vec<String>,
+    /// How many rows in `user_record_tags` actually changed.
+    /// `Add`: new (record_id, tag) pairs. `Remove`: deletions.
+    pub changed: u32,
+    /// Full post-call set of user tags on this record, sorted
+    /// ASCII-ascending. Stable so callers can render it
+    /// deterministically.
+    pub user_tags: Vec<String>,
+}
 
 /// One row inside a duplicate-raw_hash group. Carries the minimum
 /// the operator needs to decide which sibling to `forget`:
@@ -1228,6 +1283,152 @@ impl Store {
         Ok(out)
     }
 
+    /// Round 78 (PR-78): apply or remove user-tags on a record.
+    ///
+    /// **Set semantics.** Re-adding an existing tag is a no-op
+    /// (the `changed` count tells the caller how many rows
+    /// actually moved). Removing a missing tag is also a no-op.
+    /// This lets the CLI / MCP surface stay idempotent without
+    /// the caller having to first read the tags to figure out
+    /// what's actually new.
+    ///
+    /// Tag normalisation runs *before* the FK check on
+    /// `records.id`, so callers get a clear "your tag input is
+    /// bad" error instead of a SQL constraint failure. Rules:
+    ///   * `trim().to_lowercase()`
+    ///   * dedup (preserve input order)
+    ///   * reject empty
+    ///   * reject any control character (no `\n`, `\t`, …)
+    ///   * each tag ≤ `USER_TAG_MAX_LEN` bytes after trim
+    ///   * at most `TAG_RECORD_MAX_BATCH` tags per call
+    ///
+    /// If the record id doesn't exist, returns
+    /// `StoreError::Corruption` (the operator typoed the id,
+    /// likely from `list-forgotten` or `search`).
+    pub fn tag_record(
+        &self,
+        id: &RecordId,
+        tags: &[String],
+        operation: UserTagOperation,
+    ) -> Result<UserTagMutation> {
+        let requested = normalize_user_tags(tags)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Refuse early when the record doesn't exist. The FK on
+        // `user_record_tags.record_id` would catch this too, but
+        // the error message is friendlier here.
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(1) FROM records WHERE id = ?1",
+            params![id.0],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Err(StoreError::Corruption(format!(
+                "tag_record: no live record with id {:?}; \
+                 forget/unforget cycle erases tags via FK cascade",
+                id.0
+            )));
+        }
+
+        let mut changed = 0u32;
+        match operation {
+            UserTagOperation::Add => {
+                let now = chrono::Utc::now().timestamp();
+                for t in &requested {
+                    let n = tx.execute(
+                        "INSERT INTO user_record_tags(record_id, tag, created_at) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(record_id, tag) DO NOTHING",
+                        params![id.0, t, now],
+                    )?;
+                    changed += n as u32;
+                }
+            }
+            UserTagOperation::Remove => {
+                for t in &requested {
+                    let n = tx.execute(
+                        "DELETE FROM user_record_tags WHERE record_id = ?1 AND tag = ?2",
+                        params![id.0, t],
+                    )?;
+                    changed += n as u32;
+                }
+            }
+        }
+
+        // Post-call set so the caller can render the new state.
+        let user_tags: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT tag FROM user_record_tags WHERE record_id = ?1 ORDER BY tag ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![id.0], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+
+        tx.commit()?;
+        Ok(UserTagMutation {
+            record_id: id.clone(),
+            operation,
+            requested,
+            changed,
+            user_tags,
+        })
+    }
+
+    /// Round 78: list the user tags on one record. Sorted
+    /// ASCII-ascending. Empty vector for records that have
+    /// never been tagged (the common case).
+    pub fn user_tags(&self, id: &RecordId) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT tag FROM user_record_tags WHERE record_id = ?1 ORDER BY tag ASC")?;
+        let rows = stmt
+            .query_map(params![id.0], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Round 78: batched variant of `user_tags`. Used internally
+    /// by `get_record_headers_by_ids` so the search packer pays
+    /// one round-trip for the overlay, not N. Returned map omits
+    /// ids with zero tags (so the caller can default to empty
+    /// without paying for absent rows).
+    pub fn user_tags_by_ids(
+        &self,
+        ids: &[RecordId],
+    ) -> Result<std::collections::HashMap<RecordId, Vec<String>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT record_id, tag \
+             FROM user_record_tags \
+             WHERE record_id IN ({}) \
+             ORDER BY record_id ASC, tag ASC",
+            placeholders
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| &id.0 as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_iter), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out: std::collections::HashMap<RecordId, Vec<String>> =
+            std::collections::HashMap::new();
+        for (rid, tag) in rows {
+            out.entry(RecordId(rid)).or_default().push(tag);
+        }
+        Ok(out)
+    }
+
     /// Re-enqueue embedding jobs for every chunk under a different model.
     /// Used by `anamnesis model use <other>` to trigger a full re-embed.
     pub fn rebuild_embedding_jobs(&self, model_id: &str) -> Result<u64> {
@@ -1250,6 +1451,53 @@ impl Store {
 /// inside an already-open `Transaction`. The store-public
 /// [`Store::forget_record`] guarantees the tombstone is keyed on
 /// the same triple every adapter's `RecordId::from_parts` builds.
+/// Round 78: normalise the caller's tag list before the SQL
+/// write. Pure function — runs entirely in Rust, returns a
+/// validated `Vec<String>` ready to insert/delete. Fails fast
+/// on operator input bugs (empty, too long, control chars,
+/// over-batch) so the caller sees a clear error before any DB
+/// write happens.
+fn normalize_user_tags(raw: &[String]) -> Result<Vec<String>> {
+    if raw.is_empty() {
+        return Err(StoreError::Corruption(
+            "tag_record: at least one tag is required".into(),
+        ));
+    }
+    if raw.len() > TAG_RECORD_MAX_BATCH {
+        return Err(StoreError::Corruption(format!(
+            "tag_record: too many tags in one call ({}); max is {}",
+            raw.len(),
+            TAG_RECORD_MAX_BATCH
+        )));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for t in raw {
+        let normalised = t.trim().to_lowercase();
+        if normalised.is_empty() {
+            return Err(StoreError::Corruption(
+                "tag_record: empty tag (after trim) is not allowed".into(),
+            ));
+        }
+        if normalised.len() > USER_TAG_MAX_LEN {
+            return Err(StoreError::Corruption(format!(
+                "tag_record: tag {:?} exceeds {USER_TAG_MAX_LEN}-byte limit",
+                normalised
+            )));
+        }
+        if normalised.chars().any(|c| c.is_control()) {
+            return Err(StoreError::Corruption(format!(
+                "tag_record: tag {:?} contains a control character",
+                normalised
+            )));
+        }
+        if seen.insert(normalised.clone()) {
+            out.push(normalised);
+        }
+    }
+    Ok(out)
+}
+
 fn record_is_tombstoned(tx: &Transaction<'_>, r: &AnamnesisRecord) -> Result<bool> {
     let instance = r.source.instance.as_deref().unwrap_or("");
     let n: i64 = tx.query_row(
@@ -1565,10 +1813,39 @@ impl Store {
                 record_header_from_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        let mut out: std::collections::HashMap<RecordId, RecordHeader> =
+            std::collections::HashMap::with_capacity(rows.len());
         for r in rows {
             out.insert(r.id.clone(), r);
         }
+
+        // Round 78: batched second query to fill `user_tags` so
+        // the search packer pays one round-trip for the overlay
+        // instead of N. Tags arrive sorted ASCII-ascending so the
+        // wire is deterministic.
+        if !out.is_empty() {
+            let tag_sql = format!(
+                "SELECT record_id, tag \
+                 FROM user_record_tags \
+                 WHERE record_id IN ({}) \
+                 ORDER BY record_id ASC, tag ASC",
+                placeholders
+            );
+            let mut tag_stmt = conn.prepare(&tag_sql)?;
+            let tag_params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| &id.0 as &dyn rusqlite::ToSql).collect();
+            let tag_rows = tag_stmt
+                .query_map(rusqlite::params_from_iter(tag_params), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (rid, tag) in tag_rows {
+                if let Some(h) = out.get_mut(&RecordId(rid)) {
+                    h.user_tags.push(tag);
+                }
+            }
+        }
+
         Ok(out)
     }
 
@@ -1861,6 +2138,10 @@ fn record_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordHea
             derived_from: row.get::<_, Option<String>>(12)?.map(RecordId),
         },
         schema_version: row.get::<_, i64>(11)? as u32,
+        // Filled in by the batched second query in
+        // `get_record_headers_by_ids`. This per-row mapper can't
+        // do the join itself without forcing N+1.
+        user_tags: Vec::new(),
     })
 }
 
@@ -5011,5 +5292,221 @@ mod tests {
             0,
             "group should drop out once forget left only 1 live sibling",
         );
+    }
+
+    // ─── Round-78: user_record_tags ────────────────────────────────
+
+    fn seed_one(store: &Store, adapter: &str, native: &str) -> RecordId {
+        let r = make_record(adapter, native, "content", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        r.id
+    }
+
+    #[test]
+    fn tag_record_add_then_remove_is_set_semantic() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-a");
+
+        let m = store
+            .tag_record(&id, &["todo".into(), "keep".into()], UserTagOperation::Add)
+            .unwrap();
+        assert_eq!(m.changed, 2);
+        assert_eq!(m.user_tags, vec!["keep".to_string(), "todo".to_string()]);
+
+        // Add again — same set, no-op.
+        let m = store
+            .tag_record(&id, &["todo".into()], UserTagOperation::Add)
+            .unwrap();
+        assert_eq!(m.changed, 0, "re-add must be a no-op");
+        assert_eq!(m.user_tags, vec!["keep".to_string(), "todo".to_string()]);
+
+        // Remove one — set shrinks.
+        let m = store
+            .tag_record(&id, &["todo".into()], UserTagOperation::Remove)
+            .unwrap();
+        assert_eq!(m.changed, 1);
+        assert_eq!(m.user_tags, vec!["keep".to_string()]);
+
+        // Remove missing — no-op.
+        let m = store
+            .tag_record(&id, &["nonexistent".into()], UserTagOperation::Remove)
+            .unwrap();
+        assert_eq!(m.changed, 0);
+        assert_eq!(m.user_tags, vec!["keep".to_string()]);
+    }
+
+    #[test]
+    fn tag_record_normalises_input() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-norm");
+        let m = store
+            .tag_record(
+                &id,
+                &[
+                    "  TODO  ".into(),
+                    "todo".into(),
+                    "Keep".into(),
+                    "keep".into(),
+                ],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+        // Trimmed + lowercased + deduped → exactly 2 unique tags.
+        assert_eq!(m.requested, vec!["todo".to_string(), "keep".to_string()]);
+        assert_eq!(m.changed, 2);
+        assert_eq!(m.user_tags, vec!["keep".to_string(), "todo".to_string()]);
+    }
+
+    #[test]
+    fn tag_record_rejects_empty_and_oversized() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-bad");
+
+        assert!(store
+            .tag_record(&id, &["   ".into()], UserTagOperation::Add)
+            .is_err());
+        assert!(store
+            .tag_record(
+                &id,
+                &["x".repeat(USER_TAG_MAX_LEN + 1)],
+                UserTagOperation::Add
+            )
+            .is_err());
+        assert!(store
+            .tag_record(&id, &["bad\nnewline".into()], UserTagOperation::Add)
+            .is_err());
+        // Over-batch cap.
+        let many: Vec<String> = (0..(TAG_RECORD_MAX_BATCH + 1))
+            .map(|i| format!("t{i}"))
+            .collect();
+        assert!(store.tag_record(&id, &many, UserTagOperation::Add).is_err());
+    }
+
+    /// **Load-bearing**: this is the test that justifies a
+    /// separate overlay table. Re-importing the same source
+    /// (raw_hash unchanged) must NOT erase user tags.
+    #[test]
+    fn user_tags_survive_raw_hash_equal_reimport() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("claude-code", "rec-x", "stable content", Kind::Fact);
+        r.provenance.raw_hash = "h-stable".into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store
+            .tag_record(&r.id, &["keep-me".into()], UserTagOperation::Add)
+            .unwrap();
+
+        // Re-import identical content (raw_hash unchanged → fast path).
+        let (recs, _) = store.upsert_record(&r, &chunks, None).unwrap();
+        assert_eq!(recs, 0, "raw_hash-equal re-upsert must be a no-op");
+        let tags = store.user_tags(&r.id).unwrap();
+        assert_eq!(
+            tags,
+            vec!["keep-me".to_string()],
+            "user tags must survive re-import",
+        );
+    }
+
+    /// Also load-bearing: when raw_hash changes (real content
+    /// drift), the records row is rewritten — but user_tags
+    /// hangs off `record_id`, which is stable across re-import
+    /// because it's derived from `(adapter, instance, native_id)`.
+    /// So tags survive that path too.
+    #[test]
+    fn user_tags_survive_raw_hash_changed_reimport() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("claude-code", "rec-y", "first content", Kind::Fact);
+        r.provenance.raw_hash = "h-first".into();
+        let c1 = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c1, None).unwrap();
+        store
+            .tag_record(&r.id, &["keep-me".into()], UserTagOperation::Add)
+            .unwrap();
+
+        // Source content drifted; same natural key, new raw_hash.
+        let mut r2 = make_record("claude-code", "rec-y", "second content", Kind::Fact);
+        r2.provenance.raw_hash = "h-second".into();
+        let c2 = Chunker::default().chunk(&r2.id, &r2.content);
+        store.upsert_record(&r2, &c2, None).unwrap();
+        assert_eq!(
+            store.user_tags(&r2.id).unwrap(),
+            vec!["keep-me".to_string()],
+            "user tags must survive content drift; record_id is stable",
+        );
+    }
+
+    /// `forget_record` deletes the live `records` row; FK
+    /// cascade removes user_tags rows tied to that record.
+    /// Documented behaviour — the user can't tag a memory that
+    /// doesn't exist anymore.
+    #[test]
+    fn forget_record_cascades_user_tags() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-cas");
+        store
+            .tag_record(&id, &["doomed".into()], UserTagOperation::Add)
+            .unwrap();
+        assert_eq!(store.user_tags(&id).unwrap().len(), 1);
+        store.forget_record(&id, None).unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM user_record_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "FK cascade must clear user tags");
+    }
+
+    #[test]
+    fn tag_record_errors_on_unknown_record_id() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId::from_parts("claude-code", None, "never-existed");
+        let r = store.tag_record(&phantom, &["x".into()], UserTagOperation::Add);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn user_tags_by_ids_batches_overlay_lookup() {
+        let store = Store::open_in_memory().unwrap();
+        let a = seed_one(&store, "claude-code", "rec-batch-a");
+        let b = seed_one(&store, "claude-code", "rec-batch-b");
+        let c = seed_one(&store, "claude-code", "rec-batch-c");
+        store
+            .tag_record(
+                &a,
+                &["alpha".into(), "shared".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+        store
+            .tag_record(&b, &["shared".into()], UserTagOperation::Add)
+            .unwrap();
+        // c stays untagged.
+
+        let map = store
+            .user_tags_by_ids(&[a.clone(), b.clone(), c.clone()])
+            .unwrap();
+        assert_eq!(map.len(), 2, "untagged records are absent from the map");
+        assert_eq!(
+            map.get(&a).unwrap(),
+            &vec!["alpha".to_string(), "shared".to_string()]
+        );
+        assert_eq!(map.get(&b).unwrap(), &vec!["shared".to_string()]);
+    }
+
+    /// `get_record_headers_by_ids` (the hot path search packer uses)
+    /// must surface user_tags in a single batched query — no per-id
+    /// follow-up.
+    #[test]
+    fn get_record_headers_by_ids_includes_user_tags() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-hdr");
+        store
+            .tag_record(&id, &["one".into(), "two".into()], UserTagOperation::Add)
+            .unwrap();
+        let heads = store
+            .get_record_headers_by_ids(std::slice::from_ref(&id))
+            .unwrap();
+        let h = heads.get(&id).expect("present");
+        assert_eq!(h.user_tags, vec!["one".to_string(), "two".to_string()]);
     }
 }

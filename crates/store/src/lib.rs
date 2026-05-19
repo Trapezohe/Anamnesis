@@ -16,8 +16,9 @@ pub use api::{
     ChunkHit, ChunkLookup, DuplicateRawHashGroup, DuplicateRawHashRecord, ForgetRecordOutcome,
     ForgottenRecord, LineageChain, ListForgottenFilter, McpRequestMetric, McpToolMetricSummary,
     PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter, SourceRow, SourceWithCounts,
-    StoreStats, UnforgetRecordOutcome, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT,
-    LIST_FORGOTTEN_MAX_LIMIT, MAX_LIST_LIMIT, MCP_METRICS_CAP,
+    StoreStats, UnforgetRecordOutcome, UserTagMutation, UserTagOperation,
+    LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT, LIST_FORGOTTEN_MAX_LIMIT, MAX_LIST_LIMIT, MCP_METRICS_CAP,
+    TAG_RECORD_MAX_BATCH, USER_TAG_MAX_LEN,
 };
 
 use std::path::Path;
@@ -51,6 +52,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_records_raw_hash_index",
         include_str!("migrations/0008_records_raw_hash_index.sql"),
+    ),
+    (
+        "0009_user_record_tags",
+        include_str!("migrations/0009_user_record_tags.sql"),
     ),
 ];
 
@@ -258,7 +263,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
     }
 
     #[test]

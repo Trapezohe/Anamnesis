@@ -53,6 +53,7 @@ pub const ADMIN_TOOLS: &[&str] = &[
     "forget_record",
     "unforget_record",
     "list_forgotten",
+    "tag_record",
 ];
 
 /// Was this tool tagged as admin?
@@ -242,6 +243,7 @@ impl AnamnesisServer {
             "unforget_record" => self.tool_unforget_record(args.clone()).await,
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             "dedupe" => self.tool_dedupe(args.clone()).await,
+            "tag_record" => self.tool_tag_record(args.clone()).await,
             other => {
                 self.record_metric_safely(
                     Some(started_at),
@@ -561,6 +563,9 @@ impl AnamnesisServer {
                     "native_path": p.record.provenance.native_path,
                     "created_at": p.record.created_at.timestamp(),
                     "updated_at": p.record.updated_at.map(|t| t.timestamp()),
+                    // Round 78: user-tag overlay. Always emitted —
+                    // empty array when the record has no user tags.
+                    "user_tags": p.record.user_tags,
                 })
             }).collect::<Vec<_>>()
         });
@@ -618,6 +623,10 @@ impl AnamnesisServer {
             .record_summary(&r.id)
             .map_err(|e| format!("store: {e}"))?
             .ok_or_else(|| "record vanished between lookup and summary".to_string())?;
+        // Round 78: user-tag overlay. Always returned (empty vec
+        // when no user tags) so agents can branch on absence
+        // uniformly. Read is NOT admin-gated — only writes are.
+        let user_tags = store.user_tags(&r.id).map_err(|e| format!("store: {e}"))?;
 
         Ok(json!({
             "record_id": r.id.0,
@@ -656,6 +665,10 @@ impl AnamnesisServer {
             // retrieval (BLUEPRINT §6.6.1).
             "source_embedding_model": summary.source_embedding_model,
             "source_embedding_dim": summary.source_embedding_dim,
+            // Round 78: user-tag overlay. Distinct from `tags`
+            // (which is adapter-derived and gets overwritten on
+            // re-import). Empty array is the common case.
+            "user_tags": user_tags,
         }))
     }
 
@@ -1372,6 +1385,68 @@ impl AnamnesisServer {
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
             "groups":             payload_groups,
+        }))
+    }
+
+    /// Round 78 (PR-78): MCP-side `tag_record`. Admin-gated
+    /// because it mutates local state. Reads (`user_tags`
+    /// surfaced in `search_memories` / `get_record`) are NOT
+    /// admin-gated. Set semantics — re-adding is a no-op.
+    /// Same audit-log shape as the CLI.
+    async fn tool_tag_record(&self, args: Value) -> Result<Value, String> {
+        let record_id = args
+            .get("record_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "tag_record.record_id is required".to_string())?;
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "tag_record.tags must be an array".to_string())?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        let operation = match args
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("add")
+        {
+            "add" => anamnesis_store::UserTagOperation::Add,
+            "remove" => anamnesis_store::UserTagOperation::Remove,
+            other => {
+                return Err(format!(
+                    "tag_record.operation must be \"add\" or \"remove\"; got {other:?}"
+                ))
+            }
+        };
+
+        let mutation = self
+            .store
+            .tag_record(&RecordId(record_id.to_string()), &tags, operation)
+            .map_err(|e| format!("tag_record: {e}"))?;
+
+        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
+            "tag_record",
+            json!({
+                "record_id": record_id,
+                "operation": match operation {
+                    anamnesis_store::UserTagOperation::Add    => "add",
+                    anamnesis_store::UserTagOperation::Remove => "remove",
+                },
+                "requested": mutation.requested,
+                "changed":   mutation.changed,
+                "via":       "mcp",
+            }),
+        ));
+
+        Ok(json!({
+            "record_id": mutation.record_id.0,
+            "operation": match operation {
+                anamnesis_store::UserTagOperation::Add    => "add",
+                anamnesis_store::UserTagOperation::Remove => "remove",
+            },
+            "requested": mutation.requested,
+            "changed":   mutation.changed,
+            "user_tags": mutation.user_tags,
         }))
     }
 
@@ -2106,6 +2181,40 @@ fn tools_list_payload_all() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "tag_record",
+                "description": "Apply or remove user tags on a record. Tags live in a separate \
+                                overlay table from the adapter-derived `tags` field, so they \
+                                survive re-import. Read paths (`search_memories`, `get_record`) \
+                                surface them as `user_tags`. ADMIN-GATED for write; reads are not \
+                                admin-gated. Set semantics — re-adding an existing tag or \
+                                removing a missing one is a no-op (the `changed` count reports \
+                                actual writes). Tags are trimmed, lower-cased, deduped before \
+                                write. Limit: 32 tags per call, 64 bytes per tag.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "record_id": {
+                            "type": "string",
+                            "description": "Record id (as returned by `search_memories` / `list_forgotten`)."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "maxItems": 32,
+                            "description": "Tags to apply/remove. Normalised before write."
+                        },
+                        "operation": {
+                            "type": "string",
+                            "enum": ["add", "remove"],
+                            "default": "add",
+                            "description": "Direction of the mutation."
+                        }
+                    },
+                    "required": ["record_id", "tags"]
+                }
             }
         ]
     })
@@ -2389,8 +2498,8 @@ mod tests {
         let names = tool_names_from(&resp.result.unwrap());
         // R73 added forget_record (6→7). R74 added list_forgotten
         // (7→8). R75 added unforget_record (8→9). R77 added
-        // dedupe (9→10).
-        assert_eq!(names.len(), 10);
+        // dedupe (9→10). R78 added tag_record (10→11).
+        assert_eq!(names.len(), 11);
         for expected in [
             "search_memories",
             "get_record",
@@ -2402,6 +2511,7 @@ mod tests {
             "unforget_record",
             "list_forgotten",
             "dedupe",
+            "tag_record",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
