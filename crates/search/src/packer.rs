@@ -117,7 +117,7 @@ pub fn pack(
     //    query per record) with a single `get_records_by_ids` IN(?) call.
     //    Skip vanished records (missing from the returned map).
     let record_ids: Vec<RecordId> = order_seen.iter().map(|rid| RecordId(rid.clone())).collect();
-    let record_map = store
+    let mut record_map = store
         .get_records_by_ids(&record_ids)
         .map_err(|e| Error::Other(format!("store get_records_by_ids: {e}")))?;
 
@@ -125,8 +125,12 @@ pub fn pack(
     for rid in &order_seen {
         let chunks = groups.remove(rid).expect("group exists by construction");
         let record_id = chunks[0].record_id.clone();
-        let record = match record_map.get(&record_id) {
-            Some(r) => r.clone(),
+        // `remove` moves the record out of the map; avoids cloning the
+        // (potentially large) content field that `get(&id).clone()` would.
+        // Each `record_id` in `order_seen` is unique by construction so
+        // we never need to read it twice.
+        let record = match record_map.remove(&record_id) {
+            Some(r) => r,
             None => continue,
         };
         let mut chunks = chunks;

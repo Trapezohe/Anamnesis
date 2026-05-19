@@ -28,15 +28,34 @@ pub struct DrainSummary {
     pub failed: u64,
 }
 
+/// Default `claim_next_jobs` batch size — matches the importer's
+/// `UPSERT_BATCH` so a roughly equivalent number of records and chunks
+/// flow through the pipeline per fsync.
+pub const DEFAULT_DRAIN_BATCH: usize = 64;
+
 /// The worker. Stateless aside from the provider it wraps.
 pub struct EmbeddingWorker<'a, P: EmbeddingProvider> {
     provider: &'a P,
+    batch_size: usize,
 }
 
 impl<'a, P: EmbeddingProvider> EmbeddingWorker<'a, P> {
-    /// Build a worker that drains jobs targeted at `provider.model_id()`.
+    /// Build a worker that drains jobs targeted at `provider.model_id()`
+    /// with the default batch size.
     pub fn new(provider: &'a P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            batch_size: DEFAULT_DRAIN_BATCH,
+        }
+    }
+
+    /// Override the batch size used by `drain` for `claim_next_jobs` and
+    /// `embed_batch`. Min-clamped to 1. Tests use this to exercise small
+    /// batches and boundary conditions; production callers should normally
+    /// keep the default.
+    pub fn with_batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n.max(1);
+        self
     }
 
     /// Process one job, if any. Returns:
@@ -92,7 +111,6 @@ impl<'a, P: EmbeddingProvider> EmbeddingWorker<'a, P> {
     /// retried via the per-job path so a single bad chunk doesn't kill 63
     /// healthy siblings.
     pub async fn drain(&self, store: &Store) -> Result<DrainSummary> {
-        const BATCH: usize = 64;
         let model_id = self.provider.model_id().0;
         let mut summary = DrainSummary {
             model_id: model_id.clone(),
@@ -100,7 +118,9 @@ impl<'a, P: EmbeddingProvider> EmbeddingWorker<'a, P> {
             failed: 0,
         };
         loop {
-            let jobs = store.claim_next_jobs(&model_id, BATCH).map_err(s2c)?;
+            let jobs = store
+                .claim_next_jobs(&model_id, self.batch_size)
+                .map_err(s2c)?;
             if jobs.is_empty() {
                 break;
             }
@@ -408,6 +428,123 @@ mod tests {
         let summary = EmbeddingWorker::new(&provider).drain(&store).await.unwrap();
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.processed, 0);
+    }
+
+    /// Round-63: a recording provider that captures the sizes of every
+    /// `embed_batch` call so tests can prove batched drain actually issues
+    /// fewer, larger provider invocations.
+    struct RecordingProvider {
+        id: ModelId,
+        dim: u16,
+        call_sizes: std::sync::Mutex<Vec<usize>>,
+        fail_first_batch: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingProvider {
+        fn new(model: &str, dim: u16) -> Self {
+            Self {
+                id: ModelId::new("test", model, 1),
+                dim,
+                call_sizes: std::sync::Mutex::new(Vec::new()),
+                fail_first_batch: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn fail_first_batch(self) -> Self {
+            self.fail_first_batch
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        fn sizes(&self) -> Vec<usize> {
+            self.call_sizes.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingProvider {
+        fn model_id(&self) -> ModelId {
+            self.id.clone()
+        }
+        fn dim(&self) -> u16 {
+            self.dim
+        }
+        async fn embed_batch(&self, texts: &[&str], _task: EmbeddingTask) -> Result<Vec<Vec<f32>>> {
+            self.call_sizes.lock().unwrap().push(texts.len());
+            // The "fail first batch" mode fails only the first multi-text
+            // call so we can observe the per-job fallback path on a real
+            // queue (a single-text fallback call still succeeds).
+            if texts.len() > 1
+                && self
+                    .fail_first_batch
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anamnesis_core::error::Error::Other(
+                    "first batch boom".into(),
+                ));
+            }
+            Ok(texts.iter().map(|_| vec![0.5; self.dim as usize]).collect())
+        }
+    }
+
+    /// Round-63: batched drain with batch_size=3 over 7 pending jobs
+    /// should issue exactly three `embed_batch` calls of sizes 3, 3, 1.
+    #[tokio::test]
+    async fn drain_uses_configured_batch_size() {
+        let store = Store::open_in_memory().unwrap();
+        let provider = RecordingProvider::new("batched", 4);
+        seed(
+            &store,
+            &provider.model_id().0,
+            &[
+                ("r1", "a"),
+                ("r2", "b"),
+                ("r3", "c"),
+                ("r4", "d"),
+                ("r5", "e"),
+                ("r6", "f"),
+                ("r7", "g"),
+            ],
+        );
+
+        let worker = EmbeddingWorker::new(&provider).with_batch_size(3);
+        let summary = worker.drain(&store).await.unwrap();
+
+        assert_eq!(summary.processed, 7);
+        assert_eq!(summary.failed, 0);
+        // Three claim_next_jobs calls returned 3, 3, 1 jobs respectively
+        // (FIFO of 7 jobs in batches of 3).
+        assert_eq!(provider.sizes(), vec![3, 3, 1]);
+    }
+
+    /// Round-63: when `embed_batch` fails for a whole batch the worker
+    /// must fall back to per-job retries. Five jobs, batch_size=5, the
+    /// batched call fails once → fallback should re-call `embed_batch`
+    /// five times with `[1]` each and every job should still complete.
+    #[tokio::test]
+    async fn drain_falls_back_per_job_on_batch_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let provider = RecordingProvider::new("fallbacking", 4).fail_first_batch();
+        seed(
+            &store,
+            &provider.model_id().0,
+            &[
+                ("r1", "a"),
+                ("r2", "b"),
+                ("r3", "c"),
+                ("r4", "d"),
+                ("r5", "e"),
+            ],
+        );
+
+        let worker = EmbeddingWorker::new(&provider).with_batch_size(5);
+        let summary = worker.drain(&store).await.unwrap();
+
+        assert_eq!(summary.processed, 5);
+        assert_eq!(summary.failed, 0);
+        // First multi-text call (size 5) failed and triggered fallback;
+        // fallback then issued 5 single-text calls.
+        let sizes = provider.sizes();
+        assert_eq!(sizes.first().copied(), Some(5));
+        assert_eq!(sizes.iter().filter(|n| **n == 1).count(), 5);
     }
 
     #[tokio::test]
