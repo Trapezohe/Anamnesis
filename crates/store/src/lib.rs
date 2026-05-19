@@ -13,9 +13,10 @@ pub mod cjk;
 mod vec_ext;
 
 pub use api::{
-    ChunkHit, ChunkLookup, ForgetRecordOutcome, ForgottenRecord, LineageChain, McpRequestMetric,
-    McpToolMetricSummary, PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter,
-    SourceRow, SourceWithCounts, StoreStats, MAX_LIST_LIMIT, MCP_METRICS_CAP,
+    ChunkHit, ChunkLookup, ForgetRecordOutcome, ForgottenRecord, LineageChain, ListForgottenFilter,
+    McpRequestMetric, McpToolMetricSummary, PendingEmbeddingJob, RecordHeader, RecordSummary,
+    SearchFilter, SourceRow, SourceWithCounts, StoreStats, LIST_FORGOTTEN_MAX_LIMIT,
+    MAX_LIST_LIMIT, MCP_METRICS_CAP,
 };
 
 use std::path::Path;

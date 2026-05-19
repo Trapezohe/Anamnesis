@@ -363,6 +363,28 @@ pub struct SourceWithCounts {
 /// (§-1.5 PR-2).
 pub const MAX_LIST_LIMIT: u32 = 1000;
 
+/// Hard cap on `Store::list_forgotten` page size. Smaller than
+/// `MAX_LIST_LIMIT` because tombstone rows carry potentially
+/// sensitive fields (`raw_hash`, `reason`, `native_path`) — a tight
+/// page keeps any single operator request from accidentally
+/// exfiltrating the whole tombstone table.
+pub const LIST_FORGOTTEN_MAX_LIMIT: u32 = 100;
+
+/// Round 74 (PR-74): filter for `Store::list_forgotten`. Mirrors
+/// the `(adapter, instance)` natural key the tombstones are
+/// indexed on so the operator can scope to a single source. `limit`
+/// is clamped to `[1, LIST_FORGOTTEN_MAX_LIMIT]` by the store.
+#[derive(Debug, Clone, Default)]
+pub struct ListForgottenFilter {
+    /// Adapter id (e.g. `"claude-code"`). `None` returns all sources.
+    pub source: Option<String>,
+    /// Instance discriminator. `None` returns all instances of
+    /// the given source.
+    pub instance: Option<String>,
+    /// Max rows to return. Clamped to `[1, LIST_FORGOTTEN_MAX_LIMIT]`.
+    pub limit: u32,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source registry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -871,6 +893,93 @@ impl Store {
             reason: reason.map(str::to_owned),
             forgotten_at: now,
         }))
+    }
+
+    /// Round 74 (PR-74): paginated read of `record_tombstones`,
+    /// newest-first. Used by `anamnesis list-forgotten` and the
+    /// admin-gated MCP `list_forgotten` tool to surface what's
+    /// been tombstoned so an operator can audit + (eventually)
+    /// `unforget` mistakes.
+    ///
+    /// Filters mirror what the importer keys on so the operator can
+    /// scope to one source: `(adapter, instance)`. `limit` is
+    /// clamped to `[1, LIST_FORGOTTEN_MAX_LIMIT]`. Empty filter
+    /// returns the most recent N across all sources.
+    ///
+    /// This method is read-only — callers are responsible for any
+    /// field-level redaction they want at the wire boundary.
+    pub fn list_forgotten(&self, filter: &ListForgottenFilter) -> Result<Vec<ForgottenRecord>> {
+        let limit = filter.limit.clamp(1, LIST_FORGOTTEN_MAX_LIMIT);
+        let conn = self.conn.lock();
+        let mapper = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ForgottenRecord> {
+            Ok(ForgottenRecord {
+                record_id: RecordId(r.get(0)?),
+                adapter: r.get(1)?,
+                instance: r.get(2)?,
+                native_id: r.get(3)?,
+                native_path: r.get(4)?,
+                raw_hash: r.get(5)?,
+                reason: r.get(6)?,
+                forgotten_at: r.get(7)?,
+            })
+        };
+        let rows: Vec<ForgottenRecord> = match (
+            filter.source.as_deref(),
+            filter.instance.as_deref(),
+        ) {
+            (Some(s), Some(i)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT record_id, adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                     FROM record_tombstones \
+                     WHERE adapter = ?1 AND instance = ?2 \
+                     ORDER BY forgotten_at DESC, record_id DESC \
+                     LIMIT ?3",
+                )?;
+                let mapped = stmt
+                    .query_map(params![s, i, limit as i64], mapper)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                mapped
+            }
+            (Some(s), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT record_id, adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                     FROM record_tombstones \
+                     WHERE adapter = ?1 \
+                     ORDER BY forgotten_at DESC, record_id DESC \
+                     LIMIT ?2",
+                )?;
+                let mapped = stmt
+                    .query_map(params![s, limit as i64], mapper)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                mapped
+            }
+            (None, Some(i)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT record_id, adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                     FROM record_tombstones \
+                     WHERE instance = ?1 \
+                     ORDER BY forgotten_at DESC, record_id DESC \
+                     LIMIT ?2",
+                )?;
+                let mapped = stmt
+                    .query_map(params![i, limit as i64], mapper)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                mapped
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT record_id, adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                     FROM record_tombstones \
+                     ORDER BY forgotten_at DESC, record_id DESC \
+                     LIMIT ?1",
+                )?;
+                let mapped = stmt
+                    .query_map(params![limit as i64], mapper)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                mapped
+            }
+        };
+        Ok(rows)
     }
 
     /// Re-enqueue embedding jobs for every chunk under a different model.
@@ -4369,5 +4478,92 @@ mod tests {
             (0, 0),
             "tombstoned r1 must not resurrect; unchanged r2 is raw_hash no-op",
         );
+    }
+
+    // ─── Round-74: list_forgotten ───────────────────────────────────
+
+    /// Helper: seed `n` forgettable records for `(adapter, instance)`
+    /// and forget all of them. `instance = None` uses the default ("").
+    fn seed_and_forget(store: &Store, adapter: &str, n: usize) -> Vec<RecordId> {
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let nid = format!("rec-{i}");
+            let mut r = make_record(adapter, &nid, &format!("content {i}"), Kind::Fact);
+            r.provenance.raw_hash = format!("h-{adapter}-{i}");
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &chunks, None).unwrap();
+            store
+                .forget_record(&r.id, Some(&format!("test forget #{i}")))
+                .unwrap();
+            ids.push(r.id);
+        }
+        ids
+    }
+
+    /// `list_forgotten` returns rows newest-first, honours the
+    /// `limit` cap, and ignores `MAX_LIST_LIMIT` (its own
+    /// `LIST_FORGOTTEN_MAX_LIMIT = 100` is the binding cap).
+    #[test]
+    fn list_forgotten_returns_newest_first_respecting_limit() {
+        let store = Store::open_in_memory().unwrap();
+        seed_and_forget(&store, "claude-code", 5);
+        let filter = ListForgottenFilter {
+            source: None,
+            instance: None,
+            limit: 3,
+        };
+        let rows = store.list_forgotten(&filter).unwrap();
+        assert_eq!(rows.len(), 3, "limit must be respected");
+        for w in rows.windows(2) {
+            assert!(
+                w[0].forgotten_at >= w[1].forgotten_at,
+                "must be sorted newest-first"
+            );
+        }
+    }
+
+    /// Source filter narrows to one adapter even when other
+    /// adapters' tombstones exist.
+    #[test]
+    fn list_forgotten_filters_by_source() {
+        let store = Store::open_in_memory().unwrap();
+        seed_and_forget(&store, "claude-code", 2);
+        seed_and_forget(&store, "mem0", 3);
+        let filter = ListForgottenFilter {
+            source: Some("mem0".into()),
+            instance: None,
+            limit: 100,
+        };
+        let rows = store.list_forgotten(&filter).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.adapter == "mem0"));
+    }
+
+    /// `limit = 0` is a guard, not an empty-result short-circuit —
+    /// clamp to 1 so the caller always sees at least the most-
+    /// recent entry. Caps above `LIST_FORGOTTEN_MAX_LIMIT` clamp
+    /// down to `LIST_FORGOTTEN_MAX_LIMIT`.
+    #[test]
+    fn list_forgotten_clamps_limit_into_window() {
+        let store = Store::open_in_memory().unwrap();
+        seed_and_forget(&store, "claude-code", 4);
+        // 0 → clamped to 1
+        let rows = store
+            .list_forgotten(&ListForgottenFilter {
+                source: None,
+                instance: None,
+                limit: 0,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        // > cap → clamped to cap, but only 4 rows exist
+        let rows = store
+            .list_forgotten(&ListForgottenFilter {
+                source: None,
+                instance: None,
+                limit: LIST_FORGOTTEN_MAX_LIMIT * 10,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 4);
     }
 }

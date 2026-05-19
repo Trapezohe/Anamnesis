@@ -48,7 +48,7 @@ pub const PROTOCOL_VERSION: &str = "2025-03-26";
 /// filesystem paths, or otherwise stray outside read-only memory access.
 /// Hidden from `tools/list` and rejected by `tools/call` unless
 /// `AnamnesisServer::allow_admin_tools` is true. See BLUEPRINT §17.5 PR-A.
-pub const ADMIN_TOOLS: &[&str] = &["import_source", "forget_record"];
+pub const ADMIN_TOOLS: &[&str] = &["import_source", "forget_record", "list_forgotten"];
 
 /// Was this tool tagged as admin?
 fn is_admin_tool(name: &str) -> bool {
@@ -234,6 +234,7 @@ impl AnamnesisServer {
             "trace_provenance" => self.tool_trace_provenance(args.clone()).await,
             "doctor" => self.tool_doctor(args.clone()).await,
             "forget_record" => self.tool_forget_record(args.clone()).await,
+            "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             other => {
                 self.record_metric_safely(
                     Some(started_at),
@@ -1196,6 +1197,72 @@ impl AnamnesisServer {
         }
     }
 
+    /// Round 74 (PR-74): MCP audit view for `record_tombstones`.
+    /// Admin-gated and redaction-by-default — `native_path`,
+    /// `raw_hash`, `reason` are reported as `has_*` booleans
+    /// unless the caller opts in with `include_sensitive=true`.
+    /// `limit` is clamped by the store to
+    /// `[1, LIST_FORGOTTEN_MAX_LIMIT]`.
+    ///
+    /// Read-only: never writes the store or audit log.
+    async fn tool_list_forgotten(&self, args: Value) -> Result<Value, String> {
+        let source = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let instance = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(20);
+        let include_sensitive = args
+            .get("include_sensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let filter = anamnesis_store::ListForgottenFilter {
+            source,
+            instance,
+            limit,
+        };
+        let rows = self
+            .store
+            .list_forgotten(&filter)
+            .map_err(|e| format!("list_forgotten: {e}"))?;
+
+        let effective_limit = limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT);
+        let rows_payload: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut row = json!({
+                    "record_id": r.record_id.0,
+                    "adapter":   r.adapter,
+                    "instance":  if r.instance.is_empty() { Value::Null } else { Value::String(r.instance.clone()) },
+                    "native_id": r.native_id,
+                    "forgotten_at":    r.forgotten_at,
+                    "has_reason":      r.reason.is_some(),
+                    "has_native_path": r.native_path.is_some(),
+                });
+                if include_sensitive {
+                    row["reason"]      = json!(r.reason);
+                    row["native_path"] = json!(r.native_path);
+                    row["raw_hash"]    = json!(r.raw_hash);
+                }
+                row
+            })
+            .collect();
+        Ok(json!({
+            "count":              rows.len(),
+            "limit":              effective_limit,
+            "sensitive_included": include_sensitive,
+            "rows":               rows_payload,
+        }))
+    }
+
     /// Build the right adapter for a registered source and call
     /// `MemoryAdapter::health().await`. Mirrors the CLI's
     /// `run_adapter_health` — the dispatch table stays in lockstep with
@@ -1846,6 +1913,40 @@ fn tools_list_payload_all() -> Value {
                     },
                     "required": ["record_id"]
                 }
+            },
+            {
+                "name": "list_forgotten",
+                "description": "List tombstoned records, newest-first. Read-only audit view over \
+                                `record_tombstones`. ADMIN-GATED — hidden from `tools/list` and \
+                                rejected by `tools/call` unless the server allows admin tools. \
+                                **Default response is redacted**: `native_path`, `raw_hash`, and \
+                                `reason` are reported only as `has_*` booleans. Set \
+                                `include_sensitive=true` to opt in to those fields (e.g. before an \
+                                `unforget` decision). `limit` is clamped to [1, 100].",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Restrict to one adapter id (`claude-code`, `mem0`, …)."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Restrict to one instance discriminator within `source`."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 20,
+                            "description": "Max rows. Clamped to [1, 100] by the store."
+                        },
+                        "include_sensitive": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Reveal `native_path`, `raw_hash`, `reason`. Off by default."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -2124,7 +2225,8 @@ mod tests {
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        assert_eq!(names.len(), 7);
+        // R73 added forget_record (6→7). R74 added list_forgotten (7→8).
+        assert_eq!(names.len(), 8);
         for expected in [
             "search_memories",
             "get_record",
@@ -2133,6 +2235,7 @@ mod tests {
             "trace_provenance",
             "doctor",
             "forget_record",
+            "list_forgotten",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

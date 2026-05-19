@@ -139,6 +139,37 @@ enum Command {
         json: bool,
     },
 
+    /// List tombstoned records (audit view).
+    ///
+    /// Round 74: surfaces what `forget` has tombstoned, scoped by
+    /// `--source` / `--instance`, newest-first. **Default output
+    /// is redacted** — `native_path`, `raw_hash`, and `reason` are
+    /// withheld and reported only as `has_*` booleans. Pass
+    /// `--include-sensitive` to reveal them when an operator
+    /// actually needs to audit content (e.g. before `unforget`).
+    ///
+    /// Read-only — never writes to the store or audit log.
+    ListForgotten {
+        /// Restrict to one adapter id (`claude-code`, `mem0`, …).
+        #[arg(long)]
+        source: Option<String>,
+        /// Restrict to a specific instance.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Result limit. Default 20, cap 100.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+        /// Include `native_path`, `raw_hash`, and `reason` fields
+        /// in the output. Default off — these may carry user-
+        /// supplied or source-derived content and shouldn't appear
+        /// in a casual audit dump.
+        #[arg(long)]
+        include_sensitive: bool,
+    },
+
     /// Forget a record permanently.
     ///
     /// Writes a tombstone (`record_tombstones`) keyed on
@@ -692,6 +723,20 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
+        Command::ListForgotten {
+            source,
+            instance,
+            limit,
+            json,
+            include_sensitive,
+        } => cmd_list_forgotten(
+            &data_dir,
+            source.as_deref(),
+            instance.as_deref(),
+            limit,
+            json,
+            include_sensitive,
+        ),
         Command::Forget {
             record_id,
             reason,
@@ -2335,6 +2380,107 @@ fn cmd_forget(
         return Err(anyhow!(
             "no record with id {record_id:?} — nothing to forget"
         ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// list-forgotten (Round 74 PR-74)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis list-forgotten` — audit view over `record_tombstones`.
+///
+/// Default output is *redacted*: sensitive fields (`native_path`,
+/// `raw_hash`, `reason`) are reported only as `has_*` booleans so a
+/// quick "what did I forget" check doesn't spray potentially user-
+/// supplied content into the operator's terminal or a log scrape.
+/// Pass `--include-sensitive` to opt-in to the full fields.
+///
+/// Read-only — never writes to the store or audit log. Pure audit
+/// surface, distinct from the `forget` mutation.
+fn cmd_list_forgotten(
+    data_dir: &std::path::Path,
+    source: Option<&str>,
+    instance: Option<&str>,
+    limit: u32,
+    json: bool,
+    include_sensitive: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let filter = anamnesis_store::ListForgottenFilter {
+        source: source.map(str::to_owned),
+        instance: instance.map(str::to_owned),
+        limit,
+    };
+    let rows = store.list_forgotten(&filter)?;
+
+    if json {
+        let payload = serde_json::json!({
+            "count": rows.len(),
+            "limit": limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT),
+            "sensitive_included": include_sensitive,
+            "rows": rows.iter().map(|r| {
+                let mut row = serde_json::json!({
+                    "record_id": r.record_id.0,
+                    "adapter": r.adapter,
+                    "instance": if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
+                    "native_id": r.native_id,
+                    "forgotten_at": r.forgotten_at,
+                    "has_reason": r.reason.is_some(),
+                    "has_native_path": r.native_path.is_some(),
+                });
+                if include_sensitive {
+                    row["reason"] = serde_json::json!(r.reason);
+                    row["native_path"] = serde_json::json!(r.native_path);
+                    row["raw_hash"] = serde_json::json!(r.raw_hash);
+                }
+                row
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if rows.is_empty() {
+        println!("no forgotten records");
+    } else {
+        println!(
+            "{} forgotten record(s){}",
+            rows.len(),
+            if include_sensitive {
+                " (including sensitive fields)"
+            } else {
+                ""
+            }
+        );
+        for r in &rows {
+            let inst = if r.instance.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", r.instance)
+            };
+            println!(
+                "  {} ({}{inst}, native_id={}, at={})",
+                r.record_id.0, r.adapter, r.native_id, r.forgotten_at,
+            );
+            if include_sensitive {
+                if let Some(p) = &r.native_path {
+                    println!("    native_path : {p}");
+                }
+                println!("    raw_hash    : {}", r.raw_hash);
+                if let Some(reason) = &r.reason {
+                    println!("    reason      : {reason}");
+                }
+            } else {
+                let mut flags = Vec::new();
+                if r.native_path.is_some() {
+                    flags.push("native_path");
+                }
+                if r.reason.is_some() {
+                    flags.push("reason");
+                }
+                if !flags.is_empty() {
+                    println!("    (sensitive fields hidden: {})", flags.join(", "));
+                }
+            }
+        }
     }
     Ok(())
 }
