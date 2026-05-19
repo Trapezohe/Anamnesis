@@ -147,6 +147,32 @@ enum Command {
         trace: bool,
     },
 
+    /// Report records that share an identical `raw_hash` — the
+    /// source-payload byte-fingerprint. Useful when 13 adapters'
+    /// worth of imports surface the same Slack message twice, or
+    /// the same Markdown file got picked up under two project
+    /// paths. Read-only diagnostic — no auto-merge. The operator
+    /// picks which sibling to `forget`.
+    ///
+    /// **Default output is redacted**: `raw_hash` and `native_path`
+    /// are omitted; only reported as `has_*` booleans (JSON) /
+    /// hidden (human). Pass `--include-sensitive` to reveal.
+    ///
+    /// Naming caveat: this is *exact* duplicate detection (raw
+    /// payload bytes). Semantic / near-duplicate is a much bigger
+    /// product decision and explicitly out of scope.
+    Dedupe {
+        /// Max number of groups to return. Default 20, cap 100.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+        /// Reveal `raw_hash` and `native_path` fields. Default off.
+        #[arg(long)]
+        include_sensitive: bool,
+    },
+
     /// Remove a tombstone so the source can resurrect the memory
     /// on its next import. Does NOT recreate the record itself —
     /// the tombstone only stored provenance, so "stay forgotten"
@@ -751,6 +777,11 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
+        Command::Dedupe {
+            limit,
+            json,
+            include_sensitive,
+        } => cmd_dedupe(&data_dir, limit, json, include_sensitive),
         Command::Unforget { record_id, json } => cmd_unforget(&data_dir, &record_id, json),
         Command::ListForgotten {
             source,
@@ -2561,6 +2592,112 @@ fn cmd_unforget(data_dir: &std::path::Path, record_id: &str, json: bool) -> Resu
         return Err(anyhow!(
             "no tombstone for id {record_id:?} — nothing to unforget"
         ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dedupe (Round 77 PR-77)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis dedupe` — read-only exact-duplicate report keyed on
+/// `records.raw_hash`. Groups records with identical source payload
+/// bytes and prints them newest-first within each group so the
+/// operator can decide which sibling to `forget`.
+///
+/// Privacy: default output redacts `raw_hash` and `native_path`
+/// (only `has_*` booleans in JSON). `--include-sensitive` opts in
+/// to the full fields.
+///
+/// Read-only — no audit log, no store writes. Composes with
+/// `anamnesis forget <record_id>` for the action half.
+fn cmd_dedupe(
+    data_dir: &std::path::Path,
+    limit: u32,
+    json: bool,
+    include_sensitive: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let groups = store.list_duplicate_raw_hashes(limit)?;
+    let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
+
+    if json {
+        let payload = serde_json::json!({
+            "count": groups.len(),
+            "limit": effective_limit,
+            "sensitive_included": include_sensitive,
+            "groups": groups.iter().map(|g| {
+                let mut group = serde_json::json!({
+                    "record_count": g.records.len(),
+                    "records": g.records.iter().map(|r| {
+                        let mut row = serde_json::json!({
+                            "record_id": r.record_id.0,
+                            "adapter": r.adapter,
+                            "instance": if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
+                            "native_id": r.native_id,
+                            "created_at": r.created_at,
+                            "updated_at": r.updated_at,
+                            "has_native_path": r.native_path.is_some(),
+                        });
+                        if include_sensitive {
+                            row["native_path"] = serde_json::json!(r.native_path);
+                        }
+                        row
+                    }).collect::<Vec<_>>(),
+                });
+                if include_sensitive {
+                    group["raw_hash"] = serde_json::json!(g.raw_hash);
+                }
+                group
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if groups.is_empty() {
+        println!("no duplicate raw_hash groups");
+    } else {
+        println!(
+            "{} duplicate raw_hash group(s){}",
+            groups.len(),
+            if include_sensitive {
+                " (including sensitive fields)"
+            } else {
+                ""
+            }
+        );
+        for (idx, g) in groups.iter().enumerate() {
+            let hash_label = if include_sensitive {
+                format!(" raw_hash={}", g.raw_hash)
+            } else {
+                String::new()
+            };
+            println!(
+                "[{rank}] {n} record(s){hash_label}",
+                rank = idx + 1,
+                n = g.records.len()
+            );
+            for r in &g.records {
+                let inst = if r.instance.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{}", r.instance)
+                };
+                println!(
+                    "    {} ({}{inst}, native_id={}, created_at={})",
+                    r.record_id.0, r.adapter, r.native_id, r.created_at
+                );
+                if include_sensitive {
+                    if let Some(p) = &r.native_path {
+                        println!("       native_path: {p}");
+                    }
+                } else if r.native_path.is_some() {
+                    println!("       (native_path hidden — pass --include-sensitive to reveal)");
+                }
+            }
+            println!();
+        }
+        println!(
+            "Pick one record per group to keep, then `anamnesis forget <record_id>` the others."
+        );
     }
     Ok(())
 }

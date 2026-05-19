@@ -90,15 +90,17 @@ fn binary_responds_to_initialize_and_tools_list() {
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
+    // Round 77 added `dedupe` to the non-admin catalogue (5 → 6).
     assert_eq!(
         names.len(),
-        5,
+        6,
         "import_source should be hidden by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source".to_string()));
     assert!(names.contains(&"search_memories".to_string()));
     assert!(names.contains(&"list_sources".to_string()));
     assert!(names.contains(&"doctor".to_string()));
+    assert!(names.contains(&"dedupe".to_string()));
 
     // 3. tools/call list_sources — should report the source we seeded.
     send(

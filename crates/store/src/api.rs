@@ -395,6 +395,58 @@ pub const MAX_LIST_LIMIT: u32 = 1000;
 /// exfiltrating the whole tombstone table.
 pub const LIST_FORGOTTEN_MAX_LIMIT: u32 = 100;
 
+/// Round 77: hard cap on `Store::list_duplicate_raw_hashes` page size.
+/// Same reason as `LIST_FORGOTTEN_MAX_LIMIT` (provenance-bearing
+/// diagnostic surface — no single operator request should
+/// exfiltrate thousands of records at once).
+pub const LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT: u32 = 100;
+
+/// One row inside a duplicate-raw_hash group. Carries the minimum
+/// the operator needs to decide which sibling to `forget`:
+/// `(adapter, instance, native_id)` for "where did this come
+/// from" and `record_id` for the actual forget call.
+///
+/// `native_path` is kept here because the operator often
+/// disambiguates duplicates by file path, but the CLI / MCP wire
+/// layers redact it by default — see the `include_sensitive` knob
+/// at those surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateRawHashRecord {
+    /// Hashed `records.id`.
+    pub record_id: RecordId,
+    /// Adapter id (e.g. `"claude-code"`).
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// Native id at the source.
+    pub native_id: String,
+    /// Native path at the source, when the adapter has one.
+    pub native_path: Option<String>,
+    /// Record created_at, unix seconds.
+    pub created_at: i64,
+    /// Record updated_at, unix seconds. `None` when never updated.
+    pub updated_at: Option<i64>,
+}
+
+/// One group of records sharing a single `raw_hash`. Always size 2+
+/// (the SQL `HAVING COUNT(*) > 1` filter strips singletons).
+///
+/// Round 77 design choice: this is **exact** duplicate detection —
+/// only catches records whose source payload hashes byte-for-byte
+/// identically. Semantic / near-duplicate detection is a much
+/// bigger product decision and explicitly out of scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateRawHashGroup {
+    /// The shared raw_hash. CLI / MCP wire surfaces redact this
+    /// by default since it can carry signal about the source
+    /// payload's structure.
+    pub raw_hash: String,
+    /// All live records sharing this raw_hash. Length is always
+    /// `>= 2`. Ordered newest-first so the operator reads the
+    /// most-recent sibling first.
+    pub records: Vec<DuplicateRawHashRecord>,
+}
+
 /// Round 74 (PR-74): filter for `Store::list_forgotten`. Mirrors
 /// the `(adapter, instance)` natural key the tombstones are
 /// indexed on so the operator can scope to a single source. `limit`
@@ -1080,6 +1132,100 @@ impl Store {
             }
         };
         Ok(rows)
+    }
+
+    /// Round 77 (PR-77): exact-duplicate report over `records.raw_hash`.
+    ///
+    /// Returns up to `limit` groups of records sharing a raw_hash,
+    /// `>= 2` records each, ordered by group size (DESC), then by
+    /// the group's newest `created_at` (DESC), then by raw_hash
+    /// (ASC) for deterministic output. Tombstoned records were
+    /// deleted from `records` by `forget_record` (R72) so they
+    /// don't appear here automatically — `forget` is the operator's
+    /// remediation action and this report shows what's left.
+    ///
+    /// **Exact** duplicates only: this matches the byte-identical
+    /// source payload hash, not semantic similarity. Naming the
+    /// API and the wire field around `raw_hash` is deliberate so
+    /// nobody reads "dedupe" as "semantic merge."
+    ///
+    /// Read-only — never writes to the store.
+    pub fn list_duplicate_raw_hashes(&self, limit: u32) -> Result<Vec<DuplicateRawHashGroup>> {
+        let limit = limit.clamp(1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
+        let conn = self.conn.lock();
+        // First pass: the raw_hash values that have ≥2 records.
+        // Tiny result set even on big stores (one row per duplicate
+        // group), so it's fine to materialise into a Vec.
+        let hashes: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT raw_hash \
+                 FROM records \
+                 GROUP BY raw_hash \
+                 HAVING COUNT(*) > 1 \
+                 ORDER BY COUNT(*) DESC, MAX(created_at) DESC, raw_hash ASC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt
+                .query_map(params![limit as i64], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Second pass: pull every record for those hashes in one
+        // IN() query — order so siblings are grouped contiguously
+        // and the operator sees newest-first inside each group.
+        let placeholders = std::iter::repeat_n("?", hashes.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT raw_hash, id, adapter, instance, native_id, native_path, \
+                    created_at, updated_at \
+             FROM records \
+             WHERE raw_hash IN ({}) \
+             ORDER BY raw_hash ASC, created_at DESC, id DESC",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            hashes.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_iter), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    DuplicateRawHashRecord {
+                        record_id: RecordId(r.get(1)?),
+                        adapter: r.get(2)?,
+                        instance: r.get(3)?,
+                        native_id: r.get(4)?,
+                        native_path: r.get(5)?,
+                        created_at: r.get(6)?,
+                        updated_at: r.get(7)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Re-assemble in the priority order picked by the first pass
+        // (size DESC, newest DESC, raw_hash ASC). The second SQL
+        // ordered by raw_hash for grouping; we re-sort the *outer*
+        // sequence using the priority `hashes` carries.
+        let mut by_hash: std::collections::HashMap<String, Vec<DuplicateRawHashRecord>> =
+            std::collections::HashMap::new();
+        for (h, rec) in rows {
+            by_hash.entry(h).or_default().push(rec);
+        }
+        let mut out = Vec::with_capacity(hashes.len());
+        for h in hashes {
+            if let Some(records) = by_hash.remove(&h) {
+                out.push(DuplicateRawHashGroup {
+                    raw_hash: h,
+                    records,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Re-enqueue embedding jobs for every chunk under a different model.
@@ -4766,5 +4912,104 @@ mod tests {
         let second = store.unforget_record(&r.id).unwrap();
         assert!(matches!(first, UnforgetRecordOutcome::Unforgotten(_)));
         assert!(matches!(second, UnforgetRecordOutcome::NotForgotten));
+    }
+
+    // ─── Round-77: list_duplicate_raw_hashes ────────────────────────
+
+    /// Helper: insert a record with a forced raw_hash so the
+    /// grouping behaviour is deterministic.
+    fn seed_with_raw_hash(store: &Store, adapter: &str, native: &str, hash: &str) -> RecordId {
+        let mut r = make_record(
+            adapter,
+            native,
+            &format!("{adapter}|{native} content"),
+            Kind::Fact,
+        );
+        r.provenance.raw_hash = hash.into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        r.id
+    }
+
+    /// The report must skip raw_hashes with only one record
+    /// (singletons are not duplicates) and include only live
+    /// records (`forget` removes the row from `records`).
+    #[test]
+    fn list_duplicate_raw_hashes_returns_only_hashes_with_multiple_live_records() {
+        let store = Store::open_in_memory().unwrap();
+        // Two duplicates on h-shared, one singleton on h-solo.
+        let _a = seed_with_raw_hash(&store, "claude-code", "a", "h-shared");
+        let _b = seed_with_raw_hash(&store, "mem0", "b", "h-shared");
+        let _c = seed_with_raw_hash(&store, "claude-code", "c", "h-solo");
+
+        let groups = store.list_duplicate_raw_hashes(20).unwrap();
+        assert_eq!(groups.len(), 1, "only the >1-row hash is a duplicate group");
+        let g = &groups[0];
+        assert_eq!(g.raw_hash, "h-shared");
+        assert_eq!(g.records.len(), 2);
+        // Both adapters present.
+        let mut adapters: Vec<_> = g.records.iter().map(|r| r.adapter.clone()).collect();
+        adapters.sort();
+        assert_eq!(adapters, vec!["claude-code", "mem0"]);
+    }
+
+    /// Group ordering: larger groups before smaller; within a tie,
+    /// the group whose newest record is more recent comes first.
+    #[test]
+    fn list_duplicate_raw_hashes_orders_by_group_size_then_newest() {
+        let store = Store::open_in_memory().unwrap();
+        // Group A: size 3 (oldest).
+        for n in ["a1", "a2", "a3"] {
+            seed_with_raw_hash(&store, "claude-code", n, "h-A");
+        }
+        // Group B: size 2 (newer than A, but smaller).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for n in ["b1", "b2"] {
+            seed_with_raw_hash(&store, "mem0", n, "h-B");
+        }
+        let groups = store.list_duplicate_raw_hashes(20).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].raw_hash, "h-A", "size 3 must outrank size 2");
+        assert_eq!(groups[1].raw_hash, "h-B");
+    }
+
+    /// Limit is clamped: 0 → 1, anything past the cap → cap.
+    /// Verifies the report can't be used to dump unbounded
+    /// provenance in a single call.
+    #[test]
+    fn list_duplicate_raw_hashes_clamps_limit() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            seed_with_raw_hash(&store, "claude-code", &format!("g{i}-a"), &format!("h-{i}"));
+            seed_with_raw_hash(&store, "claude-code", &format!("g{i}-b"), &format!("h-{i}"));
+        }
+        // limit = 0 clamps to 1.
+        let groups = store.list_duplicate_raw_hashes(0).unwrap();
+        assert_eq!(groups.len(), 1);
+        // limit > CAP clamps but the actual data is 5 groups.
+        let groups = store
+            .list_duplicate_raw_hashes(LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT * 10)
+            .unwrap();
+        assert_eq!(groups.len(), 5);
+    }
+
+    /// A forgotten record disappears from the report because
+    /// `forget_record` deletes the live `records` row.
+    /// This is what makes dedupe + forget compose without
+    /// needing an "exclude tombstoned" SQL filter.
+    #[test]
+    fn forgotten_record_disappears_from_duplicate_report() {
+        let store = Store::open_in_memory().unwrap();
+        let a = seed_with_raw_hash(&store, "claude-code", "a", "h-shared");
+        let _b = seed_with_raw_hash(&store, "mem0", "b", "h-shared");
+        // Pre-forget: one group of 2.
+        assert_eq!(store.list_duplicate_raw_hashes(20).unwrap().len(), 1);
+        // After forget: now only 1 live record → no duplicate group.
+        store.forget_record(&a, None).unwrap();
+        assert_eq!(
+            store.list_duplicate_raw_hashes(20).unwrap().len(),
+            0,
+            "group should drop out once forget left only 1 live sibling",
+        );
     }
 }
