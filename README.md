@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Trapezohe/Anamnesis/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/version-v0.1.0-0ea5e9?style=for-the-badge" alt="version"></a>
+  <a href="https://crates.io/crates/anamnesis-cli"><img src="https://img.shields.io/crates/v/anamnesis-cli?style=for-the-badge&color=fc8d62&label=crates.io" alt="crates.io"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-22c55e?style=for-the-badge" alt="license"></a>
   <img src="https://img.shields.io/badge/rust-%3E%3D1.85-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="rust">
   <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-8b5cf6?style=for-the-badge" alt="MCP">
@@ -27,6 +28,33 @@
   · <a href="./docs/BLUEPRINT.md">Blueprint</a>
   · <a href="https://discord.gg/ghastai">Discord</a>
 </p>
+
+---
+
+## 30-second install
+
+```bash
+cargo install --locked anamnesis-cli anamnesis-mcp-server
+```
+
+```bash
+# 1. Initialize the local store
+anamnesis init
+
+# 2. Register a source you already use — e.g. Claude Code
+anamnesis source add claude-code --path ~/.claude/projects
+
+# 3. Import + index (1795 records / 50K chunks on a real ~/.claude/projects)
+anamnesis import claude-code
+
+# 4. Search across everything Anamnesis has imported
+anamnesis search "how does the user prefer tests to be written?"
+
+# 5. Wire Anamnesis into Claude Desktop / Cursor / ghast as an MCP server
+anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json
+```
+
+See [Quick Start](#quick-start) for other install paths (one-liner, Homebrew, source, binary tarball), and [Supported Sources](#supported-sources--agents) for the 14 first-class adapters + generic MCP.
 
 ---
 
@@ -312,7 +340,17 @@ Current MCP surface:
 
 ## Quick Start
 
-### Install (one-liner)
+### Install from crates.io (recommended)
+
+All 22 workspace crates are published to crates.io as of v0.1.0:
+
+```bash
+cargo install --locked anamnesis-cli anamnesis-mcp-server
+```
+
+Requires Rust `>= 1.85`. This builds locally so it works on any target that has a Rust toolchain — Linux x86_64/aarch64, macOS x86_64/arm64, Windows.
+
+### Install (one-liner, no Rust toolchain needed)
 
 POSIX one-liner — detects your platform, downloads the matching
 release tarball from GitHub, verifies its SHA-256, and drops the two
@@ -329,11 +367,12 @@ curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh
   | ANAMNESIS_VERSION=v0.1.0 ANAMNESIS_PREFIX=/usr/local/bin sh
 ```
 
-Supported platforms: **Linux x86_64**, **macOS x86_64**, **macOS
-aarch64**. Linux aarch64 is parked (fastembed C-deps); Windows users
-should grab the `.zip` from the [Releases page](https://github.com/Trapezohe/Anamnesis/releases) directly.
+Pre-built tarball platforms: **Linux x86_64**, **macOS x86_64**, **macOS
+aarch64**. Linux aarch64 binary is parked on fastembed C-deps; use
+`cargo install` above instead. Windows users should grab the `.zip`
+from the [Releases page](https://github.com/Trapezohe/Anamnesis/releases) directly.
 
-### Install via Homebrew (once the tap is published)
+### Install via Homebrew
 
 ```bash
 brew tap Trapezohe/anamnesis
@@ -353,14 +392,6 @@ cargo install --path crates/cli
 
 # MCP server binary
 cargo install --path crates/mcp-server
-```
-
-Or, once the crates are published to crates.io (planned for 0.2.0 —
-the `local-fastembed` feature's ONNX dependencies need a publishing
-story first):
-
-```bash
-cargo install --locked anamnesis-cli anamnesis-mcp-server
 ```
 
 ### Manual binary install
@@ -597,16 +628,15 @@ Anamnesis can already unify imports and retrieval, but it should not yet claim t
 | Phase 0 | Complete | Rust workspace, Apache-2.0, CI (8-leg matrix), README/CONTRIBUTING, schema v1/v2 |
 | Phase 1 | Complete | core/store/importer/search/embedder, 14 first-class adapters across §-2.2 + §-2.3, local hybrid RAG, §-1.5 PR-6 two-stage session extractor (Mock + OpenAI + Anthropic providers, audit log, lineage CLI) |
 | Phase 2 | In progress | MCP admin gate, source registry import, filter pushdown, ScanOpts, streaming scan |
-| Phase 3 | Planned | ghast integration, Homebrew/cargo release, real dogfood quality evaluation |
+| Phase 3 | In progress | crates.io publish ✓ (v0.1.0, 22 crates), ghast first-consumer integration, real dogfood quality evaluation, Homebrew tap |
 | Phase 4 | Planned | Memory MCP convention, Agent Memory Interchange Format, temporal-graph schema evolution (unlocks Zep / Cognee Kuzu native adapters) |
 
 Recommended next PR slices:
 
 1. 429 rate-limit retry/backoff on the OpenAI + Anthropic providers (they currently surface the error and skip the candidate)
 2. §-1.4 schema evolution for temporal/graph edges (unlocks Zep/Graphiti, Cognee Kuzu native adapters)
-3. §-2.5 adapter health-check tooling — `anamnesis doctor` per source
-4. Homebrew/cargo release packaging
-5. ghast first-consumer integration
+3. ghast first-consumer integration (Anamnesis as the default MCP memory server)
+4. Homebrew tap formula publishing (`brew tap Trapezohe/anamnesis`)
 
 ## Contributing
 
