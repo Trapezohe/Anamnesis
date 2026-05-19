@@ -2717,6 +2717,13 @@ async fn cmd_doctor(
     let store = Store::open(db_path(data_dir))?;
     let registered = store.list_sources_with_counts()?;
 
+    // Round-64 follow-up: one `GROUP BY` query instead of N row-
+    // materializing scans. For 13 registered sources this turns
+    // 13 × `SELECT * FROM import_errors WHERE adapter = ?` (which
+    // could materialize huge result sets on bad-import storms) into
+    // one `SELECT adapter, COUNT(1) FROM import_errors GROUP BY adapter`.
+    let error_counts = store.count_import_errors_by_adapter().unwrap_or_default();
+
     let mut rows = Vec::new();
     for swc in &registered {
         let src = &swc.source;
@@ -2736,10 +2743,7 @@ async fn cmd_doctor(
             // Never imported → counts as stale when a threshold is set.
             None => true,
         });
-        let import_errors_n = store
-            .recent_import_errors(Some(&src.adapter), usize::MAX)
-            .map(|v| v.len() as u64)
-            .unwrap_or(0);
+        let import_errors_n = error_counts.get(&src.adapter).copied().unwrap_or(0);
         rows.push(DoctorRow {
             adapter: src.adapter.clone(),
             instance: instance_label(&src.instance),

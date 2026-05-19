@@ -1608,6 +1608,23 @@ impl Store {
         })
     }
 
+    /// One-shot per-adapter count of `import_errors` rows. Returned as
+    /// a `HashMap<String, u64>` keyed by adapter id. Adapters with no
+    /// errors are simply absent from the map (callers should default to 0).
+    ///
+    /// Used by `anamnesis doctor` to avoid an N+1 query against
+    /// `recent_import_errors(Some(adapter), …)` once per registered
+    /// source: one `GROUP BY` instead of N row-materializing scans.
+    pub fn count_import_errors_by_adapter(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT adapter, COUNT(1) FROM import_errors GROUP BY adapter")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().map(|(a, n)| (a, n as u64)).collect())
+    }
+
     /// Most-recent rows from `import_errors`, newest first. Used by
     /// `anamnesis status` and `anamnesis doctor` to surface what
     /// silently failed during recent imports without making the user
