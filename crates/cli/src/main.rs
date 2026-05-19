@@ -139,6 +139,41 @@ enum Command {
         json: bool,
     },
 
+    /// Score retrieval quality (MRR@k / nDCG@k) over a judged query
+    /// set and gate the result on configurable thresholds.
+    ///
+    /// Round 70: this is the *measurement* primitive — it runs the
+    /// same `HybridSearcher` + `pack` path that `search` and the
+    /// MCP server use, then scores the ranked records against a
+    /// JSONL judgment file. Read-only; never writes to the store.
+    EvalQuality {
+        /// JSONL judgments file. One [`anamnesis_search::JudgedQuery`]
+        /// per line; see the docstring on that type for the schema.
+        #[arg(long)]
+        judgments: PathBuf,
+        /// Retrieval mode the harness should evaluate against:
+        /// `fulltext` | `vector` | `hybrid`. Defaults to `fulltext`
+        /// so the harness can run in CI without downloading
+        /// embedding model files.
+        #[arg(long, default_value = "fulltext")]
+        mode: String,
+        /// Per-query result `limit` handed to the retrieval pipeline.
+        #[arg(long, default_value_t = 10)]
+        limit: u32,
+        /// Depth `k` for MRR@k and nDCG@k. Defaults to `limit`.
+        #[arg(long)]
+        at: Option<u32>,
+        /// Fail (exit code 1) if the aggregate MRR@k is below this.
+        #[arg(long)]
+        min_mrr: Option<f64>,
+        /// Fail (exit code 1) if the aggregate nDCG@k is below this.
+        #[arg(long)]
+        min_ndcg: Option<f64>,
+        /// Emit JSON to stdout instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage embedding models.
     #[command(subcommand)]
     Model(ModelCmd),
@@ -631,6 +666,20 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_lineage(&data_dir, &record_id, children, limit, json),
+        Command::EvalQuality {
+            judgments,
+            mode,
+            limit,
+            at,
+            min_mrr,
+            min_ndcg,
+            json,
+        } => {
+            cmd_eval_quality(
+                &data_dir, &judgments, &mode, limit, at, min_mrr, min_ndcg, json,
+            )
+            .await
+        }
         Command::Model(sub) => cmd_model(&data_dir, sub).await,
         Command::Audit(sub) => cmd_audit(&data_dir, sub),
         Command::Serve { sse, token } => {
@@ -2162,6 +2211,202 @@ async fn cmd_search(
             }
             println!();
         }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// eval-quality (Round 70)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis eval-quality` — score the live retrieval pipeline against
+/// a JSONL judgment set. Read-only; never writes the store.
+///
+/// One line of `--judgments` is one [`anamnesis_search::JudgedQuery`].
+/// For each query the harness builds a `SearchFilter` from the
+/// optional `source / instance / kind / scope` fields, runs the
+/// same `HybridSearcher` + `pack` path `search` uses, converts the
+/// resulting `PackedRecord`s into [`RankedRecordRef`]s, and scores
+/// them with `evaluate_query_at`. The aggregate is gated by
+/// `--min-mrr` / `--min-ndcg` — exit 1 on threshold violation so
+/// CI can fail loudly.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_eval_quality(
+    data_dir: &std::path::Path,
+    judgments_path: &std::path::Path,
+    mode_str: &str,
+    limit: u32,
+    at: Option<u32>,
+    min_mrr: Option<f64>,
+    min_ndcg: Option<f64>,
+    json: bool,
+) -> Result<()> {
+    use std::io::BufRead;
+
+    let depth = at.unwrap_or(limit);
+    let mode = match mode_str {
+        "vector" => SearchMode::Vector,
+        "hybrid" => SearchMode::Hybrid,
+        _ => SearchMode::Fulltext,
+    };
+
+    let file = std::fs::File::open(judgments_path)
+        .map_err(|e| anyhow!("open {}: {e}", judgments_path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut judged: Vec<anamnesis_search::JudgedQuery> = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| anyhow!("read line {}: {e}", idx + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let q: anamnesis_search::JudgedQuery = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!("judgments line {}: {e}", idx + 1))?;
+        judged.push(q);
+    }
+    if judged.is_empty() {
+        return Err(anyhow!(
+            "judgments file {} contained no queries",
+            judgments_path.display()
+        ));
+    }
+
+    let store = Store::open(db_path(data_dir))?;
+    // Vector / Hybrid need a real embedding provider; Fulltext doesn't.
+    // Keep the default at Fulltext (codex's plan) so CI runs without
+    // downloading model files.
+    let provider = match mode {
+        SearchMode::Fulltext => None,
+        _ => Some(open_active_provider(data_dir, &store)?),
+    };
+
+    let mut per_query_evals = Vec::with_capacity(judged.len());
+    for q in &judged {
+        let kind_filter = match q.kind.as_deref() {
+            Some(k) => Some(parse_kind(k)?),
+            None => None,
+        };
+        let scope_filter = match q.scope.as_deref() {
+            Some(s) => Some(parse_scope(s)?),
+            None => None,
+        };
+        let store_filter = anamnesis_store::SearchFilter {
+            source: q.source.clone(),
+            instance: q.instance.clone(),
+            kind: kind_filter.map(|k| format!("{k:?}").to_lowercase()),
+            scope: scope_filter.map(|s| format!("{s:?}").to_lowercase()),
+            time_from: None,
+            time_to: None,
+        };
+        let hits = run_search(
+            &store,
+            &q.query,
+            &store_filter,
+            limit,
+            mode,
+            provider.as_ref(),
+        )
+        .await?;
+        let packed = pack(
+            &store,
+            &hits,
+            &ContextBudget {
+                max_records: limit as usize,
+                ..ContextBudget::default()
+            },
+        )?;
+        let ranked: Vec<anamnesis_search::RankedRecordRef> = packed
+            .iter()
+            .map(|p| anamnesis_search::RankedRecordRef {
+                record_id: p.record.id.0.clone(),
+                adapter: p.record.source.adapter.clone(),
+                instance: p.record.source.instance.clone().unwrap_or_default(),
+                native_id: p.record.provenance.native_id.clone(),
+            })
+            .collect();
+        per_query_evals.push(anamnesis_search::evaluate_query_at(depth, &ranked, q));
+    }
+
+    let summary = anamnesis_search::summarize_quality(depth, per_query_evals);
+    let mrr_fail = min_mrr.is_some_and(|m| summary.mrr_at_k < m);
+    let ndcg_fail = min_ndcg.is_some_and(|m| summary.ndcg_at_k < m);
+
+    if json {
+        let mut payload = serde_json::to_value(&summary)?;
+        // Surface threshold deltas so a JSON consumer can render
+        // failures the same way the human path does.
+        let mut failures = Vec::<serde_json::Value>::new();
+        if let Some(m) = min_mrr {
+            if summary.mrr_at_k < m {
+                failures.push(serde_json::json!({
+                    "metric": "mrr_at_k",
+                    "min":    m,
+                    "actual": summary.mrr_at_k,
+                }));
+            }
+        }
+        if let Some(m) = min_ndcg {
+            if summary.ndcg_at_k < m {
+                failures.push(serde_json::json!({
+                    "metric": "ndcg_at_k",
+                    "min":    m,
+                    "actual": summary.ndcg_at_k,
+                }));
+            }
+        }
+        payload["failed_thresholds"] = serde_json::Value::Array(failures);
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "eval-quality: mode={mode_str} queries={n} k={k}",
+            n = summary.queries,
+            k = summary.at,
+        );
+        println!(
+            "  MRR@{k}  = {v:.4}{thr}",
+            k = summary.at,
+            v = summary.mrr_at_k,
+            thr = min_mrr
+                .map(|m| format!("  (min {m:.4})"))
+                .unwrap_or_default(),
+        );
+        println!(
+            "  nDCG@{k} = {v:.4}{thr}",
+            k = summary.at,
+            v = summary.ndcg_at_k,
+            thr = min_ndcg
+                .map(|m| format!("  (min {m:.4})"))
+                .unwrap_or_default(),
+        );
+        // Per-query break-out for failure triage: anything with
+        // reciprocal_rank == 0 in the topk is interesting.
+        let misses: Vec<_> = summary
+            .per_query
+            .iter()
+            .filter(|e| e.judged_relevant > 0 && e.reciprocal_rank == 0.0)
+            .collect();
+        if !misses.is_empty() {
+            println!();
+            println!("queries with no relevant hit in top-{}:", summary.at);
+            for e in misses {
+                println!(
+                    "  - {id}  (judged_relevant={n})",
+                    id = e.id,
+                    n = e.judged_relevant
+                );
+            }
+        }
+    }
+
+    if mrr_fail || ndcg_fail {
+        return Err(anyhow!(
+            "quality below threshold: MRR@{k}={mrr:.4} (min {mrr_min:?}), nDCG@{k}={ndcg:.4} (min {ndcg_min:?})",
+            k = summary.at,
+            mrr = summary.mrr_at_k,
+            mrr_min = min_mrr,
+            ndcg = summary.ndcg_at_k,
+            ndcg_min = min_ndcg,
+        ));
     }
     Ok(())
 }

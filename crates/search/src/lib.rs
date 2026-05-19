@@ -9,8 +9,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod eval;
 pub mod hybrid;
 pub mod packer;
 
+pub use eval::{
+    evaluate_query_at, summarize_quality, JudgedQuery, JudgedRecordRef, QualitySummary, QueryEval,
+    RankedRecordRef,
+};
 pub use hybrid::{HybridOpts, HybridSearcher, RankedChunk, SearchMode};
 pub use packer::{pack, ContextBudget, PackedRecord};
