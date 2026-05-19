@@ -108,11 +108,22 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         let mut summary = ImportSummary::empty(&descriptor.adapter, descriptor.instance.as_deref());
         let mut stream = self.adapter.scan(opts);
 
+        // Round-62 perf: batch normalized records and hand them to
+        // `Store::upsert_records_batch` so the importer pays one
+        // `fsync` per batch instead of one per record. Default flush
+        // threshold balances throughput against memory pressure for
+        // the largest realistic chunk fan-out (codex transcripts have
+        // hundreds of chunks per record after PR-H).
+        let mut batch: Vec<UpsertItem> = Vec::with_capacity(UPSERT_BATCH);
+
         while let Some(item) = stream.next().await {
             match item {
                 Ok(raw) => {
                     summary.raw_seen += 1;
-                    self.process_one(raw, store, &descriptor, &mut summary);
+                    self.process_one(raw, store, &descriptor, &mut summary, &mut batch);
+                    if batch.len() >= UPSERT_BATCH {
+                        Self::flush_batch(&mut batch, store, &descriptor, &mut summary);
+                    }
                 }
                 Err(e) => {
                     summary.errors += 1;
@@ -132,6 +143,7 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
                 }
             }
         }
+        Self::flush_batch(&mut batch, store, &descriptor, &mut summary);
         Ok(summary)
     }
 
@@ -141,6 +153,7 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         store: &Store,
         descriptor: &anamnesis_core::SourceDescriptor,
         summary: &mut ImportSummary,
+        batch: &mut Vec<UpsertItem>,
     ) {
         // Preserve the raw payload as JSON for raw_artifacts provenance.
         let raw_payload_json = serde_json::to_string(&raw.payload).ok();
@@ -171,37 +184,82 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
 
         for record in records {
             let chunks = self.chunker.chunk(&record.id, &record.content);
-            match store.upsert_record(&record, &chunks, raw_payload_json.as_deref()) {
-                Ok((n_records, n_chunks)) => {
-                    // `store.upsert_record` returns (0, 0) for no-op
-                    // dedup (raw_hash unchanged) — see the fast-path
-                    // comment on `upsert_record`. Reflect that in the
-                    // summary so re-imports honestly report "1 raw,
-                    // 0 upserted" rather than falsely claiming work.
-                    summary.records_upserted += n_records;
-                    summary.chunks_written += n_chunks;
-                }
-                Err(e) => {
-                    summary.errors += 1;
-                    let _ = store.log_import_error(
-                        &descriptor.adapter,
-                        descriptor.instance.as_deref(),
-                        Some(&record.provenance.native_id),
-                        record.provenance.native_path.as_deref(),
-                        "upsert",
-                        &format!("{e}"),
-                    );
-                    tracing::warn!(
-                        adapter = %descriptor.adapter,
-                        record = %record.id,
-                        error = %e,
-                        "upsert failed"
-                    );
+            batch.push((record, chunks, raw_payload_json.clone()));
+        }
+    }
+
+    /// Drain `batch` into `Store::upsert_records_batch`. If the batch
+    /// fails (a single bad record poisons the SQLite transaction),
+    /// retry each record individually through the per-record path so
+    /// one corrupt record doesn't drop the rest of the batch on the
+    /// floor. Per-record `upsert_record` keeps the original log-and-
+    /// continue behavior.
+    fn flush_batch(
+        batch: &mut Vec<UpsertItem>,
+        store: &Store,
+        descriptor: &anamnesis_core::SourceDescriptor,
+        summary: &mut ImportSummary,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        match store.upsert_records_batch(batch) {
+            Ok((n_records, n_chunks)) => {
+                summary.records_upserted += n_records;
+                summary.chunks_written += n_chunks;
+            }
+            Err(batch_err) => {
+                tracing::warn!(
+                    adapter = %descriptor.adapter,
+                    error = %batch_err,
+                    batch_size = batch.len(),
+                    "batch upsert failed; falling back to per-record path",
+                );
+                for (record, chunks, raw_payload_json) in batch.iter() {
+                    match store.upsert_record(record, chunks, raw_payload_json.as_deref()) {
+                        Ok((n_records, n_chunks)) => {
+                            summary.records_upserted += n_records;
+                            summary.chunks_written += n_chunks;
+                        }
+                        Err(e) => {
+                            summary.errors += 1;
+                            let _ = store.log_import_error(
+                                &descriptor.adapter,
+                                descriptor.instance.as_deref(),
+                                Some(&record.provenance.native_id),
+                                record.provenance.native_path.as_deref(),
+                                "upsert",
+                                &format!("{e}"),
+                            );
+                            tracing::warn!(
+                                adapter = %descriptor.adapter,
+                                record = %record.id,
+                                error = %e,
+                                "upsert failed"
+                            );
+                        }
+                    }
                 }
             }
         }
+        batch.clear();
     }
 }
+
+/// One (record, chunks, optional raw-JSON) tuple buffered by the importer
+/// for batched upsert. Matches the signature `Store::upsert_records_batch`
+/// expects.
+type UpsertItem = (
+    anamnesis_core::AnamnesisRecord,
+    Vec<anamnesis_core::Chunk>,
+    Option<String>,
+);
+
+/// Records buffered between `Store::upsert_records_batch` flushes. 64 is
+/// large enough to amortize SQLite `fsync` cost without holding pathological
+/// amounts of normalized content in memory for adapters that emit many
+/// chunks per record (codex sessions can be hundreds of chunks each).
+const UPSERT_BATCH: usize = 64;
 
 /// Options accepted by `ImportService::import`.
 ///

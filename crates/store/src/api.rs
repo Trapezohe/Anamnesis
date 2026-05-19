@@ -523,6 +523,64 @@ impl Store {
         Ok((1, chunks.len() as u64))
     }
 
+    /// Batch variant of `upsert_record` — wraps up to `items.len()`
+    /// record upserts in a single SQLite transaction so the importer
+    /// pays one `fsync` per batch instead of one per record. For the
+    /// claude-code import (1795 records / 50K chunks) this turns
+    /// thousands of `BEGIN`/`COMMIT` round-trips into ~28 of them.
+    ///
+    /// Per-record semantics are identical to `upsert_record`:
+    ///   - `raw_hash`-equal records are no-ops (only enqueue any
+    ///     missing embedding jobs under the active model)
+    ///   - mismatched-hash records get full `records` / `raw_artifacts`
+    ///     / `record_chunks` rewrites + embedding jobs
+    ///
+    /// Returns `(records_upserted, chunks_written)` summed across the
+    /// batch. If any statement inside the batch fails, the entire
+    /// transaction is rolled back and the error propagates — callers
+    /// that need per-record error isolation (e.g. the importer's
+    /// log-and-skip behavior) should catch the error and fall back to
+    /// the per-record `upsert_record` path for that batch.
+    pub fn upsert_records_batch(
+        &self,
+        items: &[(AnamnesisRecord, Vec<Chunk>, Option<String>)],
+    ) -> Result<(u64, u64)> {
+        if items.is_empty() {
+            return Ok((0, 0));
+        }
+        let active = self.active_model()?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let mut total_records = 0u64;
+        let mut total_chunks = 0u64;
+        for (record, chunks, raw_payload_json) in items {
+            let existing_hash: Option<String> = tx
+                .query_row(
+                    "SELECT raw_hash FROM records WHERE id = ?1",
+                    params![record.id.0],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_hash.as_deref() == Some(record.provenance.raw_hash.as_str()) {
+                if let Some(model_id) = active.as_deref() {
+                    enqueue_jobs(&tx, chunks, model_id, now)?;
+                }
+                continue;
+            }
+            write_record(&tx, record)?;
+            write_raw_artifact(&tx, record, raw_payload_json.as_deref(), now)?;
+            write_chunks(&tx, record, chunks)?;
+            if let Some(model_id) = active.as_deref() {
+                enqueue_jobs(&tx, chunks, model_id, now)?;
+            }
+            total_records += 1;
+            total_chunks += chunks.len() as u64;
+        }
+        tx.commit()?;
+        Ok((total_records, total_chunks))
+    }
+
     /// Re-enqueue embedding jobs for every chunk under a different model.
     /// Used by `anamnesis model use <other>` to trigger a full re-embed.
     pub fn rebuild_embedding_jobs(&self, model_id: &str) -> Result<u64> {
