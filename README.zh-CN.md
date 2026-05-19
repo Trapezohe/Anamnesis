@@ -2,11 +2,13 @@
   <img src="./banner.png" alt="Anamnesis banner" width="100%" />
 </p>
 
-# Anamnesis
+# Anamnesis · 搜魂术
 
 **本地优先的跨 Agent 记忆互通层，用于导入、归一化、索引并服务已有记忆。**
 
 Anamnesis 不是要求用户从零开始使用的新记忆系统。它要解决的是更现实的问题：用户已经在不同 Agent、SDK、记忆框架和本地工具里积累了大量记忆，但这些记忆分散在 SQLite、JSON、Markdown、目录缓存和 MCP 资源里，无法互通。
+
+> **搜魂术** 取自中国修仙小说里常见的"搜魂"——施术者直接搜索目标的所有记忆。Anamnesis 做的是同一件事的善意版本：经用户授权，把自己散落在各家 Agent 与记忆框架里的全部记忆抽出来、归一化、统一索引，让任意 Agent 都能调阅。所有权与提交权仍归原始系统，Anamnesis 只是搜出来、用起来。
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-v0.1.0-1da1f2?style=for-the-badge&labelColor=555" alt="Version v0.1.0" />
