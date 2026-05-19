@@ -39,6 +39,56 @@ anamnesis mcp config --name my-memory
 
 ---
 
+## Claude Code plugin marketplace
+
+For Claude Code, the preferred guided install is the bundled plugin
+marketplace:
+
+```text
+/plugin marketplace add Trapezohe/Anamnesis
+/plugin install anamnesis@anamnesis-plugins
+```
+
+CLI equivalent with sparse checkout:
+
+```bash
+claude plugin marketplace add Trapezohe/Anamnesis --sparse .claude-plugin anamnesis-plugin
+claude plugin install anamnesis@anamnesis-plugins
+```
+
+The plugin contributes:
+
+- `.mcp.json` for the Anamnesis MCP server
+- `anamnesis-memory` skill
+- `/anamnesis-status` and `/anamnesis-search` commands
+
+It does not enable lifecycle hooks by default. Anamnesis is currently a
+read-first bridge over existing memory sources, not an automatic memory
+writer.
+
+---
+
+## Codex
+
+Fastest path, MCP only:
+
+```bash
+codex mcp add anamnesis -- anamnesis serve
+```
+
+Marketplace path:
+
+```bash
+codex plugin marketplace add Trapezohe/Anamnesis --sparse .agents/plugins anamnesis-plugin
+```
+
+Restart Codex and install Anamnesis from the Anamnesis Plugins
+marketplace in the plugin UI. Do not combine direct MCP and marketplace
+installation in the same profile unless you intentionally want duplicate
+MCP registrations.
+
+---
+
 ## Claude Desktop
 
 Config file:
@@ -103,7 +153,7 @@ anamnesis mcp config > ~/.ghast/mcp.json
 
 After restart, `search_memories` from inside ghast should return hits
 across every Anamnesis-registered source (claude-code, codex, mem0,
-letta, hermes, openclaw, ghast itself, tdai, openviking, mempalace,
+letta, hermes, openclaw, tdai, openviking, mempalace,
 memori, memos, memary, generic-mcp).
 
 ---
@@ -149,7 +199,7 @@ Output:
 {
   "mcpServers": {
     "anamnesis": {
-      "url": "http://127.0.0.1:7878",
+      "url": "http://127.0.0.1:7878/mcp",
       "headers": {
         "Authorization": "Bearer ${env:ANAMNESIS_MCP_TOKEN}"
       }

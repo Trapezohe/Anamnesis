@@ -1,0 +1,20 @@
+{
+  "name": "anamnesis-plugins",
+  "interface": {
+    "displayName": "Anamnesis Plugins"
+  },
+  "plugins": [
+    {
+      "name": "anamnesis",
+      "source": {
+        "source": "local",
+        "path": "./anamnesis-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "NONE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

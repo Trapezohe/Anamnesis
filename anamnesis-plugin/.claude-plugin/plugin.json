@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "anamnesis",
+  "displayName": "Anamnesis",
+  "version": "0.1.0",
+  "description": "Connect Claude Code to Anamnesis, a local-first memory bridge for existing agent and memory-framework data.",
+  "author": {
+    "name": "Ghast AI",
+    "email": "support@ghast.ai"
+  },
+  "homepage": "https://github.com/Trapezohe/Anamnesis",
+  "repository": "https://github.com/Trapezohe/Anamnesis",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "mcp", "rag", "agent-memory", "local-first"],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "commands": "./commands/"
+}

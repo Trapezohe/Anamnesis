@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
 use anamnesis_adapter_codex::{codex_adapter, CodexDetector};
-use anamnesis_adapter_ghast::{ghast_adapter, GhastDetector};
 use anamnesis_adapter_hermes::{hermes_adapter, HermesDetector};
 use anamnesis_adapter_letta::{letta_adapter, LettaSqliteDetector};
 use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
@@ -297,18 +296,17 @@ enum Command {
 
     /// MCP-client integration helpers. Round-55: print the
     /// copy-and-paste `mcpServers` snippet a Claude Desktop / Cursor /
-    /// ghast / Continue / generic MCP-aware client needs to talk to
+    /// Continue / Windsurf / generic MCP-aware client needs to talk to
     /// this Anamnesis install.
     #[command(subcommand)]
     Mcp(McpCmd),
 
     /// §-2.5 per-source health check. Probes each registered source's
     /// `MemoryAdapter::health()` and surfaces what's reachable, what's
-    /// stale, and any adapter-specific notes (e.g. ghast's encrypted
-    /// profile DB).
+    /// stale, and any adapter-specific notes.
     ///
     /// With `--include-unregistered`, also runs the detectors for the
-    /// 14 first-class adapters so you can see what's available on
+    /// registered first-class adapters so you can see what's available on
     /// the machine but not yet registered.
     Doctor {
         /// Restrict to one adapter id (and optional instance).
@@ -431,7 +429,7 @@ enum AuditCmd {
 #[derive(Subcommand, Debug)]
 enum McpCmd {
     /// Emit the `mcpServers` JSON snippet for a Claude Desktop / Cursor /
-    /// ghast / Continue / generic MCP client. Output is the smallest
+    /// Continue / Windsurf / generic MCP client. Output is the smallest
     /// pasteable wrapper:
     ///
     /// ```json
@@ -682,7 +680,7 @@ async fn main() -> Result<()> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // mcp config — emit the `mcpServers` JSON snippet a host client (Claude
-// Desktop / Cursor / ghast / Continue / etc.) needs to launch this
+// Desktop / Cursor / Continue / Windsurf / etc.) needs to launch this
 // Anamnesis install. Round-55: codex-recommended path to "from CLI to
 // closed-loop memory server in one paste" for the 0.1.0 demo.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -709,7 +707,7 @@ fn cmd_mcp_config(
 /// host. Two shapes:
 ///
 ///   * stdio:  `{"command": "...", "args": ["serve"]}`
-///   * sse:    `{"url": "http://127.0.0.1:<port>", "headers": {"Authorization": "Bearer ${env:TOKEN}"}}`
+///   * sse:    `{"url": "http://127.0.0.1:<port>/mcp", "headers": {"Authorization": "Bearer ${env:TOKEN}"}}`
 ///
 /// Factored out from `cmd_mcp_config` so unit tests don't have to go
 /// through stdout — they assert on this `Value` directly.
@@ -737,7 +735,7 @@ fn build_mcp_server_entry(
             // the secret never lands on disk.
             let auth = format!("Bearer ${{env:{token_env}}}");
             Ok(serde_json::json!({
-                "url": format!("http://127.0.0.1:{port}"),
+                "url": format!("http://127.0.0.1:{port}/mcp"),
                 "headers": { "Authorization": auth },
             }))
         }
@@ -1084,7 +1082,6 @@ async fn cmd_discover() -> Result<()> {
         .register(Box::new(LettaSqliteDetector::new()))
         .register(Box::new(HermesDetector::new()))
         .register(Box::new(OpenClawDetector::new()))
-        .register(Box::new(GhastDetector::new()))
         .register(Box::new(TdaiDetector::new()))
         .register(Box::new(OpenVikingDetector::new()))
         .register(Box::new(MempalaceDetector::new()))
@@ -1246,7 +1243,7 @@ async fn cmd_import(
     // "no default path".
     if !is_known_adapter(adapter_id) {
         return Err(anyhow!(
-            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, ghast, tdai, generic-mcp"
+            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, tdai, generic-mcp"
         ));
     }
 
@@ -1411,19 +1408,6 @@ async fn cmd_import(
             )
             .await
         }
-        anamnesis_adapter_ghast::ADAPTER_ID => {
-            let adapter = ghast_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
         anamnesis_adapter_tdai::ADAPTER_ID => {
             let adapter = tdai_adapter(location.clone(), instance);
             run_import(
@@ -1503,7 +1487,7 @@ async fn cmd_import(
             .await
         }
         other => Err(anyhow!(
-            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, ghast, tdai, openviking, mempalace, memori, memos, memary, generic-mcp"
+            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, tdai, openviking, mempalace, memori, memos, memary, generic-mcp"
         )),
     }
 }
@@ -1594,7 +1578,6 @@ fn is_known_adapter(adapter_id: &str) -> bool {
             | anamnesis_adapter_letta::ADAPTER_ID
             | anamnesis_adapter_hermes::ADAPTER_ID
             | anamnesis_adapter_openclaw::ADAPTER_ID
-            | anamnesis_adapter_ghast::ADAPTER_ID
             | anamnesis_adapter_tdai::ADAPTER_ID
             | anamnesis_adapter_openviking::ADAPTER_ID
             | anamnesis_adapter_mempalace::ADAPTER_ID
@@ -1616,7 +1599,6 @@ fn default_path_for(adapter_id: &str) -> Result<PathBuf> {
         anamnesis_adapter_letta::ADAPTER_ID => home_join(&[".letta", "letta.db"]),
         anamnesis_adapter_hermes::ADAPTER_ID => home_join(&[".hermes"]),
         anamnesis_adapter_openclaw::ADAPTER_ID => home_join(&[".openclaw"]),
-        anamnesis_adapter_ghast::ADAPTER_ID => home_join(&["Documents", "ghast_desktop"]),
         anamnesis_adapter_tdai::ADAPTER_ID => home_join(&[".openclaw", "memory-tdai"]),
         anamnesis_adapter_openviking::ADAPTER_ID => home_join(&[".openviking", "data"]),
         anamnesis_adapter_mempalace::ADAPTER_ID => home_join(&[".mempalace"]),
@@ -2989,11 +2971,6 @@ async fn run_adapter_health(
                 location_path.unwrap_or_else(|| home_join(&[".openclaw"]).unwrap_or_default());
             Some(openclaw_adapter(path, instance).health().await)
         }
-        anamnesis_adapter_ghast::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&["Documents", "ghast_desktop"]).unwrap_or_default());
-            Some(ghast_adapter(path, instance).health().await)
-        }
         anamnesis_adapter_tdai::ADAPTER_ID => {
             let path = location_path
                 .unwrap_or_else(|| home_join(&[".openclaw", "memory-tdai"]).unwrap_or_default());
@@ -3062,7 +3039,6 @@ async fn run_all_detectors() -> Vec<anamnesis_core::discovery::DetectedSource> {
         .register(Box::new(LettaSqliteDetector::new()))
         .register(Box::new(HermesDetector::new()))
         .register(Box::new(OpenClawDetector::new()))
-        .register(Box::new(GhastDetector::new()))
         .register(Box::new(TdaiDetector::new()))
         .register(Box::new(OpenVikingDetector::new()))
         .register(Box::new(MempalaceDetector::new()))
@@ -3817,8 +3793,8 @@ mod freshness_tests {
 
     // ─── Round-55: `anamnesis mcp config` ───────────────────────────────
 
-    /// Stdio default is the shape Claude Desktop / Cursor / ghast /
-    /// Continue / Windsurf all consume — a `command` + `args` pair.
+    /// Stdio default is the shape Claude Desktop / Cursor / Continue /
+    /// Windsurf all consume — a `command` + `args` pair.
     #[test]
     fn mcp_config_stdio_default_shape() {
         let server = build_mcp_server_entry(
@@ -3849,7 +3825,7 @@ mod freshness_tests {
             Some(std::path::Path::new("/usr/local/bin/anamnesis")),
         )
         .unwrap();
-        assert_eq!(server["url"], "http://127.0.0.1:7878");
+        assert_eq!(server["url"], "http://127.0.0.1:7878/mcp");
         assert_eq!(
             server["headers"]["Authorization"],
             "Bearer ${env:MY_TOKEN_VAR}"

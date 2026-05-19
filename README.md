@@ -1,654 +1,407 @@
 <p align="center">
-  <img src="./banner.png" alt="Anamnesis banner" width="920">
+  <img src="./banner.png" alt="Anamnesis banner" width="100%" />
 </p>
 
-<h1 align="center">Anamnesis</h1>
+# Anamnesis
+
+**A local-first interoperability layer that imports, normalizes, indexes, and serves existing agent memory across tools.**
+
+Anamnesis is not another memory product that asks users to start over. It is the bridge for memory that already exists in agent runtimes, SDKs, local caches, SQLite databases, JSON files, Markdown workspaces, and MCP resources.
 
 <p align="center">
-  <strong>A local-first memory layer that imports, normalizes, indexes, and serves agent memory across tools.</strong>
+  <img src="https://img.shields.io/badge/version-v0.1.0-1da1f2?style=for-the-badge&labelColor=555" alt="Version v0.1.0" />
+  <img src="https://img.shields.io/badge/license-Apache--2.0-2ecc71?style=for-the-badge&labelColor=555" alt="Apache-2.0 license" />
+  <img src="https://img.shields.io/badge/rust-%3E%3D1.85-f97316?style=for-the-badge&labelColor=555&logo=rust&logoColor=white" alt="Rust >= 1.85" />
+  <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-8b5cf6?style=for-the-badge&labelColor=555" alt="MCP stdio and SSE" />
+  <img src="https://img.shields.io/badge/RAG-local%20hybrid-14b8a6?style=for-the-badge&labelColor=555" alt="Local hybrid RAG" />
+  <br />
+  <a href="https://x.com/Ghast_AI"><img src="https://img.shields.io/badge/X-@Ghast_AI-000000?style=for-the-badge&labelColor=555&logo=x&logoColor=white" alt="X @Ghast_AI" /></a>
+  <a href="https://discord.gg/ghastai"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&labelColor=555&logo=discord&logoColor=white" alt="Join Discord" /></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Trapezohe/Anamnesis/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/version-v0.1.0-0ea5e9?style=for-the-badge" alt="version"></a>
-  <a href="https://crates.io/crates/anamnesis-cli"><img src="https://img.shields.io/crates/v/anamnesis-cli?style=for-the-badge&color=fc8d62&label=crates.io" alt="crates.io"></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-22c55e?style=for-the-badge" alt="license"></a>
-  <img src="https://img.shields.io/badge/rust-%3E%3D1.85-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="rust">
-  <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-8b5cf6?style=for-the-badge" alt="MCP">
-  <img src="https://img.shields.io/badge/RAG-local%20hybrid-14b8a6?style=for-the-badge" alt="local rag">
-  <a href="https://x.com/Ghast_AI"><img src="https://img.shields.io/badge/X-@Ghast__AI-000000?style=for-the-badge&logo=x&logoColor=white" alt="X"></a>
-  <a href="https://discord.gg/ghastai"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="#overview">Overview</a> ·
+  <a href="#supported-sources">Supported Sources</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#cli">CLI</a> ·
+  <a href="./README.zh-CN.md">简体中文</a> ·
+  <a href="./docs/BLUEPRINT.md">Blueprint</a> ·
+  <a href="https://discord.gg/ghastai">Discord</a>
 </p>
-
-<p align="center">
-  <a href="#overview">Overview</a>
-  · <a href="#supported-sources--agents">Supported Sources</a>
-  · <a href="#architecture">Architecture</a>
-  · <a href="#quick-start">Quick Start</a>
-  · <a href="./README.zh-CN.md">简体中文</a>
-  · <a href="./docs/BLUEPRINT.md">Blueprint</a>
-  · <a href="https://discord.gg/ghastai">Discord</a>
-</p>
-
----
-
-## 30-second install
-
-```bash
-cargo install --locked anamnesis-cli anamnesis-mcp-server
-```
-
-```bash
-# 1. Initialize the local store
-anamnesis init
-
-# 2. Register a source you already use — e.g. Claude Code
-anamnesis source add claude-code --path ~/.claude/projects
-
-# 3. Import + index (1795 records / 50K chunks on a real ~/.claude/projects)
-anamnesis import claude-code
-
-# 4. Search across everything Anamnesis has imported
-anamnesis search "how does the user prefer tests to be written?"
-
-# 5. Wire Anamnesis into Claude Desktop / Cursor / ghast as an MCP server
-anamnesis mcp config > ~/Library/Application\ Support/Claude/claude_desktop_config.json
-```
-
-See [Quick Start](#quick-start) for other install paths (one-liner, Homebrew, source, binary tarball), and [Supported Sources](#supported-sources--agents) for the 14 first-class adapters + generic MCP.
 
 ---
 
 ## Overview
 
-**Anamnesis** is an open-source memory infrastructure project for the agent era. It reads memories and sessions from **14 first-class adapters** — agent frameworks (Claude Code, Codex, Hermes, OpenClaw, ghast) and memory systems (mem0, Letta, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary) — plus any MCP-aware project through the Generic MCP adapter, then normalizes them into one local schema, one local database, and one Anamnesis-owned RAG stack. A two-stage **session extractor** distills raw `Episode` records into long-lived `Fact` / `Preference` / `Feedback` / `Skill` records, with every LLM call auditable, gated, and provenance-linked back to the source Episode.
+Agent memory is fragmented. A user may have months of context in Codex, structured memories in mem0, sessions in Claude Code, and workspace notes in OpenClaw. These systems usually store memory in different formats and locations, so the context cannot move cleanly between agents.
 
-It is not another chat interface. It is the memory layer underneath your tools:
+Anamnesis solves that interoperability problem:
 
-- **User-sovereign**: your memory data stays local by default.
-- **Cross-agent continuity**: what one agent learns about your preferences, projects, and workflows can be reused by other trusted agents.
-- **Unified retrieval**: no delegated source-system search, no mixed embedding spaces, no opaque ranking across vendors.
-- **Auditable provenance**: every record keeps `adapter / instance / native_id / native_path / raw_hash`.
+- **Import existing memory** from supported local stores and registered MCP resources.
+- **Normalize records** into a shared schema with provenance, source identity, scope, timestamps, and content chunks.
+- **Index locally** with SQLite FTS plus optional embeddings.
+- **Serve memory back to agents** through CLI search, export, and MCP tools.
+- **Keep ownership at the source**: the original agent or framework still creates the memory; Anamnesis aggregates and retrieves it.
 
-> Status: `v0.1.0` — first stable adapter-contract release. All 14 first-class adapters pass the shared `MemoryAdapter` invariant suite; CLI, MCP server, search, and the Claude Desktop / Cursor / ghast on-ramp (`anamnesis mcp config`) are stable. Schema and `MemoryAdapter` trait are now considered stable across the 0.1.x line; semver applies.
+This README describes the current source tree. “Supported” means an adapter crate and a CLI import path exist. It does not mean every upstream format has perfect semantic extraction yet. Precision varies by adapter, and the limitations section calls out the important gaps.
 
-## Technical Snapshot
+## Current Surface
 
 | Area | Current implementation |
-|---|---|
-| Language | Rust 2021, MSRV `1.85` |
-| Binaries | `anamnesis` CLI, `anamnesis-mcp` MCP server |
-| Storage | SQLite + FTS5 + chunk-level tables; vector search currently uses BLOB-backed cosine fallback, with sqlite-vec as the target replacement layer |
-| Retrieval | FTS5 BM25 + vector kNN + Reciprocal Rank Fusion + ContextPacker |
-| Embeddings | Local `fastembed-rs` by default; curated model registry; Voyage cloud provider is explicit opt-in |
-| Protocol | MCP stdio; `anamnesis-mcp --sse` supports loopback HTTP/SSE |
-| Current adapters | 14 first-class: Claude Code, Codex, mem0, Letta, Hermes, OpenClaw, ghast, TencentDB Agent Memory, OpenViking, MemPalace, Memori, MemOS, Memary, Generic MCP |
-| Session extractor | §-1.5 PR-6 two-stage (deterministic gate + LLM). Three providers: `mock` (offline, deterministic), `openai` (any Chat-Completions-compatible: OpenAI, Ollama, vLLM, OpenRouter, …), `anthropic` (native Messages API). Per-run audit log at `<data_dir>/audit/stage2.jsonl`; `anamnesis lineage <id>` walks `provenance.derived_from`. |
-| Security posture | Local-first, source provenance, explicit cloud opt-in; MCP admin tool gating is the next P0 hardening step |
+| --- | --- |
+| Language | Rust workspace, MSRV `1.85` |
+| Binaries | `anamnesis` CLI and `anamnesis-mcp` server |
+| Storage | SQLite metadata, chunks, audit events, lineage, FTS search |
+| Retrieval | Keyword, vector, and hybrid search with source, instance, kind, scope, and time filters |
+| Embeddings | Local deterministic embeddings by default, provider-ready interface |
+| Import | Shared importer service used by CLI and MCP admin import path |
+| MCP | stdio and HTTP/SSE transports; search, read, list, doctor, and gated admin import tools |
+| Extraction | Session extraction crate and CLI command with mock/OpenAI/Anthropic provider options |
 
-## Supported Sources & Agents
+## Supported Sources
 
-### Importable memory sources
+`anamnesis discover` probes known local conventions for local adapters. `anamnesis source add ... --path ...` or `--url ...` is the authoritative way to register a source when the default detector is not appropriate.
 
-#### §-2.2 Agents
+### Agent Runtimes
 
-| Source / Agent | Status | What is read today | Precision |
-|---|---|---|---|
-| Claude Code | Usable | `~/.claude/projects/*/memory/*.md`, project `*.jsonl` sessions | Medium-high for memory markdown; medium-low for sessions |
-| Codex | Usable | `~/.codex/` session JSON/JSONL | Medium |
-| Hermes (Nous Research) | Usable | `~/.hermes/MEMORY.md` + `USER.md` + SQLite session DBs | Medium-high |
-| OpenClaw | Usable | `~/.openclaw/` workspace MD + `skills/`, `sessions/*.json[l]` | Medium-high |
-| ghast | Usable | `~/Documents/ghast_desktop/prompts/`, bundled skills; detects encrypted profile DB | Medium-high |
+| Source | Adapter ID | How it is registered | Current scanner reads | Precision |
+| --- | --- | --- | --- | --- |
+| Claude Code | `claude-code` | Local path, usually the Claude projects directory | Project/session files under the configured Claude Code root | Medium |
+| Codex | `codex` | Local path, usually the Codex home directory | Memory files and rollout summaries available under the configured Codex root | Medium |
+| Hermes | `hermes` | Local path | Hermes project and memory artifacts found by the adapter | Medium |
+| OpenClaw | `openclaw` | Local path | `AGENTS.md`, `SOUL.md`, `TOOLS.md`, workspace skills, sessions | Medium-high |
 
-#### §-2.3 Memory frameworks
+### Memory Frameworks
 
-| Source / Framework | Status | What is read today | License |
-|---|---|---|---|
-| mem0 | Usable | Self-hosted SQLite `memories` table | Apache-2.0 |
-| Letta (formerly MemGPT) | Usable | SQLite `block` table (`~/.letta/letta.db`) | Apache-2.0 |
-| TencentDB Agent Memory | Usable | `~/.openclaw/memory-tdai/` 4-tier (L0 refs, L1 JSONL facts, L2 scenarios, L3 persona) | MIT |
-| OpenViking | Usable | VikingFS AGFS workspace (resources/user/agent/session × L0/L1/L2) | AGPLv3 (read-only, no link) |
-| MemPalace | Usable | `~/.mempalace/identity.txt` + ChromaDB drawers/closets | AGPLv3 (read-only, no link) |
-| Memori | Usable | SQLite — entity_facts, process_attrs, conversation messages + summaries, KG triples | Apache-2.0 |
-| MemOS | Usable | MemCube dumps (`textual_memory.json`) per `memory_type` | Apache-2.0 |
-| Memary | Usable | Local cache files (`memory_stream.json`, entity tally, past chat, personas) | MIT |
+| Source | Adapter ID | How it is registered | Current scanner reads | Precision |
+| --- | --- | --- | --- | --- |
+| mem0 | `mem0` | Local SQLite path | mem0 SQLite memory rows | High when the schema matches |
+| Letta | `letta` | Local SQLite path | Letta archival/recall memory tables | High when the schema matches |
+| TDAI | `tdai` | Local path | OpenClaw-compatible TDAI memory directories | Medium |
+| OpenViking | `openviking` | Local path | AGFS-style local resources, agents, sessions | Medium |
+| MemPalace | `mempalace` | Local path | Identity text and local palace/chroma SQLite data | Medium |
+| Memori | `memori` | Local SQLite path | Memori SQLite rows | Medium-high when the schema matches |
+| MemOS | `memos` | Local path | MemOS MemCube textual memory JSON | Medium |
+| Memary | `memary` | Local path | Local Memary cache files | Medium |
 
-#### §-2.4 Long-tail (any MCP-aware source)
+### MCP Sources
 
-| Protocol | Status | What is read today |
-|---|---|---|
-| Generic MCP server | Usable | `resources/list` + `resources/read` — works for any project that exposes an MCP server (Cognee, Zep, etc.) |
-
-### Consumers that can use Anamnesis
-
-| Consumer | Integration | Status | Notes |
-|---|---|---|---|
-| ghast | MCP server config | Planned first consumer | Anamnesis remains an independent OSS project |
-| Claude Desktop / Claude Code MCP clients | `anamnesis-mcp` stdio | Ready to wire | Suitable for local retrieval and provenance lookup |
-| Codex / CLI agents | MCP stdio or CLI | Ready to wire | Can consume Anamnesis via MCP or shell commands |
-| Cursor / Zed / MCP-aware tools | MCP stdio / SSE | Ready to wire | Depends on each client’s MCP support |
-| Scripts and automation | CLI + JSON output | Ready | `search --json`, `export`, `status --json` |
-
-### Planned support
-
-| Source / Consumer | Type | Plan |
-|---|---|---|
-| Zep / Graphiti | Temporal knowledge graph | Bi-temporal facts push beyond the current `created_at/updated_at` schema; integration via `generic-mcp` until §-1.4 schema evolves |
-| Cognee | DuckDB + Kuzu graph | Today: via Cognee's own MCP server through `generic-mcp`. Native adapter pending if/when a portable on-disk export lands |
-| LangMem | LangChain SDK | Reads whichever backend LangGraph Store points at; case-by-case |
-| OpenAI / Voyage / other cloud embeddings | Embedding provider | Explicit opt-in only; never called silently |
-| Session extractor (§-1.5 PR-6) | Pipeline | Two-stage LLM-gated `Episode → Fact / Preference / Skill / Feedback` distillation |
-| Agent Memory Interchange Format | Standardization | Future RFC for cross-agent memory exchange |
-
-## Why Anamnesis
-
-Each agent and memory framework stores memory differently:
-
-- **Agents** — Claude Code keeps project JSONL sessions and markdown memory files; Codex has local session and rollout history; Hermes uses SQLite session DBs plus `MEMORY.md`/`USER.md`; OpenClaw and ghast each layer their own workspace conventions on top.
-- **Memory frameworks** — mem0/Letta/Memori use SQLite; MemPalace uses ChromaDB; OpenViking and TencentDB Agent Memory use hierarchical filesystem layouts; MemOS dumps JSON "MemCubes"; Memary uses Neo4j with local-cache JSON; Cognee uses DuckDB+Kuzu; Zep/Graphiti use temporal graphs.
-
-Without a neutral memory layer, users retrain every agent from scratch — and migrating from one memory framework to another means losing years of accumulated context. Anamnesis turns fragmented memory stores into one local, inspectable, searchable, and portable substrate — read-only against each upstream, with full provenance kept so original sources stay authoritative.
+| Source | Adapter ID | How it is registered | Current scanner reads | Precision |
+| --- | --- | --- | --- | --- |
+| Generic MCP server | `generic-mcp` | `source add generic-mcp --url <upstream-url> [--token-env ENV_NAME]` | `resources/list` and `resources/read` results from the upstream server | Depends on upstream metadata |
 
 ## Architecture
 
 ```mermaid
-flowchart TB
-  subgraph Consumers["Consumers"]
-    Ghast["ghast"]
-    ClaudeDesktop["Claude Desktop"]
-    CodexClient["Codex / CLI Agent"]
-    Cursor["Cursor / Zed"]
-    Scripts["Custom scripts"]
-  end
+flowchart LR
+    subgraph Sources["Existing memory producers"]
+        A1["Agent runtimes"]
+        A2["Memory frameworks"]
+        A3["MCP resource servers"]
+    end
 
-  subgraph Runtime["Anamnesis Runtime"]
-    CLI["anamnesis CLI"]
-    MCP["anamnesis-mcp<br/>stdio / SSE"]
-    Search["search crate<br/>Hybrid RAG + ContextPacker"]
-    Importer["importer crate<br/>scan -> normalize -> chunk -> upsert"]
-    Store["store crate<br/>SQLite + FTS5 + embeddings"]
-    Embedder["embedder crate<br/>fastembed / optional cloud"]
-  end
+    subgraph ImportLayer["Import layer"]
+        B1["Detector"]
+        B2["Adapter scanner"]
+        B3["Normalizer"]
+        B4["Dedup + provenance"]
+    end
 
-  subgraph Sources["Memory Sources (14 first-class adapters)"]
-    Agents["Agents: Claude Code · Codex<br/>Hermes · OpenClaw · ghast"]
-    MemFW["Memory frameworks: mem0 · Letta<br/>TencentDB Agent Memory · OpenViking<br/>MemPalace · Memori · MemOS · Memary"]
-    GenericMCP["Generic MCP<br/>(Cognee, Zep, any MCP-aware source)"]
-  end
+    subgraph Store["Local memory store"]
+        C1["Records"]
+        C2["Chunks"]
+        C3["FTS index"]
+        C4["Embeddings"]
+        C5["Audit + lineage"]
+    end
 
-  Ghast --> MCP
-  ClaudeDesktop --> MCP
-  CodexClient --> MCP
-  Cursor --> MCP
-  Scripts --> CLI
+    subgraph Access["Agent access"]
+        D1["CLI"]
+        D2["MCP stdio"]
+        D3["MCP HTTP/SSE"]
+        D4["Export"]
+    end
 
-  MCP --> Search
-  CLI --> Search
-  CLI --> Importer
-  MCP -. "admin tools (planned gated)" .-> Importer
-
-  Importer --> Store
-  Search --> Store
-  Store --> Embedder
-  Embedder --> Store
-
-  Agents --> Importer
-  MemFW --> Importer
-  GenericMCP --> Importer
+    Sources --> ImportLayer --> Store --> Access
 ```
 
 ## Import Pipeline
 
-Anamnesis separates carrier reading from memory semantics. Adapters never write the database directly; persistence goes through store transactions.
-
 ```mermaid
-flowchart LR
-  A["Discovery<br/>paths / schema / counts only"] --> B["User Confirm / Source Registry"]
-  B --> C["Adapter.scan()<br/>RawRecord stream"]
-  C --> D["Parser<br/>Markdown / JSONL / SQLite / MCP resource"]
-  D --> E["Normalizer<br/>AnamnesisRecord"]
-  E --> F["Chunker<br/>record -> chunks"]
-  F --> G["Store.upsert_transaction()<br/>records + raw_artifacts + chunks"]
-  G --> H["FTS5 index<br/>chunks_fts"]
-  G --> I["Embedding jobs<br/>content_hash + model_id"]
-  I --> J["Embedding worker<br/>local fastembed"]
-  J --> K["chunk_embeddings"]
+sequenceDiagram
+    participant User
+    participant CLI as anamnesis CLI
+    participant Registry as Source Registry
+    participant Adapter
+    participant Importer
+    participant Store
+    participant Embedder
+
+    User->>CLI: source add / import
+    CLI->>Registry: resolve source path or URL
+    CLI->>Adapter: scan(ScanOpts)
+    Adapter-->>CLI: normalized memory records
+    CLI->>Importer: import records
+    Importer->>Store: upsert records and chunks
+    Importer->>Store: write audit and lineage events
+    CLI->>Embedder: embed pending chunks unless disabled
+    Embedder->>Store: persist vectors
 ```
 
-### Adapter Precision Matrix
-
-| Source | Current read path | Normalized result | Precision | Notes |
-|---|---|---|---|---|
-| Claude Code memory markdown | `~/.claude/projects/*/memory/*.md` | frontmatter type -> `Kind/Scope`, body -> `content` | Medium-high | Structured memory import is usable; frontmatter parser still needs hardening |
-| Claude Code JSONL | project `*.jsonl` files | `Episode / Session` | Medium-low | This is history recall, not stable preference extraction |
-| mem0 SQLite | read-only `memories` table | `memory` -> content, default `Fact / User` | Medium-high | SQLite mode is usable; API mode and source embedding provenance are pending |
-| Codex | basic `.json/.jsonl` scan | `Episode / Session` | Low | Needs precise Codex session schema and path whitelist |
-| Generic MCP | `resources/list` + `resources/read` | `Unknown / Ephemeral` | Low | Suitable for opaque resources until memory metadata conventions exist |
-
-## RAG Retrieval Flow
-
-Anamnesis owns the retrieval path. Source-system vectors, source search APIs, and source ranking logic do not enter cross-source retrieval.
+## Retrieval Flow
 
 ```mermaid
-flowchart LR
-  Q["Query<br/>text + source/kind/scope/time filters"] --> Filter["SearchFilter<br/>planned store pushdown"]
-
-  Filter --> FTS["FTS5 BM25<br/>record_chunks"]
-  Filter --> QEmbed["embed_query()<br/>active model"]
-  QEmbed --> Vec["Vector kNN<br/>chunk_embeddings"]
-
-  FTS --> RRF["RRF merge<br/>K = 60"]
-  Vec --> RRF
-  RRF --> Agg["Aggregate chunks<br/>by record_id"]
-  Agg --> Pack["ContextPacker<br/>budget + diversity + provenance"]
-  Pack --> Resp["MCP / CLI response<br/>record + matched snippets"]
+flowchart TD
+    Q["Agent query"] --> M["Search mode"]
+    M --> K["Keyword FTS"]
+    M --> V["Vector search"]
+    K --> H["Hybrid ranker"]
+    V --> H
+    H --> F["Source / instance / kind / scope / time filters"]
+    F --> R["Ranked chunks"]
+    R --> C["MCP or CLI response"]
 ```
 
-Retrieval principles:
-
-- **Source embeddings are provenance only**: if a source has its own vector, it can be stored in `raw_artifacts`, but it never participates in cross-source search.
-- **Index embeddings are unified**: every chunk is embedded by Anamnesis under the active model.
-- **Chunks are retrieval units; records are semantic units**: long sessions can split into chunks while still aggregating back to records.
-- **ContextPacker controls the final payload**: budget, provenance, source diversity, and matched snippets are handled before returning context to agents.
-
-## Storage Model
-
-```mermaid
-erDiagram
-  SOURCES ||--o{ RECORDS : registers
-  RECORDS ||--o{ RECORD_CHUNKS : splits_into
-  RECORDS ||--|| RAW_ARTIFACTS : preserves
-  RECORD_CHUNKS ||--o{ CHUNK_EMBEDDINGS : indexed_by
-  RECORD_CHUNKS ||--o{ EMBEDDING_JOBS : queues
-  SOURCES ||--o{ IMPORT_ERRORS : reports
-
-  SOURCES {
-    text adapter
-    text instance
-    text location
-    text config_json
-    integer last_import_at
-  }
-
-  RECORDS {
-    text id
-    text adapter
-    text instance
-    text content
-    text scope
-    text kind
-    text native_id
-    text native_path
-    text raw_hash
-  }
-
-  RECORD_CHUNKS {
-    text id
-    text record_id
-    integer seq
-    text content
-    text content_hash
-    integer token_estimate
-  }
-
-  CHUNK_EMBEDDINGS {
-    text chunk_id
-    text model_id
-    text content_hash
-    integer dim
-    blob embedding
-  }
-
-  RAW_ARTIFACTS {
-    text record_id
-    text payload_json
-    blob source_embedding
-    text source_embedding_model
-    integer captured_at
-  }
-```
+Search filters are pushed into the store API for keyword and vector search. Hybrid search combines ranked keyword and vector results and can be constrained to a source, instance, record kind, scope, and time range.
 
 ## MCP Runtime
 
 ```mermaid
-sequenceDiagram
-  participant Agent as MCP Client / Agent
-  participant Server as anamnesis-mcp
-  participant Search as HybridSearcher
-  participant Store as SQLite Store
-  participant Embed as EmbeddingProvider
-
-  Agent->>Server: tools/call search_memories
-  Server->>Search: query + filters + mode
-  Search->>Store: FTS5 chunk search
-  Search->>Embed: embed_query (if vector/hybrid)
-  Embed-->>Search: query vector
-  Search->>Store: vector chunk search
-  Search->>Search: RRF merge + pack
-  Search-->>Server: packed records + snippets + provenance
-  Server-->>Agent: MCP response
+flowchart LR
+    Agent["MCP client"] --> Transport["stdio or HTTP/SSE"]
+    Transport --> Server["Anamnesis MCP server"]
+    Server --> Tools["Tools"]
+    Tools --> Search["search_memory"]
+    Tools --> Read["read_memory"]
+    Tools --> List["list_sources"]
+    Tools --> Doctor["doctor"]
+    Tools --> Import["import_source"]
+    Import --> Gate["Admin gate disabled by default"]
+    Server --> Resources["MCP resources/list + resources/read"]
+    Resources --> Store["Local SQLite store"]
 ```
 
-Current MCP surface:
-
-| Type | Capabilities |
-|---|---|
-| Tools | `search_memories`, `get_record`, `list_sources`, `import_source`, `trace_provenance` |
-| Resources | `anamnesis://record/{id}`, `anamnesis://source/{adapter}`, `anamnesis://timeline/{date}` |
-| Prompts | `summarize_my_preferences`, `find_related` |
-
-> Security note: `import_source` is an admin capability. During pre-release, use it only with trusted local clients. The next P0 hardening step is to gate MCP admin tools by default.
+The MCP server exposes read/search tools by default. Import is an admin operation and is hidden unless the server is started with admin tools enabled.
 
 ## Quick Start
 
-### Install from crates.io (recommended)
-
-All 22 workspace crates are published to crates.io as of v0.1.0:
-
-```bash
-cargo install --locked anamnesis-cli anamnesis-mcp-server
-```
-
-Requires Rust `>= 1.85`. This builds locally so it works on any target that has a Rust toolchain — Linux x86_64/aarch64, macOS x86_64/arm64, Windows.
-
-### Install (one-liner, no Rust toolchain needed)
-
-POSIX one-liner — detects your platform, downloads the matching
-release tarball from GitHub, verifies its SHA-256, and drops the two
-binaries (`anamnesis` + `anamnesis-mcp`) into `~/.local/bin`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh | sh
-```
-
-Pin a version or change the install prefix:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Trapezohe/Anamnesis/main/install.sh \
-  | ANAMNESIS_VERSION=v0.1.0 ANAMNESIS_PREFIX=/usr/local/bin sh
-```
-
-Pre-built tarball platforms: **Linux x86_64**, **macOS x86_64**, **macOS
-aarch64**. Linux aarch64 binary is parked on fastembed C-deps; use
-`cargo install` above instead. Windows users should grab the `.zip`
-from the [Releases page](https://github.com/Trapezohe/Anamnesis/releases) directly.
-
-### Install via Homebrew
-
-```bash
-brew tap Trapezohe/anamnesis
-brew install anamnesis
-```
-
-The formula template lives at [`packaging/homebrew/anamnesis.rb`](./packaging/homebrew/anamnesis.rb) — operators who maintain the tap refresh the four `sha256` lines after every release.
-
-### Install from source
-
-```bash
-git clone https://github.com/Trapezohe/Anamnesis
-cd Anamnesis
-
-# CLI binary
-cargo install --path crates/cli
-
-# MCP server binary
-cargo install --path crates/mcp-server
-```
-
-### Manual binary install
-
-The GitHub release pages also host the raw tarball + `.sha256`
-sidecar for every platform if you'd rather not pipe `install.sh`:
-
-```bash
-VERSION=0.1.0
-TARGET=x86_64-unknown-linux-gnu
-curl -L "https://github.com/Trapezohe/Anamnesis/releases/download/v${VERSION}/anamnesis-${VERSION}-${TARGET}.tar.gz" \
-  | tar -xz
-sudo install -m 755 "anamnesis-${VERSION}-${TARGET}"/anamnesis      /usr/local/bin/
-sudo install -m 755 "anamnesis-${VERSION}-${TARGET}"/anamnesis-mcp  /usr/local/bin/
-```
-
-Verify the SHA-256 against the `.sha256` sidecar on the release page
-before extracting if you're cautious about supply chain.
-
-### Initialize and import
-
-```bash
-# Create the local database and set the default embedding model
-anamnesis init
-
-# Discover known local memory sources
-anamnesis discover
-
-# Register Claude Code as a source
-anamnesis source add claude-code --path ~/.claude/projects
-
-# Import and index
-anamnesis import claude-code
-
-# Search across imported memory
-anamnesis search "how does the user prefer tests to be written?"
-
-# Inspect runtime status
-anamnesis status
-```
-
-### Run as an MCP server
-
-```bash
-# stdio mode for local MCP clients
-anamnesis-mcp
-
-# loopback HTTP/SSE mode
-anamnesis-mcp --sse 8787
-```
-
-Example MCP client config:
-
-```json
-{
-  "mcpServers": {
-    "anamnesis": {
-      "command": "anamnesis-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-## CLI Reference
-
-```bash
-anamnesis init [--model KEY]
-anamnesis discover
-anamnesis source add/list/remove
-anamnesis import <adapter>[:instance] [--full] [--dry-run] [--no-embed] [--path PATH]
-anamnesis search <query> [--source X] [--kind K] [--scope S] [--limit N] [--mode hybrid|fulltext|vector] [--json]
-anamnesis extract [--kind fact|preference|feedback|skill] [--no-dry-run]
-                  [--provider mock|openai|anthropic] [--model NAME] [--api-base URL]
-                  [--threshold 0.4] [--limit 25] [--max-llm-calls 100]
-                  [--concurrency 1] [--max-retries 3] [--yes] [--explain] [--json]
-anamnesis lineage <record-id> [--children] [--limit N] [--json]
-anamnesis audit list [--limit N] [--json]
-anamnesis audit show <line-no|last> [--json]
-anamnesis doctor [--source X] [--instance Y] [--include-unregistered] [--strict]
-                 [--since 7d] [--strict-staleness] [--json]
-anamnesis export [--format jsonl|csv] [--out FILE] [--source X]
-anamnesis verify [--repair]
-anamnesis model list/use/install/rebuild
-anamnesis serve
-anamnesis migrate
-```
-
-## Session Extractor (§-1.5 PR-6)
-
-Anamnesis distills raw conversation `Episode` records into long-lived
-`Fact` / `Preference` / `Feedback` / `Skill` records via a two-stage,
-auditable pipeline.
-
-**Stage 1** is a deterministic gate (`anamnesis-extractor::gate`). It
-scores every Episode in the store on three local signals — content
-length (40-char floor, 600-char plateau), recency (30-day half-life),
-and content density (letter-to-noise ratio) — weighted 0.45 / 0.20 /
-0.35. Episodes below `--threshold` (default 0.4) are dropped before
-any LLM sees them. Stage 1 is pure CPU and makes zero network calls.
-
-**Stage 2** sends each surviving Episode through the configured
-provider. Three are wired today:
-
-| `--provider` | What it does                                                              |
-|--------------|---------------------------------------------------------------------------|
-| `mock`       | Deterministic, offline, zero network. Default — exercise the pipeline.    |
-| `openai`     | Any OpenAI-compatible Chat-Completions API. Requires `OPENAI_API_KEY`. Set `--api-base http://localhost:11434/v1` for Ollama, `https://openrouter.ai/api/v1` for OpenRouter, etc. |
-| `anthropic`  | Native Anthropic Messages API. Requires `ANTHROPIC_API_KEY`. Pinned to `anthropic-version: 2023-06-01`. |
-
-### Safety posture (§-1.5 #6 + §-1.2 #5)
-
-- **No silent LLM calls.** `extract` defaults to `--dry-run` (just
-  shows candidates). `--no-dry-run` is required to actually invoke the
-  provider — and even then, prints `Stage 2 plan: N candidate(s) →
-  model X (~T input tokens)` **before** the first request and asks for
-  `[y/N]` confirmation unless `--yes` is passed.
-- **Safety cap.** `--max-llm-calls N` (default 100) refuses to run if
-  Stage 1 surfaced more candidates than the cap, before constructing
-  any HTTP client.
-- **Audit trail.** Every `--no-dry-run` run appends one JSON line to
-  `<data_dir>/audit/stage2.jsonl` with timestamps, provider+model,
-  candidate counts, tokens, errors, and the full
-  `derived_record_ids` / `source_record_ids` cross-reference. Browse
-  with `anamnesis audit list` and `anamnesis audit show <#>`.
-- **Provenance link.** Each derived record carries
-  `provenance.derived_from = source_episode_id`. Walk the chain with
-  `anamnesis lineage <record-id>` (or `--children` to find every
-  record extracted from a given Episode).
-- **Idempotent.** Derived `RecordId`s are deterministic in
-  `(source_id, kind, item_index)`, so a second run replaces (not
-  duplicates) prior output.
-
-### Example flow
-
-```bash
-# Step 1: ingest a Claude Code session as Episode records.
-anamnesis source add claude-code --path ~/.claude/projects
-anamnesis import claude-code
-
-# Step 2: see which Episodes the Stage-1 gate would surface.
-anamnesis extract --kind preference --explain
-# → ranks candidates, shows score rationale, no LLM call.
-
-# Step 3: distill via Ollama locally — zero cloud calls.
-export OPENAI_API_KEY=ollama-noop
-anamnesis extract --kind preference --no-dry-run \
-  --provider openai --api-base http://localhost:11434/v1 \
-  --model llama3.2:3b
-
-# Step 4: inspect the audit log + lineage of a derived record.
-anamnesis audit list
-anamnesis lineage <id-from-list> --children
-```
-
-### Feature flags
-
-The CLI ships with `openai-provider` and `anthropic-provider` enabled
-by default. To build a slimmer binary without `reqwest`:
-
-```bash
-cargo build --no-default-features --features local-fastembed,sse
-```
-
-(The `mock` provider always works.)
-
-## Repository Layout
-
-```text
-anamnesis/
-├── crates/
-│   ├── core/                   # Domain types, traits, source discovery, chunker, contracts
-│   ├── store/                  # SQLite schema, FTS5, embeddings, sources, typed API
-│   ├── importer/               # Adapter scan -> normalize -> chunk -> transaction
-│   ├── search/                 # Hybrid RAG, RRF, ContextPacker
-│   ├── embedder/               # Local fastembed provider, Voyage provider, model registry, worker
-│   ├── cli/                    # `anamnesis`
-│   ├── mcp-server/             # `anamnesis-mcp`
-│   ├── adapter-claude-code/    # Claude Code adapter
-│   ├── adapter-codex/          # Codex adapter
-│   ├── adapter-mem0/           # mem0 SQLite adapter
-│   ├── adapter-letta/          # Letta (formerly MemGPT) SQLite adapter
-│   ├── adapter-hermes/         # Hermes (Nous Research) adapter
-│   ├── adapter-openclaw/       # OpenClaw adapter
-│   ├── adapter-ghast/          # ghast adapter
-│   ├── adapter-tdai/           # TencentDB Agent Memory adapter
-│   ├── adapter-openviking/     # OpenViking VikingFS adapter
-│   ├── adapter-mempalace/      # MemPalace ChromaDB adapter
-│   ├── adapter-memori/         # Memori SQLite adapter
-│   ├── adapter-memos/          # MemOS MemCube adapter
-│   ├── adapter-memary/         # Memary local-cache adapter
-│   └── adapter-generic-mcp/    # Generic MCP resource adapter (long-tail)
-├── docs/
-│   └── BLUEPRINT.md
-├── logo.png
-├── banner.png
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-└── README.md
-```
-
-## Development
+Build from the current repository:
 
 ```bash
 cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-
-# Faster iteration without fastembed / ONNX default features
-cargo test --workspace --no-default-features
+cargo install --path crates/cli
+cargo install --path crates/mcp-server
 ```
 
-Notes:
+Initialize the local store:
 
-- Default features include `local-fastembed`; first ONNX runtime builds can be slow.
-- CI covers no-default-features, SSE transport, and default-feature builds.
-- If full tests expose generic MCP loopback readiness flakiness, fix test readiness rather than treating the flake as a passing signal.
+```bash
+anamnesis init
+anamnesis status
+```
+
+Discover local sources:
+
+```bash
+anamnesis discover
+```
+
+Register an explicit local source:
+
+```bash
+anamnesis source add codex --path ~/.codex
+```
+
+Register an upstream MCP source:
+
+```bash
+anamnesis source add generic-mcp \
+  --instance upstream \
+  --url http://127.0.0.1:8787 \
+  --token-env ANAMNESIS_UPSTREAM_TOKEN
+```
+
+Import and embed:
+
+```bash
+anamnesis import codex
+anamnesis import generic-mcp:upstream
+```
+
+Search:
+
+```bash
+anamnesis search "project preferences" --source codex --limit 10
+anamnesis search "long term profile" --mode hybrid --since 2026-01-01T00:00:00Z
+```
+
+Generate MCP client configuration:
+
+```bash
+anamnesis mcp config
+anamnesis mcp config --transport sse --sse-port 7331
+```
+
+Run the server:
+
+```bash
+anamnesis serve
+anamnesis serve --sse 7331
+anamnesis-mcp --sse 7331
+```
+
+## Agent Plugins
+
+Anamnesis ships a Claude Code marketplace plugin and Codex marketplace metadata in the same style as modern agent memory plugins: install the local binary first, add the marketplace, then let the client spawn Anamnesis through MCP.
+
+### Claude Code
+
+Add the marketplace:
+
+```text
+/plugin marketplace add Trapezohe/Anamnesis
+```
+
+Install the plugin:
+
+```text
+/plugin install anamnesis@anamnesis-plugins
+```
+
+For CLI installation with sparse checkout:
+
+```bash
+claude plugin marketplace add Trapezohe/Anamnesis --sparse .claude-plugin anamnesis-plugin
+claude plugin install anamnesis@anamnesis-plugins
+```
+
+The plugin includes:
+
+- MCP server config for `anamnesis serve`
+- `anamnesis-memory` skill for deliberate memory recall
+- `/anamnesis-status` and `/anamnesis-search` Claude Code commands
+- no lifecycle hooks by default
+
+### Codex
+
+Fastest path, MCP only:
+
+```bash
+codex mcp add anamnesis -- anamnesis serve
+```
+
+Marketplace path:
+
+```bash
+codex plugin marketplace add Trapezohe/Anamnesis --sparse .agents/plugins anamnesis-plugin
+```
+
+Restart Codex, open the plugin UI, and install Anamnesis from the Anamnesis Plugins marketplace. Do not enable both direct MCP and marketplace plugin in the same profile unless duplicate MCP registrations are intentional.
+
+## CLI
+
+```text
+anamnesis init
+anamnesis status
+anamnesis discover [--json] [--include-unregistered]
+anamnesis source add <adapter> [--instance <name>] [--path <path>]
+anamnesis source add generic-mcp [--instance <name>] --url <url> [--token-env <ENV_NAME>]
+anamnesis source list [--json]
+anamnesis import <source[:instance]> [--dry-run] [--no-embed] [--full] [--since <RFC3339>]
+anamnesis search <query> [--mode keyword|vector|hybrid] [--source <id>] [--instance <name>] [--kind <kind>] [--scope <scope>] [--since <RFC3339>] [--until <RFC3339>] [--json]
+anamnesis extract <source[:instance]> [--provider mock|openai|anthropic] [--audit]
+anamnesis lineage <record-id>
+anamnesis audit
+anamnesis export --format json|jsonl|markdown
+anamnesis doctor [--json] [--include-unregistered]
+anamnesis mcp config [--transport stdio|sse] [--sse-port <port>]
+anamnesis serve
+```
+
+## Data Model
+
+```mermaid
+erDiagram
+    SOURCE ||--o{ RECORD : imports
+    RECORD ||--o{ CHUNK : splits
+    CHUNK ||--o| VECTOR : embeds
+    RECORD ||--o{ LINEAGE : traces
+    SOURCE ||--o{ AUDIT_EVENT : records
+
+    SOURCE {
+      string source_id
+      string instance
+      string location
+      string config_json
+    }
+
+    RECORD {
+      string id
+      string source_id
+      string instance
+      string kind
+      string scope
+      string content_hash
+      datetime created_at
+      datetime updated_at
+    }
+
+    CHUNK {
+      string id
+      string record_id
+      int chunk_index
+      string text
+    }
+```
+
+The store keeps provenance with each record so imported memory can be traced back to its source. Anamnesis should be able to answer “where did this memory come from?” before it answers “what did this memory say?”
+
+## Session Extraction
+
+The extractor turns conversation/session material into structured memory candidates. It is exposed through the `extract` command and supports mock, OpenAI, and Anthropic provider modes in the current source tree.
+
+Extraction is intentionally separate from import:
+
+- Import preserves source memory as faithfully as possible.
+- Extraction derives higher-level memories from sessions.
+- Audit and lineage commands make derived records reviewable.
+
+## Project Layout
+
+```text
+crates/
+  core/                  Shared memory schema and adapter traits
+  store/                 SQLite store, FTS, vectors, audit, lineage
+  importer/              Import service and normalization pipeline
+  search/                Keyword, vector, and hybrid search
+  embedder/              Embedding provider abstraction
+  extractor/             Session-to-memory extraction
+  cli/                   anamnesis CLI
+  mcp-server/            MCP server
+  adapter-*/             Source adapters
+docs/
+  blueprint/             Architecture and planning documents
+packaging/               Packaging templates and scripts
+```
 
 ## Current Limitations
 
-Anamnesis can already unify imports and retrieval, but it should not yet claim to precisely understand every agent’s memory semantics.
-
-- Codex adapter is currently a basic episode importer.
-- Generic MCP adapter currently imports opaque resources.
-- `source add` and `import` still need a stricter canonical registry path.
-- `--full / --since` and `ScanOpts` need to be wired through adapter scans.
-- MCP admin tools need to be disabled by default.
-- Session-to-stable-memory extraction is still a design task.
+- Adapter precision is not uniform. SQLite-backed systems are more precise when schemas match; file-based systems can be coarser.
+- ghast AI is intentionally not supported as a memory source today. Its user memory database is encrypted, and prompts-only scanning is not enough to claim real memory import support.
+- Generic MCP import depends on the upstream server exposing useful `resources/list` and `resources/read` metadata.
+- Embedding storage and vector search are implemented locally, but production ANN tuning and sqlite-vec integration are separate follow-up work.
+- Default discovery paths are conventions, not guarantees. Use `source add --path` or `source add --url` for reproducible imports.
+- Release distribution status should be verified during each release. The repository supports source builds today.
 
 ## Roadmap
 
-| Phase | Status | Focus |
-|---|---|---|
-| Phase 0 | Complete | Rust workspace, Apache-2.0, CI (8-leg matrix), README/CONTRIBUTING, schema v1/v2 |
-| Phase 1 | Complete | core/store/importer/search/embedder, 14 first-class adapters across §-2.2 + §-2.3, local hybrid RAG, §-1.5 PR-6 two-stage session extractor (Mock + OpenAI + Anthropic providers, audit log, lineage CLI) |
-| Phase 2 | In progress | MCP admin gate, source registry import, filter pushdown, ScanOpts, streaming scan |
-| Phase 3 | In progress | crates.io publish ✓ (v0.1.0, 22 crates), ghast first-consumer integration, real dogfood quality evaluation, Homebrew tap |
-| Phase 4 | Planned | Memory MCP convention, Agent Memory Interchange Format, temporal-graph schema evolution (unlocks Zep / Cognee Kuzu native adapters) |
-
-Recommended next PR slices:
-
-1. 429 rate-limit retry/backoff on the OpenAI + Anthropic providers (they currently surface the error and skip the candidate)
-2. §-1.4 schema evolution for temporal/graph edges (unlocks Zep/Graphiti, Cognee Kuzu native adapters)
-3. ghast first-consumer integration (Anamnesis as the default MCP memory server)
-4. Homebrew tap formula publishing (`brew tap Trapezohe/anamnesis`)
-
-## Contributing
-
-The highest leverage contribution is a high-quality adapter. Every adapter should:
-
-- keep discovery metadata-only;
-- stream raw records instead of loading entire corpora into memory;
-- keep normalization deterministic and pure;
-- preserve provenance;
-- pass the shared adapter contract tests.
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
+- Improve adapter-specific fidelity tests with realistic fixtures.
+- Add stronger conformance checks for source registries and import previews.
+- Extend MCP metadata conventions for upstream memory resources.
+- Add production-grade vector index integration and ranking evaluation.
+- Harden release packaging and published binary installation docs.
+- Re-evaluate ghast AI only if an official export path or MCP resource surface makes user memories readable without decrypting private databases blindly.
 
 ## Community
 
@@ -657,9 +410,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License
 
-[Apache License 2.0](./LICENSE)
-
-Imported memory data is not covered by the project license. It remains yours.
+Apache-2.0.
 
 ## Star History
 

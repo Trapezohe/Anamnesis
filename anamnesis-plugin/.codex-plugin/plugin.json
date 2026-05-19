@@ -1,0 +1,32 @@
+{
+  "name": "anamnesis",
+  "version": "0.1.0",
+  "description": "Connect Codex to Anamnesis, a local-first memory bridge for existing agent and memory-framework data.",
+  "author": {
+    "name": "Ghast AI",
+    "email": "support@ghast.ai"
+  },
+  "homepage": "https://github.com/Trapezohe/Anamnesis",
+  "repository": "https://github.com/Trapezohe/Anamnesis",
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "interface": {
+    "displayName": "Anamnesis",
+    "shortDescription": "Local-first cross-agent memory bridge",
+    "longDescription": "Anamnesis lets Codex query memories imported from existing agents and memory frameworks such as Claude Code, Codex, mem0, Letta, Hermes, OpenClaw, TDAI, OpenViking, MemPalace, Memori, MemOS, Memary, and generic MCP resource servers.",
+    "developerName": "Ghast AI",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/Trapezohe/Anamnesis",
+    "privacyPolicyURL": "https://github.com/Trapezohe/Anamnesis",
+    "termsOfServiceURL": "https://github.com/Trapezohe/Anamnesis",
+    "defaultPrompt": [
+      "Search Anamnesis for relevant project memory",
+      "List my Anamnesis memory sources",
+      "Find prior decisions about this codebase"
+    ],
+    "brandColor": "#6D5EF5",
+    "logo": "./logo.svg"
+  }
+}
