@@ -35,7 +35,7 @@
 
 use anamnesis_core::chunker::estimate_tokens;
 use anamnesis_core::error::{Error, Result};
-use anamnesis_core::model::{AnamnesisRecord, Kind};
+use anamnesis_core::model::{AnamnesisRecord, Kind, RecordId};
 use anamnesis_store::Store;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -112,16 +112,21 @@ pub fn pack(
         }
         groups.entry(key).or_default().push(h.clone());
     }
-    // 2. Materialize: look up record metadata. Skip vanished records.
+    // 2. Materialize: look up record metadata in one batched query.
+    //    Round 63 perf: replace per-id `get_record` loop (one prepare +
+    //    query per record) with a single `get_records_by_ids` IN(?) call.
+    //    Skip vanished records (missing from the returned map).
+    let record_ids: Vec<RecordId> = order_seen.iter().map(|rid| RecordId(rid.clone())).collect();
+    let record_map = store
+        .get_records_by_ids(&record_ids)
+        .map_err(|e| Error::Other(format!("store get_records_by_ids: {e}")))?;
+
     let mut materialized: Vec<PackedRecord> = Vec::new();
     for rid in &order_seen {
         let chunks = groups.remove(rid).expect("group exists by construction");
         let record_id = chunks[0].record_id.clone();
-        let record = match store
-            .get_record(&record_id)
-            .map_err(|e| Error::Other(format!("store get_record: {e}")))?
-        {
-            Some(r) => r,
+        let record = match record_map.get(&record_id) {
+            Some(r) => r.clone(),
             None => continue,
         };
         let mut chunks = chunks;

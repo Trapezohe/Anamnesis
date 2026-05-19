@@ -83,20 +83,120 @@ impl<'a, P: EmbeddingProvider> EmbeddingWorker<'a, P> {
     }
 
     /// Run until the queue for this model is empty. Returns aggregate counts.
+    ///
+    /// Round 63 perf: claims up to `BATCH = 64` jobs per `claim_next_jobs`
+    /// and hands them to `embed_batch` in one call. For 1000 jobs that's
+    /// `~16 provider requests + ~32 SQLite transactions` instead of
+    /// `~1000 + ~2000`. If `embed_batch` fails for the whole batch (network
+    /// error, single bad text poisoning a remote-batch call), each job is
+    /// retried via the per-job path so a single bad chunk doesn't kill 63
+    /// healthy siblings.
     pub async fn drain(&self, store: &Store) -> Result<DrainSummary> {
+        const BATCH: usize = 64;
+        let model_id = self.provider.model_id().0;
         let mut summary = DrainSummary {
-            model_id: self.provider.model_id().0,
+            model_id: model_id.clone(),
             processed: 0,
             failed: 0,
         };
         loop {
-            match self.run_once(store).await? {
-                Some(true) => summary.processed += 1,
-                Some(false) => summary.failed += 1,
-                None => break,
+            let jobs = store.claim_next_jobs(&model_id, BATCH).map_err(s2c)?;
+            if jobs.is_empty() {
+                break;
             }
+            self.process_batch(store, jobs, &mut summary).await?;
         }
         Ok(summary)
+    }
+
+    /// Embed a single claimed batch. On batch-level success the store
+    /// commits all vectors in one transaction; on batch-level failure we
+    /// fall back to per-job processing so one bad text doesn't poison the
+    /// whole drain step.
+    async fn process_batch(
+        &self,
+        store: &Store,
+        jobs: Vec<anamnesis_store::PendingEmbeddingJob>,
+        summary: &mut DrainSummary,
+    ) -> Result<()> {
+        let texts: Vec<&str> = jobs.iter().map(|j| j.content.as_str()).collect();
+        let expected_dim = self.provider.dim();
+        match self
+            .provider
+            .embed_batch(&texts, EmbeddingTask::Document)
+            .await
+        {
+            Ok(vectors)
+                if vectors.len() == jobs.len()
+                    && vectors.iter().all(|v| v.len() as u16 == expected_dim) =>
+            {
+                store.complete_jobs_batch(&jobs, &vectors).map_err(s2c)?;
+                summary.processed += jobs.len() as u64;
+                Ok(())
+            }
+            Ok(_vectors_mismatched) => {
+                // Provider returned the wrong number of vectors, or one was
+                // the wrong dim. Don't trust any of them — re-route each
+                // through the per-job path so the working ones get retried
+                // and the genuinely bad ones get marked failed individually.
+                tracing::warn!(
+                    expected = jobs.len(),
+                    "embed_batch returned mismatched vector count/dim; falling back per-job"
+                );
+                self.fallback_per_job(store, jobs, summary).await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    batch_size = jobs.len(),
+                    "embed_batch failed for whole batch; falling back per-job",
+                );
+                self.fallback_per_job(store, jobs, summary).await
+            }
+        }
+    }
+
+    async fn fallback_per_job(
+        &self,
+        store: &Store,
+        jobs: Vec<anamnesis_store::PendingEmbeddingJob>,
+        summary: &mut DrainSummary,
+    ) -> Result<()> {
+        let expected_dim = self.provider.dim();
+        for job in jobs {
+            match self
+                .provider
+                .embed_batch(&[&job.content], EmbeddingTask::Document)
+                .await
+            {
+                Ok(mut vectors) => match vectors.pop() {
+                    Some(v) if v.len() as u16 == expected_dim => {
+                        store.complete_job(&job, &v).map_err(s2c)?;
+                        summary.processed += 1;
+                    }
+                    Some(v) => {
+                        let msg = format!(
+                            "provider returned vec of dim {} but trait says dim {}",
+                            v.len(),
+                            expected_dim
+                        );
+                        store.fail_job(job.job_id, &msg).map_err(s2c)?;
+                        summary.failed += 1;
+                    }
+                    None => {
+                        store
+                            .fail_job(job.job_id, "provider returned no vectors")
+                            .map_err(s2c)?;
+                        summary.failed += 1;
+                    }
+                },
+                Err(e) => {
+                    store.fail_job(job.job_id, &format!("{e}")).map_err(s2c)?;
+                    summary.failed += 1;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
