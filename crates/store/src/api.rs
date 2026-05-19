@@ -543,7 +543,7 @@ impl Store {
     /// the per-record `upsert_record` path for that batch.
     pub fn upsert_records_batch(
         &self,
-        items: &[(AnamnesisRecord, Vec<Chunk>, Option<String>)],
+        items: &[(&AnamnesisRecord, &[Chunk], Option<&str>)],
     ) -> Result<(u64, u64)> {
         if items.is_empty() {
             return Ok((0, 0));
@@ -551,10 +551,13 @@ impl Store {
         let active = self.active_model()?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let now = chrono::Utc::now().timestamp();
         let mut total_records = 0u64;
         let mut total_chunks = 0u64;
         for (record, chunks, raw_payload_json) in items {
+            // Take `now` per-item (not per-batch) so `raw_artifacts.captured_at`
+            // and `embedding_jobs.enqueued_at` semantics match per-record
+            // `upsert_record`. Cheap; `Utc::now()` is microseconds.
+            let now = chrono::Utc::now().timestamp();
             let existing_hash: Option<String> = tx
                 .query_row(
                     "SELECT raw_hash FROM records WHERE id = ?1",
@@ -569,7 +572,7 @@ impl Store {
                 continue;
             }
             write_record(&tx, record)?;
-            write_raw_artifact(&tx, record, raw_payload_json.as_deref(), now)?;
+            write_raw_artifact(&tx, record, *raw_payload_json, now)?;
             write_chunks(&tx, record, chunks)?;
             if let Some(model_id) = active.as_deref() {
                 enqueue_jobs(&tx, chunks, model_id, now)?;
@@ -2604,6 +2607,99 @@ mod tests {
         assert_eq!(
             count, 1,
             "derived_from index must exist after 0004 migration"
+        );
+    }
+
+    // ─── Round-62: upsert_records_batch parity tests ─────────────────────
+
+    /// `upsert_records_batch` with one item must produce the same
+    /// records / chunks / counts as `upsert_record` does for that
+    /// same record. Guards against drift between the two paths.
+    #[test]
+    fn upsert_records_batch_size_one_matches_upsert_record() {
+        let single = Store::open_in_memory().unwrap();
+        let batched = Store::open_in_memory().unwrap();
+
+        let mut r = make_record("claude-code", "alpha", "alpha content", Kind::Fact);
+        r.provenance.raw_hash = "alpha-hash".into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+
+        let (single_recs, single_chunks) = single.upsert_record(&r, &chunks, None).unwrap();
+        let chunks_slice = chunks.as_slice();
+        let (batched_recs, batched_chunks) = batched
+            .upsert_records_batch(&[(&r, chunks_slice, None)])
+            .unwrap();
+
+        assert_eq!((single_recs, single_chunks), (batched_recs, batched_chunks));
+
+        let single_records: i64 = single
+            .conn()
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        let batched_records: i64 = batched
+            .conn()
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(single_records, batched_records);
+
+        let single_chunks_n: i64 = single
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_chunks", [], |row| row.get(0))
+            .unwrap();
+        let batched_chunks_n: i64 = batched
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(single_chunks_n, batched_chunks_n);
+    }
+
+    /// A batch that mixes already-imported (raw_hash-equal → no-op) records
+    /// with new records must report only the new records as upserted, and
+    /// must leave the store's row count equal to total-distinct-records.
+    #[test]
+    fn upsert_records_batch_mixed_dedup_and_new_counts_only_new_rows() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Seed two records via per-record path.
+        let mut r1 = make_record("claude-code", "one", "first content", Kind::Fact);
+        r1.provenance.raw_hash = "h1".into();
+        let c1 = Chunker::default().chunk(&r1.id, &r1.content);
+        store.upsert_record(&r1, &c1, None).unwrap();
+
+        let mut r2 = make_record("claude-code", "two", "second content", Kind::Fact);
+        r2.provenance.raw_hash = "h2".into();
+        let c2 = Chunker::default().chunk(&r2.id, &r2.content);
+        store.upsert_record(&r2, &c2, None).unwrap();
+
+        // Now build a batch: r1 unchanged, r2 unchanged, r3 brand new.
+        let mut r3 = make_record("claude-code", "three", "third content", Kind::Fact);
+        r3.provenance.raw_hash = "h3".into();
+        let c3 = Chunker::default().chunk(&r3.id, &r3.content);
+
+        let batch: Vec<(&AnamnesisRecord, &[Chunk], Option<&str>)> = vec![
+            (&r1, c1.as_slice(), None),
+            (&r2, c2.as_slice(), None),
+            (&r3, c3.as_slice(), None),
+        ];
+        let (recs, chunks_written) = store.upsert_records_batch(&batch).unwrap();
+
+        assert_eq!(
+            recs, 1,
+            "only r3 was new, so the batch should report 1 upsert"
+        );
+        assert_eq!(
+            chunks_written as usize,
+            c3.len(),
+            "batch must only write chunks for the new record"
+        );
+
+        let total_records: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            total_records, 3,
+            "store should now hold all 3 distinct records"
         );
     }
 }

@@ -68,20 +68,31 @@ impl ImportSummary {
 pub struct ImportRunner<'a, A: MemoryAdapter> {
     adapter: &'a A,
     chunker: Chunker,
+    upsert_batch: usize,
 }
 
 impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
-    /// Build a runner with the default chunker config (max=512 tokens).
+    /// Build a runner with the default chunker config (max=512 tokens) and
+    /// the default upsert batch size (`UPSERT_BATCH = 64`).
     pub fn new(adapter: &'a A) -> Self {
         Self {
             adapter,
             chunker: Chunker::default(),
+            upsert_batch: UPSERT_BATCH,
         }
     }
 
     /// Override the chunker (e.g. tests with tiny budgets).
     pub fn with_chunker(mut self, chunker: Chunker) -> Self {
         self.chunker = chunker;
+        self
+    }
+
+    /// Override the upsert batch size. Tests use `batch=1` to compare against
+    /// the per-record path; pathological adapters with very large chunk
+    /// fan-out can lower this to bound peak memory.
+    pub fn with_upsert_batch(mut self, batch: usize) -> Self {
+        self.upsert_batch = batch.max(1);
         self
     }
 
@@ -114,14 +125,15 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         // threshold balances throughput against memory pressure for
         // the largest realistic chunk fan-out (codex transcripts have
         // hundreds of chunks per record after PR-H).
-        let mut batch: Vec<UpsertItem> = Vec::with_capacity(UPSERT_BATCH);
+        let batch_size = self.upsert_batch;
+        let mut batch: Vec<UpsertItem> = Vec::with_capacity(batch_size);
 
         while let Some(item) = stream.next().await {
             match item {
                 Ok(raw) => {
                     summary.raw_seen += 1;
                     self.process_one(raw, store, &descriptor, &mut summary, &mut batch);
-                    if batch.len() >= UPSERT_BATCH {
+                    if batch.len() >= batch_size {
                         Self::flush_batch(&mut batch, store, &descriptor, &mut summary);
                     }
                 }
@@ -156,7 +168,13 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         batch: &mut Vec<UpsertItem>,
     ) {
         // Preserve the raw payload as JSON for raw_artifacts provenance.
-        let raw_payload_json = serde_json::to_string(&raw.payload).ok();
+        // Shared between every normalized record produced from this raw
+        // (an adapter can fan one raw out into multiple records) via
+        // `Arc` so the importer's per-record buffer doesn't clone the
+        // whole JSON string per record.
+        let raw_payload_json = serde_json::to_string(&raw.payload)
+            .ok()
+            .map(std::sync::Arc::<str>::from);
         let native_id = raw.native_id.clone();
         let native_path = raw.native_path.clone();
 
@@ -203,7 +221,17 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
         if batch.is_empty() {
             return;
         }
-        match store.upsert_records_batch(batch) {
+        let borrowed: Vec<(
+            &anamnesis_core::AnamnesisRecord,
+            &[anamnesis_core::Chunk],
+            Option<&str>,
+        )> = batch
+            .iter()
+            .map(|(record, chunks, raw_payload_json)| {
+                (record, chunks.as_slice(), raw_payload_json.as_deref())
+            })
+            .collect();
+        match store.upsert_records_batch(&borrowed) {
             Ok((n_records, n_chunks)) => {
                 summary.records_upserted += n_records;
                 summary.chunks_written += n_chunks;
@@ -247,12 +275,13 @@ impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
 }
 
 /// One (record, chunks, optional raw-JSON) tuple buffered by the importer
-/// for batched upsert. Matches the signature `Store::upsert_records_batch`
-/// expects.
+/// for batched upsert. The JSON is shared between every normalized record
+/// produced from the same raw via `Arc<str>` so an adapter that fans one
+/// raw out into many records doesn't clone the full payload per record.
 type UpsertItem = (
     anamnesis_core::AnamnesisRecord,
     Vec<anamnesis_core::Chunk>,
-    Option<String>,
+    Option<std::sync::Arc<str>>,
 );
 
 /// Records buffered between `Store::upsert_records_batch` flushes. 64 is
