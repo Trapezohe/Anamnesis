@@ -436,6 +436,9 @@ impl AnamnesisServer {
             "vector" => SearchMode::Vector,
             _ => SearchMode::Hybrid,
         };
+        // Round-71: opt-in per-stage breakdown. Default off — when
+        // omitted the response shape is byte-identical to pre-R71.
+        let trace_requested = args.get("trace").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // PR-C: push every filter into the SQL recall stage so a
         // minority-source query (e.g. `source = "mem0"` against a
@@ -456,16 +459,24 @@ impl AnamnesisServer {
             candidate_pool: (limit * 4).max(limit),
             mode,
         };
-        let hits = match self.provider.as_ref() {
+        // Always go through the traced primitive so the live search
+        // and the trace can never drift. The `trace` field on the
+        // response is only included when the caller asked — keeping
+        // the default wire shape additive-compatible.
+        let traced = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
-                .search_filtered(store, query, &filter, &opts)
+                .search_filtered_traced(store, query, &filter, &opts)
                 .await
                 .map_err(|e| format!("search: {e}"))?,
             None => HybridSearcher::<NoProvider>::fulltext_only()
-                .search_filtered(store, query, &filter, &opts.fulltext_fallback())
+                .search_filtered_traced(store, query, &filter, &opts.fulltext_fallback())
                 .await
                 .map_err(|e| format!("search: {e}"))?,
         };
+        let hits = traced.hits;
+        let search_trace = traced.trace;
+
+        let t_pack = std::time::Instant::now();
         let packed = pack(
             store,
             &hits,
@@ -475,6 +486,7 @@ impl AnamnesisServer {
             },
         )
         .map_err(|e| format!("pack: {e}"))?;
+        let pack_ms = t_pack.elapsed().as_millis() as u64;
         // Post-filter is now a defense-in-depth no-op: the SQL stage
         // already excluded non-matching adapters from the candidate
         // pool. We keep it so adding new filter dimensions to the MCP
@@ -498,7 +510,7 @@ impl AnamnesisServer {
         //
         // `score` is kept as an alias for `rrf_score` so older agents
         // that pinned the previous field name don't break.
-        Ok(json!({
+        let mut payload = json!({
             "results": filtered.iter().map(|p| {
                 let best = p.matched_chunks.first();
                 json!({
@@ -526,7 +538,33 @@ impl AnamnesisServer {
                     "updated_at": p.record.updated_at.map(|t| t.timestamp()),
                 })
             }).collect::<Vec<_>>()
-        }))
+        });
+        if trace_requested {
+            // Inject the search-layer trace + MCP-layer pack_ms +
+            // packed-record counts. Everything here is numeric or the
+            // effective mode string; no query text, no snippets, no
+            // record/chunk ids, no path strings — same privacy
+            // contract as R69's `mcp_request_metrics`.
+            let returned_records = payload["results"].as_array().map_or(0, |a| a.len()) as u32;
+            payload["trace"] = json!({
+                "effective_mode": search_trace.effective_mode,
+                "candidate_pool": search_trace.candidate_pool,
+                "stages_ms": {
+                    "embed_query": search_trace.stages_ms.embed_query_ms,
+                    "fts":         search_trace.stages_ms.fts_ms,
+                    "vec":         search_trace.stages_ms.vec_ms,
+                    "rrf":         search_trace.stages_ms.rrf_ms,
+                    "pack":        pack_ms,
+                },
+                "counts": {
+                    "fts_hits":         search_trace.counts.fts_hits,
+                    "vec_hits":         search_trace.counts.vec_hits,
+                    "ranked_chunks":    search_trace.counts.ranked_chunks,
+                    "returned_records": returned_records,
+                },
+            });
+        }
+        Ok(payload)
     }
 
     async fn tool_get_record(&self, args: Value) -> Result<Value, String> {
@@ -1591,7 +1629,16 @@ fn tools_list_payload_all() -> Value {
                             "description": "RFC3339 upper bound on records.created_at (inclusive)."
                         },
                         "limit": {"type": "integer", "minimum": 1, "default": 10},
-                        "mode": {"type": "string", "enum": ["fulltext", "vector", "hybrid"], "default": "hybrid"}
+                        "mode": {"type": "string", "enum": ["fulltext", "vector", "hybrid"], "default": "hybrid"},
+                        "trace": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Return per-stage search timings (embed_query / fts / vec / rrf / pack, in ms) \
+                                            and candidate counts under a top-level `trace` field. Never includes query \
+                                            text, snippets, or any record / chunk identifiers — strictly numeric \
+                                            diagnostic shape. Default off; omitting it keeps the response wire-identical \
+                                            to pre-Round-71."
+                        }
                     },
                     "required": ["query"]
                 }
@@ -3180,6 +3227,124 @@ mod tests {
             assert!(
                 body["summary"][key].is_number(),
                 "summary.{key} must still be present"
+            );
+        }
+    }
+
+    // ─── Round-71: search_memories(trace=true) ──────────────────────
+
+    /// Without `trace=true`, the response shape must be byte-identical
+    /// to the pre-Round-71 wire — guards against accidentally always
+    /// emitting the trace and silently inflating MCP payloads for
+    /// every existing client.
+    #[tokio::test]
+    async fn search_trace_omitted_by_default() {
+        let s = server_with_records(&[make_record("claude-code", "r1", "alpha bench", 1_700)]);
+        let body = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {"query": "alpha", "mode": "fulltext", "limit": 5}
+                }),
+            ))
+            .await
+            .result
+            .unwrap();
+        let payload = &body["structuredContent"];
+        assert!(payload["results"].is_array());
+        assert!(
+            payload.get("trace").is_none(),
+            "trace must be absent unless explicitly requested; got {payload}"
+        );
+    }
+
+    /// With `trace=true`, the response must carry per-stage `stages_ms`
+    /// and `counts` blocks alongside the usual `results` array.
+    #[tokio::test]
+    async fn search_trace_reports_stage_breakdown_when_requested() {
+        let s = server_with_records(&[
+            make_record("claude-code", "r1", "alpha bench memory", 1_700),
+            make_record("claude-code", "r2", "alpha duplicate memory", 1_701),
+        ]);
+        let body = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "alpha",
+                        "mode": "fulltext",
+                        "limit": 5,
+                        "trace": true
+                    }
+                }),
+            ))
+            .await
+            .result
+            .unwrap();
+        let payload = &body["structuredContent"];
+        assert!(payload["results"].is_array());
+        let trace = &payload["trace"];
+        assert_eq!(trace["effective_mode"], "fulltext");
+        assert!(trace["candidate_pool"].is_u64());
+        // Fulltext mode: fts and rrf and pack ran; embed/vec did not.
+        assert!(trace["stages_ms"]["fts"].is_u64());
+        assert!(trace["stages_ms"]["embed_query"].is_null());
+        assert!(trace["stages_ms"]["vec"].is_null());
+        assert!(trace["stages_ms"]["rrf"].is_u64());
+        assert!(trace["stages_ms"]["pack"].is_u64());
+        // Counts cover both modalities + final shape.
+        assert!(trace["counts"]["fts_hits"].as_u64().unwrap() >= 1);
+        assert_eq!(trace["counts"]["vec_hits"].as_u64().unwrap(), 0);
+        assert!(trace["counts"]["ranked_chunks"].as_u64().unwrap() >= 1);
+        assert!(trace["counts"]["returned_records"].as_u64().unwrap() >= 1);
+    }
+
+    /// The trace payload must never include the query text or any
+    /// snippet/record/chunk identifier. This is the same privacy
+    /// contract enforced for R69's `mcp_request_metrics`.
+    #[tokio::test]
+    async fn search_trace_payload_excludes_user_content() {
+        let s = server_with_records(&[make_record(
+            "claude-code",
+            "r1",
+            "the marker phrase wombatFluteSafari should not appear anywhere",
+            1_700,
+        )]);
+        let body = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "wombatFluteSafari",
+                        "mode": "fulltext",
+                        "limit": 5,
+                        "trace": true
+                    }
+                }),
+            ))
+            .await
+            .result
+            .unwrap();
+        let trace_str = body["structuredContent"]["trace"].to_string();
+        assert!(
+            !trace_str.contains("wombatFluteSafari"),
+            "query text must not appear in trace payload: {trace_str}"
+        );
+        assert!(
+            !trace_str.contains("marker phrase"),
+            "memory content must not appear in trace payload: {trace_str}"
+        );
+        // Whitelist of allowed top-level keys inside `trace`.
+        let trace = &body["structuredContent"]["trace"];
+        let allowed = ["effective_mode", "candidate_pool", "stages_ms", "counts"];
+        let obj = trace.as_object().unwrap();
+        for k in obj.keys() {
+            assert!(
+                allowed.contains(&k.as_str()),
+                "unexpected trace top-level field {k:?}: needs a privacy review"
             );
         }
     }

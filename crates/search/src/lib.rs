@@ -17,5 +17,8 @@ pub use eval::{
     evaluate_query_at, summarize_quality, JudgedQuery, JudgedRecordRef, QualitySummary, QueryEval,
     RankedRecordRef,
 };
-pub use hybrid::{HybridOpts, HybridSearcher, RankedChunk, SearchMode};
+pub use hybrid::{
+    HybridOpts, HybridSearcher, RankedChunk, SearchMode, SearchStageCounts, SearchStageTimings,
+    SearchTrace, TracedSearchResult,
+};
 pub use packer::{pack, ContextBudget, PackedRecord};
