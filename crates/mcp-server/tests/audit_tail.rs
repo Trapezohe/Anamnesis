@@ -213,10 +213,86 @@ async fn audit_tail_tools_list_schema_advertises_all_args() {
         .find(|t| t["name"] == "audit_tail")
         .expect("audit_tail must be in admin tools/list");
     let props = &at["inputSchema"]["properties"];
-    for key in ["limit", "action", "since", "include_detail"] {
+    for key in ["limit", "action", "since", "include_detail", "csv"] {
         assert!(
             props.get(key).is_some(),
             "audit_tail must advertise {key:?}: {at}"
         );
     }
+    assert_eq!(props["csv"]["type"], "boolean");
+}
+
+// ─── Round-92 PR-78n: audit_tail csv (MCP parity with R91) ──────────
+
+/// `csv: true` returns a `csv` string with the redacted summary
+/// header + rows, NOT an `entries[]` array. Same field
+/// discipline as the CLI `audit tail --csv`: never carries
+/// `detail` / `reason` / `query`.
+#[tokio::test]
+async fn audit_tail_csv_returns_string_with_header_and_redacted_rows() {
+    let bundle = build_bundle(true);
+    bundle.audit.record(AuditEntry::new(
+        "forget",
+        json!({"via": "cli", "outcome": "forgotten", "reason": "secret-leak-canary"}),
+    ));
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "audit_tail",
+            json!({"action": "forget", "csv": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["include_detail"], false);
+    // `entries` absent — csv path uses a flat string instead.
+    assert!(payload.get("entries").is_none());
+    let csv = payload["csv"].as_str().unwrap();
+    assert!(csv.starts_with("line_no,timestamp,action,via,outcome\n"));
+    assert!(csv.contains(",forget,cli,forgotten\n"));
+    assert!(
+        !csv.contains("secret-leak-canary"),
+        "csv must not leak reason: {csv}"
+    );
+}
+
+/// `csv: true` + `include_detail: true` is a contradictory
+/// operator intent — CSV is the redacted summary form, and
+/// detail would either leak through or pretend the CSV was
+/// full-detail. The handler returns a clear error.
+#[tokio::test]
+async fn audit_tail_csv_conflicts_with_include_detail() {
+    let bundle = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "audit_tail",
+            json!({"csv": true, "include_detail": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "must error on the conflict");
+    let msg = resp.error.unwrap().message;
+    assert!(
+        msg.contains("mutually exclusive") || msg.contains("redacted-summary"),
+        "error must explain the conflict; got {msg}"
+    );
+}
+
+/// Empty audit log + `csv: true` still emits header-only — same
+/// behaviour as the CLI, so scripts can branch uniformly.
+#[tokio::test]
+async fn audit_tail_csv_empty_log_emits_header_only() {
+    let bundle = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call("audit_tail", json!({"csv": true})))
+        .await;
+    assert!(resp.error.is_none());
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 0);
+    let csv = payload["csv"].as_str().unwrap();
+    assert_eq!(csv.trim(), "line_no,timestamp,action,via,outcome");
 }

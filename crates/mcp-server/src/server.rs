@@ -87,6 +87,54 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 92 (PR-78n): render `Audit::tail` results as the
+/// MCP CSV string. Same columns and redaction discipline as the
+/// CLI helper in R91 — `line_no,timestamp,action,via,outcome`
+/// only, never `detail` / `reason` / `query`. Empty rows still
+/// emit the header so scripts can branch uniformly. CSV
+/// escaping reuses the same simple rule (quote + double inner
+/// quotes when the field contains `,`, `"`, or `\n`).
+fn render_audit_tail_csv(rows: &[anamnesis_core::AuditTailRow]) -> String {
+    fn csv_escape(s: &str) -> String {
+        if s.chars().any(|c| c == ',' || c == '"' || c == '\n') {
+            let escaped = s.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        } else {
+            s.to_string()
+        }
+    }
+    let mut out = String::from("line_no,timestamp,action,via,outcome\n");
+    for r in rows {
+        let via = r
+            .entry
+            .detail
+            .get("via")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let outcome = r
+            .entry
+            .detail
+            .get("outcome")
+            .or_else(|| r.entry.detail.get("status"))
+            .or_else(|| r.entry.detail.get("changed"))
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{line_no},{ts},{action},{via},{outcome}\n",
+            line_no = r.line_no,
+            ts = csv_escape(&r.entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            action = csv_escape(&r.entry.action),
+            via = csv_escape(&via),
+            outcome = csv_escape(&outcome),
+        ));
+    }
+    out
+}
+
 /// Round 90 (PR-78l): render `count_forgotten_by_source` as
 /// the shared `counts` block for MCP `list_forgotten { include_counts: true }`.
 /// Same shape as the CLI JSON payload — `total` plus
@@ -1838,6 +1886,20 @@ impl AnamnesisServer {
             .get("include_detail")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 92 (PR-78n): MCP-side parity with R91's CLI
+        // `audit tail --csv`. CSV is the redacted-summary form
+        // (no `detail`); we refuse `csv + include_detail` because
+        // the operator intent is contradictory — mixing the two
+        // would either smuggle raw `reason` / `query` into a CSV
+        // export or pretend the CSV was full-detail.
+        let csv_requested = args.get("csv").and_then(|v| v.as_bool()).unwrap_or(false);
+        if csv_requested && include_detail {
+            return Err(
+                "audit_tail: `csv: true` and `include_detail: true` are mutually exclusive — \
+                 CSV is the redacted-summary form (no `detail`)."
+                    .to_string(),
+            );
+        }
 
         let opts = anamnesis_core::AuditTailOptions {
             limit,
@@ -1851,6 +1913,27 @@ impl AnamnesisServer {
         let effective_limit = limit
             .unwrap_or(anamnesis_core::AUDIT_TAIL_DEFAULT_LIMIT)
             .clamp(1, anamnesis_core::AUDIT_TAIL_MAX_LIMIT);
+
+        if csv_requested {
+            // CSV path returns a single `csv` string instead of
+            // an `entries[]` array. Same redacted summary fields
+            // CLI uses (`line_no,timestamp,action,via,outcome`),
+            // never `detail` / `reason` / `query`. Empty result
+            // still emits the header so downstream scripts can
+            // branch uniformly.
+            let csv = render_audit_tail_csv(&rows);
+            return Ok(json!({
+                "count":           rows.len(),
+                "limit":           effective_limit,
+                "format":          "csv",
+                "include_detail":  false,
+                "filter": {
+                    "action": action,
+                    "since":  since_spec,
+                },
+                "csv": csv,
+            }));
+        }
 
         let entries: Vec<Value> = rows
             .iter()
@@ -2889,6 +2972,11 @@ fn tools_list_payload_all() -> Value {
                             "type": "boolean",
                             "default": false,
                             "description": "When true, attach the full per-entry `detail` payload. Default off — keeps search queries / forget reasons out of the response by default."
+                        },
+                        "csv": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 92: return a CSV string in `csv` (header `line_no,timestamp,action,via,outcome`) instead of structured `entries[]`. Same redacted summary discipline as the CLI `audit tail --csv` — never carries `detail` / `reason` / `query`. Mutually exclusive with `include_detail: true`."
                         }
                     }
                 }
