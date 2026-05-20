@@ -198,6 +198,13 @@ enum Command {
         /// Emit JSON instead of the human one-liner.
         #[arg(long)]
         json: bool,
+        /// Round 96: append a `stats` block (`total_user_tags`)
+        /// to the JSON payload and a short stats line to the
+        /// human output. Operators paging through tag mutations
+        /// can see the post-call tag-count without a second
+        /// `get_record` round trip. Default off — back-compat.
+        #[arg(long)]
+        include_stats: bool,
     },
 
     /// Report records that share an identical `raw_hash` — the
@@ -934,7 +941,16 @@ async fn main() -> Result<()> {
             remove,
             replace,
             json,
-        } => cmd_tag_record(&data_dir, &record_id, &tags, remove, replace, json),
+            include_stats,
+        } => cmd_tag_record(
+            &data_dir,
+            &record_id,
+            &tags,
+            remove,
+            replace,
+            json,
+            include_stats,
+        ),
         Command::Dedupe {
             source,
             instance,
@@ -3183,6 +3199,7 @@ fn cmd_unforget_dry_run(
 ///
 /// Audit-logged so the §-1.5 stage-2 audit trail captures
 /// who-tagged-what-when, parity with `forget` / `unforget`.
+#[allow(clippy::too_many_arguments)]
 fn cmd_tag_record(
     data_dir: &std::path::Path,
     record_id: &str,
@@ -3190,6 +3207,7 @@ fn cmd_tag_record(
     remove: bool,
     replace: bool,
     json: bool,
+    include_stats: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let id = anamnesis_core::model::RecordId(record_id.to_string());
@@ -3217,13 +3235,18 @@ fn cmd_tag_record(
     ));
 
     if json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "record_id": mutation.record_id.0,
             "operation": op_label,
             "requested": mutation.requested,
             "changed": mutation.changed,
             "user_tags": mutation.user_tags,
         });
+        if include_stats {
+            payload["stats"] = serde_json::json!({
+                "total_user_tags": mutation.user_tags.len(),
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         let verb = match op {
@@ -3245,6 +3268,9 @@ fn cmd_tag_record(
             println!("  user_tags: (none)");
         } else {
             println!("  user_tags: {}", mutation.user_tags.join(", "));
+        }
+        if include_stats {
+            println!("  stats: total_user_tags={}", mutation.user_tags.len());
         }
     }
     Ok(())

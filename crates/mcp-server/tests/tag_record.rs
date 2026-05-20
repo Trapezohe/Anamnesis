@@ -468,3 +468,62 @@ async fn tag_record_tools_list_schema_advertises_replace() {
         "operation enum must advertise replace: {labels:?}"
     );
 }
+
+// ─── Round-96 PR-78r: tag_record include_stats ─────────────────────
+
+#[tokio::test]
+async fn tag_record_default_response_has_no_stats_block() {
+    let (bundle, id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": ["keep"]}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    assert!(
+        payload.get("stats").is_none(),
+        "default tag_record must not carry stats; got {payload}"
+    );
+}
+
+#[tokio::test]
+async fn tag_record_include_stats_attaches_total_user_tags() {
+    let (bundle, id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({
+                "record_id": id.0,
+                "tags": ["keep", "todo"],
+                "include_stats": true,
+            }),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["stats"]["total_user_tags"], 2);
+}
+
+#[tokio::test]
+async fn tag_record_tools_list_schema_advertises_include_stats() {
+    let (bundle, _id) = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let tag = tools
+        .iter()
+        .find(|t| t["name"] == "tag_record")
+        .expect("tag_record in admin tools/list");
+    let props = &tag["inputSchema"]["properties"];
+    assert_eq!(
+        props["include_stats"]["type"], "boolean",
+        "tag_record must advertise include_stats: {tag}"
+    );
+}

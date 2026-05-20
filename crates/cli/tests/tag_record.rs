@@ -386,3 +386,71 @@ fn search_user_tag_filter_no_match_returns_empty() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["results"].as_array().unwrap().len(), 0);
 }
+
+// ─── Round-96 PR-78r: tag-record --include-stats ───────────────────
+
+/// Default `tag-record --json` carries no `stats` block.
+#[test]
+fn tag_record_default_json_has_no_stats_block() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "todo", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v.get("stats").is_none(),
+        "default tag-record must not carry stats; got {v}"
+    );
+}
+
+/// `--include-stats` adds `stats.total_user_tags` to the JSON
+/// payload. After adding 2 tags, the count is 2; after removing
+/// 1, the count drops to 1.
+#[test]
+fn tag_record_include_stats_reports_post_mutation_total() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "tag-record",
+            &rid,
+            "keep",
+            "todo",
+            "--json",
+            "--include-stats",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["stats"]["total_user_tags"], 2);
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "tag-record",
+            &rid,
+            "todo",
+            "--remove",
+            "--json",
+            "--include-stats",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["stats"]["total_user_tags"], 1);
+}
