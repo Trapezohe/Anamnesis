@@ -329,3 +329,142 @@ async fn search_memories_user_tag_unknown_returns_empty() {
     let payload = extract_payload(&resp);
     assert_eq!(payload["results"].as_array().unwrap().len(), 0);
 }
+
+// ─── Round-81 PR-78c: tag_record operation=replace ─────────────────
+
+/// `operation=replace` installs the input as the full
+/// post-call set in one atomic call, returns set delta, and
+/// the audit log records `"operation": "replace"` so a
+/// post-hoc audit can distinguish replace from add/remove.
+#[tokio::test]
+async fn tag_record_replace_overwrites_prior_set_with_delta() {
+    let (bundle, id) = build_bundle(true);
+    // Seed {keep, todo}.
+    bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": ["keep", "todo"], "operation": "add"}),
+        ))
+        .await;
+
+    // Replace with {keep, final}.
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({
+                "record_id": id.0,
+                "tags": ["keep", "final"],
+                "operation": "replace",
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["operation"], "replace");
+    assert_eq!(payload["changed"], 2, "set delta: 1 added + 1 removed");
+    assert_eq!(payload["user_tags"], json!(["final", "keep"]));
+
+    let audit = read_audit(&bundle.audit_dir);
+    let replace_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| e["action"] == "tag_record" && e["detail"]["operation"] == "replace")
+        .collect();
+    assert_eq!(replace_entries.len(), 1);
+    assert_eq!(replace_entries[0]["detail"]["via"], "mcp");
+    assert_eq!(replace_entries[0]["detail"]["changed"], 2);
+}
+
+/// `operation=replace` with empty `tags` is the only path that
+/// accepts an empty list — it clears the overlay for this record.
+#[tokio::test]
+async fn tag_record_replace_with_empty_tags_clears_overlay() {
+    let (bundle, id) = build_bundle(true);
+    bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": ["a", "b"], "operation": "add"}),
+        ))
+        .await;
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": [], "operation": "replace"}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["operation"], "replace");
+    assert_eq!(payload["changed"], 2, "two tags cleared = 2 deletions");
+    assert_eq!(payload["requested"], json!([]));
+    assert_eq!(payload["user_tags"], json!([]));
+}
+
+/// Empty `tags` with `add` or `remove` must still error — only
+/// `replace` carries the "explicit clear" intent. Guards
+/// against a regression in the handler-side validation.
+#[tokio::test]
+async fn tag_record_add_with_empty_tags_still_errors() {
+    let (bundle, id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": [], "operation": "add"}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "empty add must error");
+}
+
+/// Unknown `operation` value returns a clear error mentioning
+/// all three valid choices. Guards against schema drift between
+/// the handler and the advertised enum.
+#[tokio::test]
+async fn tag_record_unknown_operation_errors_with_three_options() {
+    let (bundle, id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": ["x"], "operation": "toggle"}),
+        ))
+        .await;
+    assert!(resp.error.is_some());
+    let msg = resp.error.unwrap().message;
+    assert!(msg.contains("add"), "error must mention add: {msg}");
+    assert!(msg.contains("remove"), "error must mention remove: {msg}");
+    assert!(msg.contains("replace"), "error must mention replace: {msg}");
+}
+
+/// tools/list schema advertises `replace` in the operation enum
+/// so MCP clients can introspect the wire shape.
+#[tokio::test]
+async fn tag_record_tools_list_schema_advertises_replace() {
+    let (bundle, _id) = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let tag = tools
+        .iter()
+        .find(|t| t["name"] == "tag_record")
+        .expect("tag_record must be in admin tools/list");
+    let ops = tag["inputSchema"]["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("operation must carry an enum");
+    let labels: Vec<&str> = ops.iter().filter_map(|v| v.as_str()).collect();
+    assert!(labels.contains(&"add"));
+    assert!(labels.contains(&"remove"));
+    assert!(
+        labels.contains(&"replace"),
+        "operation enum must advertise replace: {labels:?}"
+    );
+}

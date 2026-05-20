@@ -1449,11 +1449,19 @@ impl AnamnesisServer {
         {
             "add" => anamnesis_store::UserTagOperation::Add,
             "remove" => anamnesis_store::UserTagOperation::Remove,
+            // Round 81 PR-78c: atomic full-set replace.
+            "replace" => anamnesis_store::UserTagOperation::Replace,
             other => {
                 return Err(format!(
-                    "tag_record.operation must be \"add\" or \"remove\"; got {other:?}"
+                    "tag_record.operation must be \"add\", \"remove\", or \"replace\"; \
+                     got {other:?}"
                 ))
             }
+        };
+        let op_label = match operation {
+            anamnesis_store::UserTagOperation::Add => "add",
+            anamnesis_store::UserTagOperation::Remove => "remove",
+            anamnesis_store::UserTagOperation::Replace => "replace",
         };
 
         let mutation = self
@@ -1465,10 +1473,7 @@ impl AnamnesisServer {
             "tag_record",
             json!({
                 "record_id": record_id,
-                "operation": match operation {
-                    anamnesis_store::UserTagOperation::Add    => "add",
-                    anamnesis_store::UserTagOperation::Remove => "remove",
-                },
+                "operation": op_label,
                 "requested": mutation.requested,
                 "changed":   mutation.changed,
                 "via":       "mcp",
@@ -1477,10 +1482,7 @@ impl AnamnesisServer {
 
         Ok(json!({
             "record_id": mutation.record_id.0,
-            "operation": match operation {
-                anamnesis_store::UserTagOperation::Add    => "add",
-                anamnesis_store::UserTagOperation::Remove => "remove",
-            },
+            "operation": op_label,
             "requested": mutation.requested,
             "changed":   mutation.changed,
             "user_tags": mutation.user_tags,
@@ -2240,14 +2242,17 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "tag_record",
-                "description": "Apply or remove user tags on a record. Tags live in a separate \
-                                overlay table from the adapter-derived `tags` field, so they \
-                                survive re-import. Read paths (`search_memories`, `get_record`) \
-                                surface them as `user_tags`. ADMIN-GATED for write; reads are not \
-                                admin-gated. Set semantics — re-adding an existing tag or \
-                                removing a missing one is a no-op (the `changed` count reports \
-                                actual writes). Tags are trimmed, lower-cased, deduped before \
-                                write. Limit: 32 tags per call, 64 bytes per tag.",
+                "description": "Apply, remove, or replace user tags on a record. Tags live in a \
+                                separate overlay table from the adapter-derived `tags` field, so \
+                                they survive re-import. Read paths (`search_memories`, \
+                                `get_record`) surface them as `user_tags`. ADMIN-GATED for write; \
+                                reads are not admin-gated. Set semantics — re-adding an existing \
+                                tag or removing a missing one is a no-op; `replace` reports the \
+                                set delta (re-replacing with the same set = 0). Tags are trimmed, \
+                                lower-cased, deduped before write. Limit: 32 tags per call, 64 \
+                                bytes per tag. Empty `tags` is **only valid for \
+                                `operation=\"replace\"`** (= clear all user tags on the record); \
+                                `add`/`remove` reject empty input.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2258,15 +2263,14 @@ fn tools_list_payload_all() -> Value {
                         "tags": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "minItems": 1,
                             "maxItems": 32,
-                            "description": "Tags to apply/remove. Normalised before write."
+                            "description": "Tags to apply/remove/replace with. Normalised before write. Must be non-empty for `add`/`remove`; may be empty for `replace` (= clear)."
                         },
                         "operation": {
                             "type": "string",
-                            "enum": ["add", "remove"],
+                            "enum": ["add", "remove", "replace"],
                             "default": "add",
-                            "description": "Direction of the mutation."
+                            "description": "`add` inserts (set semantic); `remove` deletes (set semantic); `replace` installs `tags` as the full post-call set, deleting anything not in the input."
                         }
                     },
                     "required": ["record_id", "tags"]
