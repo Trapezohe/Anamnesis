@@ -354,6 +354,50 @@ pub fn delete_vec_rows_for_record(tx: &Transaction<'_>, record_id: &str) -> rusq
     Ok(())
 }
 
+/// Round 83 (PR-78e): count vec0 rows that `delete_vec_rows_for_record`
+/// would actually remove for `record_id`. Uses the **same**
+/// `(chunk_id, model_id) → vec_key` traversal as the delete path so
+/// the dry-run preview can't drift from what the real delete will do.
+///
+/// Returns 0 when no chunks for the record carry embeddings (e.g.
+/// the embedder job is still pending) — exactly what the delete
+/// path would no-op on too.
+pub fn count_vec_rows_for_record(tx: &Transaction<'_>, record_id: &str) -> rusqlite::Result<u64> {
+    let pairs: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT e.chunk_id, e.model_id \
+             FROM chunk_embeddings e \
+             JOIN record_chunks rc ON rc.id = e.chunk_id \
+             WHERE rc.record_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![record_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    let tables: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT table_name FROM chunk_vec_indexes")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut total: u64 = 0;
+    for (chunk_id, model_id) in &pairs {
+        let key = vec_key(model_id, chunk_id);
+        for t in &tables {
+            let n: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM {t} WHERE vec_key = ?1"),
+                params![key],
+                |r| r.get(0),
+            )?;
+            total += n as u64;
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

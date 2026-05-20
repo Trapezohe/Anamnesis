@@ -302,6 +302,13 @@ enum Command {
         /// Emit JSON instead of the human one-liner.
         #[arg(long)]
         json: bool,
+        /// Round 83: don't actually forget — print a preview
+        /// showing how many rows would be deleted, what the
+        /// tombstone would carry, and that one audit entry
+        /// would be written. The store is **not** touched and
+        /// the audit log is **not** appended.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Score retrieval quality (MRR@k / nDCG@k) over a judged query
@@ -875,7 +882,8 @@ async fn main() -> Result<()> {
             record_id,
             reason,
             json,
-        } => cmd_forget(&data_dir, &record_id, reason.as_deref(), json),
+            dry_run,
+        } => cmd_forget(&data_dir, &record_id, reason.as_deref(), json, dry_run),
         Command::EvalQuality {
             judgments,
             mode,
@@ -2542,9 +2550,13 @@ fn cmd_forget(
     record_id: &str,
     reason: Option<&str>,
     json: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let id = anamnesis_core::model::RecordId(record_id.to_string());
+    if dry_run {
+        return cmd_forget_dry_run(&store, record_id, &id, reason, json);
+    }
     let outcome = store.forget_record(&id, reason)?;
 
     // §-1.5 PR-6 audit: every state-mutating CLI action lands in
@@ -2614,6 +2626,143 @@ fn cmd_forget(
     if matches!(outcome, anamnesis_store::ForgetRecordOutcome::NotFound) {
         return Err(anyhow!(
             "no record with id {record_id:?} — nothing to forget"
+        ));
+    }
+    Ok(())
+}
+
+/// Round 83 (PR-78e): `anamnesis forget --dry-run` — preview the
+/// cascade without writing anything. Does NOT call
+/// `store.forget_record` and does NOT append to `audit.log`. Same
+/// exit-code policy as the real path: `NotFound` is loud.
+fn cmd_forget_dry_run(
+    store: &Store,
+    record_id: &str,
+    id: &anamnesis_core::model::RecordId,
+    reason: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let preview = store.preview_forget_record(id, reason)?;
+
+    if json {
+        let payload = match &preview {
+            anamnesis_store::ForgetRecordPreview::WouldForget {
+                would_delete,
+                tombstone_preview,
+            } => serde_json::json!({
+                "dry_run": true,
+                "status": "would-forget",
+                "record_id": tombstone_preview.record_id.0,
+                "adapter": tombstone_preview.adapter,
+                "instance": if tombstone_preview.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(tombstone_preview.instance.clone())
+                },
+                "native_id": tombstone_preview.native_id,
+                "native_path": tombstone_preview.native_path,
+                "raw_hash": tombstone_preview.raw_hash,
+                "reason": tombstone_preview.reason,
+                "would_delete": {
+                    "records": would_delete.records,
+                    "raw_artifacts": would_delete.raw_artifacts,
+                    "record_chunks": would_delete.record_chunks,
+                    "chunk_embeddings": would_delete.chunk_embeddings,
+                    "embedding_jobs": would_delete.embedding_jobs,
+                    "user_record_tags": would_delete.user_record_tags,
+                    "vec0_rows": would_delete.vec0_rows,
+                },
+                "would_insert": {
+                    "record_tombstones": 1,
+                    // 1 audit entry: this dry-run does NOT write
+                    // one, but the real forget would.
+                    "audit_log_entries": 1,
+                },
+            }),
+            anamnesis_store::ForgetRecordPreview::AlreadyForgotten(r) => serde_json::json!({
+                "dry_run": true,
+                "status": "already-forgotten",
+                "record_id": r.record_id.0,
+                "adapter": r.adapter,
+                "instance": if r.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(r.instance.clone())
+                },
+                "native_id": r.native_id,
+                "native_path": r.native_path,
+                "raw_hash": r.raw_hash,
+                "reason": r.reason,
+                "forgotten_at": r.forgotten_at,
+                "would_delete": {
+                    "records": 0u64,
+                    "raw_artifacts": 0u64,
+                    "record_chunks": 0u64,
+                    "chunk_embeddings": 0u64,
+                    "embedding_jobs": 0u64,
+                    "user_record_tags": 0u64,
+                    "vec0_rows": 0u64,
+                },
+                "would_insert": {
+                    "record_tombstones": 0,
+                    "audit_log_entries": 0,
+                },
+            }),
+            anamnesis_store::ForgetRecordPreview::NotFound => serde_json::json!({
+                "dry_run": true,
+                "status": "not-found",
+                "record_id": record_id,
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        match &preview {
+            anamnesis_store::ForgetRecordPreview::WouldForget {
+                would_delete,
+                tombstone_preview,
+            } => {
+                let inst = if tombstone_preview.instance.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{}", tombstone_preview.instance)
+                };
+                println!(
+                    "DRY-RUN — would forget {} (adapter={}{inst}, native_id={})",
+                    tombstone_preview.record_id.0,
+                    tombstone_preview.adapter,
+                    tombstone_preview.native_id
+                );
+                println!(
+                    "  would delete: {} record, {} chunks, {} embeddings, {} vec0 rows, \
+                     {} embedding jobs, {} user tags, {} raw artifacts",
+                    would_delete.records,
+                    would_delete.record_chunks,
+                    would_delete.chunk_embeddings,
+                    would_delete.vec0_rows,
+                    would_delete.embedding_jobs,
+                    would_delete.user_record_tags,
+                    would_delete.raw_artifacts,
+                );
+                println!("  would write: 1 tombstone, 1 audit entry");
+                if let Some(r) = &tombstone_preview.reason {
+                    println!("  reason: {r}");
+                }
+                println!("  (no changes applied — re-run without --dry-run to commit)");
+            }
+            anamnesis_store::ForgetRecordPreview::AlreadyForgotten(r) => {
+                println!(
+                    "DRY-RUN — already forgotten at {}: {} (adapter={}, native_id={})",
+                    r.forgotten_at, r.record_id.0, r.adapter, r.native_id,
+                );
+                println!("  no changes would be made (re-run without --dry-run is a no-op too)");
+            }
+            anamnesis_store::ForgetRecordPreview::NotFound => {}
+        }
+    }
+
+    if matches!(preview, anamnesis_store::ForgetRecordPreview::NotFound) {
+        return Err(anyhow!(
+            "no record with id {record_id:?} — nothing to forget (dry-run)"
         ));
     }
     Ok(())

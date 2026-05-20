@@ -77,6 +77,47 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 83 (PR-78e): MCP wire shape for `forget_record { dry_run: true }`.
+/// Mirrors the CLI dry-run JSON: top-level `dry_run: true`,
+/// `status: "would-forget"`, the would-be tombstone fields, and
+/// `would_delete` / `would_insert` count blocks.
+fn forget_dry_run_payload(
+    status: &str,
+    would_delete: &anamnesis_store::ForgetCascadeCounts,
+    tombstone_preview: &anamnesis_store::ForgetTombstonePreview,
+) -> Value {
+    json!({
+        "dry_run":    true,
+        "status":     status,
+        "record_id":  tombstone_preview.record_id.0,
+        "adapter":    tombstone_preview.adapter,
+        "instance":   if tombstone_preview.instance.is_empty() {
+            Value::Null
+        } else {
+            Value::String(tombstone_preview.instance.clone())
+        },
+        "native_id":   tombstone_preview.native_id,
+        "native_path": tombstone_preview.native_path,
+        "raw_hash":    tombstone_preview.raw_hash,
+        "reason":      tombstone_preview.reason,
+        "would_delete": {
+            "records":           would_delete.records,
+            "raw_artifacts":     would_delete.raw_artifacts,
+            "record_chunks":     would_delete.record_chunks,
+            "chunk_embeddings":  would_delete.chunk_embeddings,
+            "embedding_jobs":    would_delete.embedding_jobs,
+            "user_record_tags":  would_delete.user_record_tags,
+            "vec0_rows":         would_delete.vec0_rows,
+        },
+        "would_insert": {
+            "record_tombstones":  1,
+            // 1 audit entry: the real forget would write one,
+            // this dry-run did not.
+            "audit_log_entries":  1,
+        },
+    })
+}
+
 /// Round-22 (§-1.5 PR-5): parse an RFC3339 timestamp into the unix
 /// seconds form the `SearchFilter` stores. Used by `search_memories`
 /// for `since` / `until` parameters. Returns a string-form error so the
@@ -1197,6 +1238,40 @@ impl AnamnesisServer {
             .get("reason")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+        // Round 83 (PR-78e): dry_run=true returns the cascade
+        // preview without writing a tombstone and without
+        // appending an audit entry. Still admin-gated — the
+        // preview reveals raw_hash/native_path and destructive
+        // intent that should match the real forget's ACL.
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if dry_run {
+            let preview = self
+                .store
+                .preview_forget_record(&RecordId(record_id.to_string()), reason.as_deref())
+                .map_err(|e| format!("forget_record: {e}"))?;
+            return match preview {
+                anamnesis_store::ForgetRecordPreview::WouldForget {
+                    would_delete,
+                    tombstone_preview,
+                } => Ok(forget_dry_run_payload(
+                    "would-forget",
+                    &would_delete,
+                    &tombstone_preview,
+                )),
+                anamnesis_store::ForgetRecordPreview::AlreadyForgotten(r) => {
+                    let mut p = forget_payload("already-forgotten", r);
+                    p["dry_run"] = json!(true);
+                    Ok(p)
+                }
+                anamnesis_store::ForgetRecordPreview::NotFound => Err(format!(
+                    "forget_record: no record with id {record_id:?} — nothing to forget (dry-run)"
+                )),
+            };
+        }
 
         let outcome = self
             .store
@@ -2150,6 +2225,15 @@ fn tools_list_payload_all() -> Value {
                             "type": "string",
                             "description": "Optional operator-supplied reason. Stored on the tombstone \
                                             for the future `list_forgotten` view."
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 83: preview the cascade without writing. Returns `status: \
+                                            \"would-forget\"` plus `would_delete` (records, raw_artifacts, \
+                                            record_chunks, chunk_embeddings, embedding_jobs, user_record_tags, \
+                                            vec0_rows) and `would_insert` (record_tombstones, audit_log_entries). \
+                                            Does NOT mutate the store and does NOT append an audit entry."
                         }
                     },
                     "required": ["record_id"]

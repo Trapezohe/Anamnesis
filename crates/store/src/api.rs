@@ -312,6 +312,90 @@ pub enum ForgetRecordOutcome {
     NotFound,
 }
 
+/// Round 83 (PR-78e): per-table cascade counts a `forget_record`
+/// **would** delete (existing rows) or insert (tombstone, audit).
+/// All fields are `u64` so callers can render large stores
+/// without arithmetic surprises.
+///
+/// Counted via the same queries the real `forget_record` runs, so
+/// the preview can't silently drift from the actual cascade:
+///   * vec0 rows go through `vec_ext::count_vec_rows_for_record`
+///     (mirror of `delete_vec_rows_for_record`)
+///   * other tables resolved via FK cascade in the SQLite schema
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ForgetCascadeCounts {
+    /// The live `records` row itself (always `1` for `WouldForget`,
+    /// `0` for `AlreadyForgotten` / `NotFound`).
+    pub records: u64,
+    /// `raw_artifacts` rows attached to the record.
+    pub raw_artifacts: u64,
+    /// `record_chunks` rows (cascade source for embeddings).
+    pub record_chunks: u64,
+    /// `chunk_embeddings` rows. Goes via `record_chunks` cascade.
+    pub chunk_embeddings: u64,
+    /// `embedding_jobs` rows. Goes via `record_chunks` cascade.
+    pub embedding_jobs: u64,
+    /// `user_record_tags` rows. Tags are user-curated; they get
+    /// wiped on forget by the R78 FK cascade.
+    pub user_record_tags: u64,
+    /// vec0 rows — manually counted because vec0 has no FK.
+    pub vec0_rows: u64,
+}
+
+/// Round 83 (PR-78e): three-state preview of what
+/// [`Store::preview_forget_record`] sees before the operator
+/// commits the real delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetRecordPreview {
+    /// Live record exists — `forget_record` would write a
+    /// tombstone and cascade-delete the counted rows. The
+    /// `record` carries the would-be tombstone shape so the
+    /// operator sees exactly what gets recorded; `forgotten_at`
+    /// is `None` because it's stamped at commit-time, not now.
+    WouldForget {
+        /// Per-table count of rows the real `forget_record` would
+        /// delete (or, for vec0, manually remove via the matching
+        /// `(chunk_id, model_id)` keys).
+        would_delete: ForgetCascadeCounts,
+        /// Would-be tombstone shape — same as `ForgottenRecord`
+        /// minus `forgotten_at` (which is only stamped at commit
+        /// time).
+        tombstone_preview: ForgetTombstonePreview,
+    },
+    /// A tombstone is already present — `forget_record` would
+    /// return `AlreadyForgotten`, no writes. Carries the existing
+    /// tombstone so the operator sees "you already forgot this
+    /// at <when> for reason <why>."
+    AlreadyForgotten(ForgottenRecord),
+    /// Neither record nor tombstone — operator likely typo'd
+    /// the id. CLI exits non-zero, MCP returns the same shape.
+    NotFound,
+}
+
+/// Round 83: the would-be tombstone shape from a dry-run preview.
+/// Mirrors `ForgottenRecord` but with `forgotten_at` omitted (the
+/// real value is stamped only at commit time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetTombstonePreview {
+    /// The record id the operator is previewing — same shape as
+    /// the id passed to `preview_forget_record`.
+    pub record_id: RecordId,
+    /// Adapter id (e.g. `"claude-code"`) for the live record.
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// Native id at the source.
+    pub native_id: String,
+    /// Native path at the source (when the adapter has one).
+    pub native_path: Option<String>,
+    /// `raw_hash` of the live record — the same value the real
+    /// `forget_record` would pin onto the tombstone.
+    pub raw_hash: String,
+    /// Operator's `--reason` passed to the dry-run, echoed back
+    /// so they can see what the audit entry would carry.
+    pub reason: Option<String>,
+}
+
 /// Lightweight projection of `records` — everything the search +
 /// packer + MCP wire format actually need, *without* the heavy
 /// content / tags / metadata payload that an `AnamnesisRecord` carries.
@@ -1096,6 +1180,164 @@ impl Store {
             reason: reason.map(str::to_owned),
             forgotten_at: now,
         }))
+    }
+
+    /// Round 83 (PR-78e): dry-run preview of [`forget_record`].
+    ///
+    /// Returns:
+    ///   * [`ForgetRecordPreview::WouldForget`] with per-table
+    ///     cascade counts + would-be tombstone shape when the
+    ///     record is live;
+    ///   * [`ForgetRecordPreview::AlreadyForgotten`] (no work)
+    ///     when a tombstone exists;
+    ///   * [`ForgetRecordPreview::NotFound`] when neither.
+    ///
+    /// **Does not mutate the store** — all counts are taken
+    /// inside a single read-only transaction, the transaction is
+    /// rolled back at the end, and no `record_tombstones` /
+    /// audit-log write happens. The CLI / MCP surfaces are
+    /// responsible for not calling `Audit::record` either.
+    ///
+    /// vec0 row count uses the same `(chunk_id, model_id) →
+    /// vec_key` traversal as [`crate::vec_ext::delete_vec_rows_for_record`]
+    /// (via the mirror helper `count_vec_rows_for_record`) so the
+    /// preview can't drift from what the real delete would touch.
+    pub fn preview_forget_record(
+        &self,
+        id: &RecordId,
+        reason: Option<&str>,
+    ) -> Result<ForgetRecordPreview> {
+        let mut conn = self.conn.lock();
+        // We never commit — but using a transaction still gives a
+        // consistent point-in-time snapshot across the 7 counting
+        // queries below.
+        let tx = conn.transaction()?;
+
+        // Live record? If so, the preview will be WouldForget.
+        let live: Option<(String, String, String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT adapter, instance, native_id, native_path, raw_hash \
+                 FROM records WHERE id = ?1",
+                params![id.0],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some((adapter, instance, native_id, native_path, raw_hash)) = live {
+            // Count what cascade-delete would remove. Each of these
+            // tables either has a direct FK to records or cascades
+            // through record_chunks → records.
+            let raw_artifacts: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM raw_artifacts WHERE record_id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )?;
+            let record_chunks: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM record_chunks WHERE record_id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )?;
+            let chunk_embeddings: i64 = tx.query_row(
+                "SELECT COUNT(*) \
+                 FROM chunk_embeddings e \
+                 JOIN record_chunks rc ON rc.id = e.chunk_id \
+                 WHERE rc.record_id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )?;
+            let embedding_jobs: i64 = tx.query_row(
+                "SELECT COUNT(*) \
+                 FROM embedding_jobs j \
+                 JOIN record_chunks rc ON rc.id = j.chunk_id \
+                 WHERE rc.record_id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )?;
+            let user_record_tags: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM user_record_tags WHERE record_id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )?;
+            let vec0_rows = crate::vec_ext::count_vec_rows_for_record(&tx, &id.0)?;
+
+            // No commit — the read-only snapshot is dropped here.
+            drop(tx);
+
+            return Ok(ForgetRecordPreview::WouldForget {
+                would_delete: ForgetCascadeCounts {
+                    records: 1,
+                    raw_artifacts: raw_artifacts as u64,
+                    record_chunks: record_chunks as u64,
+                    chunk_embeddings: chunk_embeddings as u64,
+                    embedding_jobs: embedding_jobs as u64,
+                    user_record_tags: user_record_tags as u64,
+                    vec0_rows,
+                },
+                tombstone_preview: ForgetTombstonePreview {
+                    record_id: id.clone(),
+                    adapter,
+                    instance,
+                    native_id,
+                    native_path,
+                    raw_hash,
+                    reason: reason.map(str::to_owned),
+                },
+            });
+        }
+
+        // No live record. Maybe a tombstone exists.
+        type TombstoneCols = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            i64,
+        );
+        let existing: Option<TombstoneCols> = tx
+            .query_row(
+                "SELECT adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                 FROM record_tombstones WHERE record_id = ?1",
+                params![id.0],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        drop(tx);
+
+        Ok(match existing {
+            Some((adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at)) => {
+                ForgetRecordPreview::AlreadyForgotten(ForgottenRecord {
+                    record_id: id.clone(),
+                    adapter,
+                    instance,
+                    native_id,
+                    native_path,
+                    raw_hash,
+                    reason,
+                    forgotten_at,
+                })
+            }
+            None => ForgetRecordPreview::NotFound,
+        })
     }
 
     /// Round 75 (PR-75): remove a tombstone, so the same source can
@@ -5280,6 +5522,163 @@ mod tests {
         let phantom = RecordId::from_parts("claude-code", None, "never-existed");
         let outcome = store.forget_record(&phantom, None).unwrap();
         assert!(matches!(outcome, ForgetRecordOutcome::NotFound));
+    }
+
+    // ─── Round-83 PR-78e: preview_forget_record dry-run ─────────────
+
+    /// Live-record preview reports cascade counts that match what
+    /// the real `forget_record` would touch, and **does not mutate
+    /// the store** — the record is still searchable + tombstone
+    /// table empty + tags untouched after the preview returns.
+    #[test]
+    fn preview_forget_record_counts_live_cascade_without_mutating() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("claude-code", "rec-prev", "preview body", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store
+            .tag_record(
+                &r.id,
+                &["keep".into(), "todo".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let preview = store.preview_forget_record(&r.id, Some("test")).unwrap();
+        match preview {
+            ForgetRecordPreview::WouldForget {
+                would_delete,
+                tombstone_preview,
+            } => {
+                assert_eq!(would_delete.records, 1);
+                assert_eq!(would_delete.record_chunks, chunks.len() as u64);
+                assert_eq!(would_delete.user_record_tags, 2);
+                // No active model in this test → embeddings/jobs/vec0 are 0.
+                assert_eq!(would_delete.chunk_embeddings, 0);
+                assert_eq!(would_delete.embedding_jobs, 0);
+                assert_eq!(would_delete.vec0_rows, 0);
+                assert_eq!(tombstone_preview.adapter, "claude-code");
+                assert_eq!(tombstone_preview.native_id, "rec-prev");
+                assert_eq!(tombstone_preview.reason.as_deref(), Some("test"));
+            }
+            other => panic!("expected WouldForget, got {other:?}"),
+        }
+
+        // Mutation guard: the record is still live + tags intact +
+        // tombstone table empty.
+        assert!(store.get_record(&r.id).unwrap().is_some());
+        assert_eq!(store.user_tags(&r.id).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .list_forgotten(&ListForgottenFilter {
+                    source: None,
+                    instance: None,
+                    limit: 100,
+                })
+                .unwrap()
+                .len(),
+            0,
+            "dry-run must not write a tombstone"
+        );
+    }
+
+    /// Already-forgotten records report `AlreadyForgotten` with the
+    /// existing tombstone shape, no counts, no writes.
+    #[test]
+    fn preview_forget_record_already_forgotten_reports_tombstone() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("mem0", "rec-gone", "body", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        store.forget_record(&r.id, Some("init")).unwrap();
+
+        let preview = store.preview_forget_record(&r.id, Some("retry")).unwrap();
+        match preview {
+            ForgetRecordPreview::AlreadyForgotten(t) => {
+                assert_eq!(t.record_id, r.id);
+                assert_eq!(t.adapter, "mem0");
+                assert_eq!(
+                    t.reason.as_deref(),
+                    Some("init"),
+                    "must echo the *existing* tombstone reason, not the preview's reason"
+                );
+            }
+            other => panic!("expected AlreadyForgotten, got {other:?}"),
+        }
+    }
+
+    /// `NotFound` when neither a record nor a tombstone exists —
+    /// matches `forget_record` precedent so the CLI dry-run can
+    /// exit non-zero on typo'd ids without a special case.
+    #[test]
+    fn preview_forget_record_not_found_when_id_never_existed() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId::from_parts("claude-code", None, "never-existed");
+        let preview = store.preview_forget_record(&phantom, None).unwrap();
+        assert!(matches!(preview, ForgetRecordPreview::NotFound));
+    }
+
+    /// Preview-then-real-forget invariant: the counts the preview
+    /// emits match what the real forget actually removes. Pinned
+    /// because the preview and the delete walk separate code paths
+    /// and would silently drift if anyone changed one without the
+    /// other.
+    #[test]
+    fn preview_forget_record_counts_match_real_forget_cascade() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("claude-code", "rec-match", "match body", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        store
+            .tag_record(
+                &r.id,
+                &["a".into(), "b".into(), "c".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+
+        // Take the preview snapshot first.
+        let counts = match store.preview_forget_record(&r.id, None).unwrap() {
+            ForgetRecordPreview::WouldForget { would_delete, .. } => would_delete,
+            other => panic!("expected WouldForget, got {other:?}"),
+        };
+
+        // Pre-forget row counts.
+        let (chunks_before, tags_before): (i64, i64) = {
+            let c = store.conn();
+            let chunks: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM record_chunks WHERE record_id = ?1",
+                    params![r.id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let tags: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM user_record_tags WHERE record_id = ?1",
+                    params![r.id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (chunks, tags)
+        };
+
+        // Real forget runs and tombstones get written.
+        store.forget_record(&r.id, None).unwrap();
+
+        assert_eq!(counts.record_chunks, chunks_before as u64);
+        assert_eq!(counts.user_record_tags, tags_before as u64);
+        assert_eq!(counts.records, 1);
+        // Post-forget cleanup.
+        let chunks_after: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM record_chunks WHERE record_id = ?1",
+                params![r.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunks_after, 0, "real forget cascaded chunks");
     }
 
     /// After a record is forgotten, re-running upsert with the same
