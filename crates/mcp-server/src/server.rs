@@ -2477,11 +2477,33 @@ impl AnamnesisServer {
             bullets.push_str("(no related memories found)\n");
         }
 
+        // Round 100 (PR-78v): compact summary line so the LLM
+        // sees at a glance how many memories were attached and
+        // (when a user_tag filter was set) how many actually
+        // carried that tag. Cheap — `packed.len()` is in hand
+        // and `user_tags` already lives on `RecordHeader` from
+        // R78. Text-only, doesn't bloat the prompt token cost
+        // even when bullets is large.
+        let bullet_count = packed.len();
+        let matched_user_tag_count = match filter.user_tag.as_deref() {
+            Some(tag) => packed
+                .iter()
+                .filter(|p| p.record.user_tags.iter().any(|t| t == tag))
+                .count(),
+            None => 0,
+        };
+        let summary_line = match filter.user_tag.as_deref() {
+            Some(tag) => format!(
+                "Summary: bullets={bullet_count}; user_tag=\"{tag}\"; matched_user_tag={matched_user_tag_count}\n\n"
+            ),
+            None => format!("Summary: bullets={bullet_count}\n\n"),
+        };
+
         let user_text = format!(
             "The user is currently working on / discussing the following:\n\n{text}\n\n\
              Here are the most relevant memories Anamnesis has on file. Cite them when they \
              contradict or reinforce what the user is asking. Don't repeat verbatim; weave them \
-             into your reply where useful.\n\n---\n{bullets}",
+             into your reply where useful.\n\n---\n{summary_line}{bullets}",
         );
         Ok(json!({
             "description": "Inject the top-N related Anamnesis memories into the LLM's context.",
@@ -4443,6 +4465,96 @@ mod tests {
             !text.contains("from mem0"),
             "mem0 memory must be filtered out: {text}"
         );
+    }
+
+    // ─── Round-100 PR-78v: find_related summary line ─────────────
+
+    /// Default `find_related` prompt now carries a compact
+    /// `Summary: bullets=N` line above the bullets so the LLM
+    /// sees at a glance how many memories were attached.
+    #[tokio::test]
+    async fn prompt_find_related_includes_bullet_count_summary() {
+        let r1 = make_record("claude-code", "a", "alpha bright morning", 1700000000);
+        let r2 = make_record("mem0", "b", "alpha bright evening", 1700000010);
+        let s = server_with_records(&[r1, r2]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "find_related", "arguments": {"text": "alpha", "limit": 10}}),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("Summary: bullets=2"),
+            "summary line missing or wrong: {text}"
+        );
+        // No user_tag arg → no user_tag clause in the summary.
+        assert!(
+            !text.contains("user_tag="),
+            "user_tag absent should omit the tag clause: {text}"
+        );
+    }
+
+    /// When `user_tag` is set the summary also reports the
+    /// filter tag and how many of the surfaced bullets actually
+    /// carry that tag. Useful for the LLM to gauge filter
+    /// strength without parsing the bullets.
+    #[tokio::test]
+    async fn prompt_find_related_summary_reports_user_tag_matches() {
+        let r = make_record(
+            "claude-code",
+            "tagged-x",
+            "alpha bright morning",
+            1700000000,
+        );
+        let s = server_with_records(&[r]);
+        s.store
+            .tag_record(
+                &anamnesis_core::model::RecordId::from_parts("claude-code", None, "tagged-x"),
+                &["keep-forever".into()],
+                anamnesis_store::UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {"text": "alpha", "user_tag": "Keep-Forever"},
+                }),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("Summary: bullets=1"), "got {text}");
+        assert!(text.contains("user_tag=\"keep-forever\""), "got {text}");
+        assert!(text.contains("matched_user_tag=1"), "got {text}");
+    }
+
+    /// Empty result still gets a summary line — `bullets=0`
+    /// reaches the LLM as a structured zero, not implicit
+    /// silence.
+    #[tokio::test]
+    async fn prompt_find_related_summary_reports_zero_when_no_matches() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "find_related", "arguments": {"text": "nothing"}}),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("Summary: bullets=0"), "got {text}");
+        assert!(text.contains("(no related memories found)"));
     }
 
     // ─── Round-89 PR-78k: find_related explain ────────────────────
