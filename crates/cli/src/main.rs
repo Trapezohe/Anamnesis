@@ -284,6 +284,15 @@ enum Command {
         /// in a casual audit dump.
         #[arg(long)]
         include_sensitive: bool,
+        /// Round 90: also report `counts.total` and
+        /// `counts.by_source` (per-`(adapter, instance)`
+        /// tombstone totals). Counts respect the same
+        /// `--source` / `--instance` filter as the row list,
+        /// but they reflect the **full** matching set — not
+        /// just the current page — so an operator can see the
+        /// real shape of the tombstone table at a glance.
+        #[arg(long)]
+        include_counts: bool,
     },
 
     /// Forget a record permanently.
@@ -934,6 +943,7 @@ async fn main() -> Result<()> {
             limit,
             json,
             include_sensitive,
+            include_counts,
         } => cmd_list_forgotten(
             &data_dir,
             source.as_deref(),
@@ -941,6 +951,7 @@ async fn main() -> Result<()> {
             limit,
             json,
             include_sensitive,
+            include_counts,
         ),
         Command::Forget {
             record_id,
@@ -3322,6 +3333,7 @@ fn cmd_dedupe(
 ///
 /// Read-only — never writes to the store or audit log. Pure audit
 /// surface, distinct from the `forget` mutation.
+#[allow(clippy::too_many_arguments)]
 fn cmd_list_forgotten(
     data_dir: &std::path::Path,
     source: Option<&str>,
@@ -3329,6 +3341,7 @@ fn cmd_list_forgotten(
     limit: u32,
     json: bool,
     include_sensitive: bool,
+    include_counts: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::ListForgottenFilter {
@@ -3337,9 +3350,18 @@ fn cmd_list_forgotten(
         limit,
     };
     let rows = store.list_forgotten(&filter)?;
+    // Round 90: opt-in tombstone aggregation. The `counts`
+    // block uses the same source/instance filter as the row
+    // list but reflects the full matching set (not just the
+    // current page).
+    let counts = if include_counts {
+        Some(store.count_forgotten_by_source(&filter)?)
+    } else {
+        None
+    };
 
     if json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "count": rows.len(),
             "limit": limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT),
             "sensitive_included": include_sensitive,
@@ -3361,6 +3383,9 @@ fn cmd_list_forgotten(
                 row
             }).collect::<Vec<_>>(),
         });
+        if let Some(buckets) = &counts {
+            payload["counts"] = render_forgotten_counts_json(buckets);
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if rows.is_empty() {
         println!("no forgotten records");
@@ -3405,8 +3430,48 @@ fn cmd_list_forgotten(
                 }
             }
         }
+        if let Some(buckets) = &counts {
+            println!();
+            let total: u64 = buckets.iter().map(|b| b.forgotten_count).sum();
+            println!("Tombstone totals (filter-scoped):");
+            println!("  total: {total}");
+            for b in buckets {
+                let inst = if b.instance.is_empty() {
+                    "(default)".to_string()
+                } else {
+                    b.instance.clone()
+                };
+                println!(
+                    "  {adapter:<14} {inst:<14} {count}",
+                    adapter = b.adapter,
+                    inst = inst,
+                    count = b.forgotten_count,
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// Round 90 (PR-78l): render the `count_forgotten_by_source`
+/// result as the shared `counts` JSON block. CLI and MCP both
+/// emit this shape so scripts can branch on the same field set.
+fn render_forgotten_counts_json(
+    buckets: &[anamnesis_store::ForgottenSourceCount],
+) -> serde_json::Value {
+    let total: u64 = buckets.iter().map(|b| b.forgotten_count).sum();
+    serde_json::json!({
+        "total": total,
+        "by_source": buckets.iter().map(|b| serde_json::json!({
+            "adapter": b.adapter,
+            "instance": if b.instance.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(b.instance.clone())
+            },
+            "forgotten_count": b.forgotten_count,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -87,6 +87,27 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 90 (PR-78l): render `count_forgotten_by_source` as
+/// the shared `counts` block for MCP `list_forgotten { include_counts: true }`.
+/// Same shape as the CLI JSON payload — `total` plus
+/// `by_source[]` with each `(adapter, instance, forgotten_count)`.
+/// Default instance serialises as JSON `null`.
+fn render_forgotten_counts(buckets: &[anamnesis_store::ForgottenSourceCount]) -> Value {
+    let total: u64 = buckets.iter().map(|b| b.forgotten_count).sum();
+    json!({
+        "total": total,
+        "by_source": buckets.iter().map(|b| json!({
+            "adapter": b.adapter,
+            "instance": if b.instance.is_empty() {
+                Value::Null
+            } else {
+                Value::String(b.instance.clone())
+            },
+            "forgotten_count": b.forgotten_count,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Round 89 (PR-78k): compact text rendering of
 /// `RecordScoreExplain` for the `find_related { explain: true }`
 /// prompt. Same numeric fields as `render_score_explain` but
@@ -1582,6 +1603,11 @@ impl AnamnesisServer {
             .get("include_sensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 90 (PR-78l): opt-in aggregate counts.
+        let include_counts = args
+            .get("include_counts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let filter = anamnesis_store::ListForgottenFilter {
             source,
@@ -1592,6 +1618,15 @@ impl AnamnesisServer {
             .store
             .list_forgotten(&filter)
             .map_err(|e| format!("list_forgotten: {e}"))?;
+        let counts = if include_counts {
+            Some(
+                self.store
+                    .count_forgotten_by_source(&filter)
+                    .map_err(|e| format!("list_forgotten counts: {e}"))?,
+            )
+        } else {
+            None
+        };
 
         let effective_limit = limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT);
         let rows_payload: Vec<Value> = rows
@@ -1614,12 +1649,16 @@ impl AnamnesisServer {
                 row
             })
             .collect();
-        Ok(json!({
+        let mut payload = json!({
             "count":              rows.len(),
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
             "rows":               rows_payload,
-        }))
+        });
+        if let Some(buckets) = &counts {
+            payload["counts"] = render_forgotten_counts(buckets);
+        }
+        Ok(payload)
     }
 
     /// Round 77 (PR-77): MCP audit view for raw-hash duplicates.
@@ -2736,6 +2775,11 @@ fn tools_list_payload_all() -> Value {
                             "type": "boolean",
                             "default": false,
                             "description": "Reveal `native_path`, `raw_hash`, `reason`. Off by default."
+                        },
+                        "include_counts": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 90: also return a `counts` block with `total` + `by_source[]` (per-`(adapter, instance)` tombstone totals). Counts respect the same source/instance filter as the row list but reflect the full matching set — not just the current page."
                         }
                     }
                 }
