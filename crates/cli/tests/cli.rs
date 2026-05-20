@@ -2063,6 +2063,138 @@ fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
         );
 }
 
+// ─── Round-86 PR-78h: source show ──────────────────────────────────
+
+/// `source show` on an unregistered adapter exits non-zero
+/// with "source not found" — typo'd ids stay loud.
+#[test]
+fn source_show_missing_source_exits_nonzero() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "show", "claude-code"])
+        .assert()
+        .failure()
+        .stderr(contains("source not found"));
+}
+
+/// `source show <id> --json` returns counts + (empty)
+/// recent_import_errors for a fresh registered source.
+#[test]
+fn source_show_json_returns_counts_and_empty_errors() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "show", "claude-code", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["source"]["adapter"], "claude-code");
+    assert!(v["source"]["instance"].is_null());
+    assert_eq!(v["source"]["record_count"], 0);
+    assert_eq!(v["source"]["tagged_record_count"], 0);
+    assert_eq!(v["recent_import_errors"].as_array().unwrap().len(), 0);
+}
+
+/// After seeding records + tagging one + logging an import
+/// error, `source show --json` surfaces both pieces of state
+/// in one call, scoped to the requested `(adapter, instance)`.
+#[test]
+fn source_show_json_surfaces_tagged_count_and_recent_errors() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::{Store, UserTagOperation};
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+
+    // Seed via store directly.
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "a"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "a".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-a".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    store
+        .tag_record(&r.id, &["keep".into()], UserTagOperation::Add)
+        .unwrap();
+    store
+        .log_import_error(
+            "claude-code",
+            None,
+            Some("a"),
+            Some("/tmp/cc/a.md"),
+            "parse",
+            "boom",
+        )
+        .unwrap();
+    drop(store);
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "show", "claude-code", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["source"]["record_count"], 1);
+    assert_eq!(v["source"]["tagged_record_count"], 1);
+    let errors = v["recent_import_errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["phase"], "parse");
+    assert_eq!(errors[0]["error"], "boom");
+    assert_eq!(errors[0]["native_path"], "/tmp/cc/a.md");
+}
+
 // ─── Round-84 PR-78f: audit tail ────────────────────────────────────
 
 /// Empty store has no audit.log → CLI prints a friendly empty
