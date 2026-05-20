@@ -2063,6 +2063,115 @@ fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
         );
 }
 
+// ─── Round-99 PR-78u: source list --source / --instance ───────────
+
+/// `--source` narrows the JSON `sources[]` array to one adapter.
+/// Symmetric with the R96 MCP `list_sources { source }` filter.
+#[test]
+fn source_list_source_filter_narrows_json_to_one_adapter() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/m"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list", "--source", "mem0", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = v["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["adapter"], "mem0");
+}
+
+/// `--source` + `--instance` narrows to a single
+/// `(adapter, instance)`. Matches R96 MCP `list_sources`
+/// filter semantic where both must match.
+#[test]
+fn source_list_source_plus_instance_filter_narrows_to_one_row() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "add",
+            "mem0",
+            "--instance",
+            "prod",
+            "--path",
+            "/p",
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--instance", "dev", "--path", "/d"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "list",
+            "--source",
+            "mem0",
+            "--instance",
+            "prod",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = v["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["instance"], "prod");
+}
+
+/// Human output: filter that matches nothing prints
+/// "no sources matched filter" (NOT the empty-registry
+/// "no sources registered" prose), so the operator can
+/// distinguish "I typoed the source name" from "I have no
+/// sources at all."
+#[test]
+fn source_list_filter_no_match_prints_filter_specific_message() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/c"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list", "--source", "no-such-adapter"])
+        .assert()
+        .success()
+        .stdout(contains("no sources matched filter"));
+}
+
 // ─── Round-91 PR-78m: audit tail --csv ─────────────────────────────
 
 /// `--csv` emits a header plus one row per matched audit entry,
