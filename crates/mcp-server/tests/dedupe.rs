@@ -277,3 +277,79 @@ async fn dedupe_tools_list_advertises_source_and_instance_args() {
         "dedupe must advertise `instance` arg: {dedupe}"
     );
 }
+
+// ─── Round-98 PR-78t: MCP dedupe include_counts ────────────────────
+
+#[tokio::test]
+async fn dedupe_default_response_has_no_counts_block() {
+    let (server, _data) = build_bundle(false);
+    let resp = server.handle(tool_call("dedupe", json!({}))).await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert!(
+        payload.get("counts").is_none(),
+        "default dedupe must not carry counts; got {payload}"
+    );
+}
+
+#[tokio::test]
+async fn dedupe_include_counts_reflects_full_set_ignoring_limit() {
+    let (server, _data) = build_bundle_two_groups();
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"limit": 1, "include_counts": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 1, "rows respect limit");
+    let counts = &payload["counts"];
+    // seed_two_groups builds h-mixed (mem0 + claude-code) and
+    // h-cc (2× claude-code) — 2 groups, 4 records.
+    assert_eq!(counts["total_groups"], 2);
+    assert_eq!(counts["total_records"], 4);
+    let by_source = counts["by_source"].as_array().unwrap();
+    let cc = by_source
+        .iter()
+        .find(|b| b["adapter"] == "claude-code")
+        .unwrap();
+    let mem = by_source.iter().find(|b| b["adapter"] == "mem0").unwrap();
+    assert_eq!(cc["duplicate_record_count"], 3);
+    assert_eq!(mem["duplicate_record_count"], 1);
+}
+
+#[tokio::test]
+async fn dedupe_counts_block_carries_no_sensitive_fields() {
+    let (server, _data) = build_bundle_two_groups();
+    let resp = server
+        .handle(tool_call("dedupe", json!({"include_counts": true})))
+        .await;
+    let payload = extract_payload(&resp);
+    let counts_str = serde_json::to_string(&payload["counts"]).unwrap();
+    for forbidden in ["h-mixed", "h-cc", "raw_hash", "native_path", "native_id"] {
+        assert!(
+            !counts_str.contains(forbidden),
+            "counts must not leak {forbidden:?}: {counts_str}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dedupe_tools_list_schema_advertises_include_counts() {
+    let (server, _data) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let dedupe = tools
+        .iter()
+        .find(|t| t["name"] == "dedupe")
+        .expect("dedupe in tools/list");
+    let props = &dedupe["inputSchema"]["properties"];
+    assert_eq!(props["include_counts"]["type"], "boolean");
+}

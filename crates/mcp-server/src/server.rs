@@ -135,6 +135,28 @@ fn render_audit_tail_csv(rows: &[anamnesis_core::AuditTailRow]) -> String {
     out
 }
 
+/// Round 98 (PR-78t): render `count_duplicate_raw_hashes_by_source`
+/// as the MCP `counts` block for `dedupe { include_counts: true }`.
+/// Same shape as the CLI `--include-counts` JSON in R97 — sources
+/// share `(adapter, instance)` keys, instance serialises as
+/// JSON `null` for the default. Operators can read either surface
+/// without per-tool field translation.
+fn render_dedupe_counts(c: &anamnesis_store::DuplicateRawHashCounts) -> Value {
+    json!({
+        "total_groups":  c.total_groups,
+        "total_records": c.total_records,
+        "by_source": c.by_source.iter().map(|b| json!({
+            "adapter": b.adapter,
+            "instance": if b.instance.is_empty() {
+                Value::Null
+            } else {
+                Value::String(b.instance.clone())
+            },
+            "duplicate_record_count": b.duplicate_record_count,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Round 90 (PR-78l): render `count_forgotten_by_source` as
 /// the shared `counts` block for MCP `list_forgotten { include_counts: true }`.
 /// Same shape as the CLI JSON payload — `total` plus
@@ -1796,6 +1818,15 @@ impl AnamnesisServer {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
 
+        // Round 98 (PR-78t): opt-in filter-scoped aggregate.
+        // Symmetric with R97's CLI `--include-counts`. Counts
+        // ignore `limit` and reflect the full matching set; per-
+        // source breakdown counts records, not group memberships.
+        let include_counts = args
+            .get("include_counts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let filter = anamnesis_store::DuplicateRawHashFilter {
             source: source.clone(),
             instance: instance.clone(),
@@ -1805,6 +1836,15 @@ impl AnamnesisServer {
             .store
             .list_duplicate_raw_hashes_filtered(&filter)
             .map_err(|e| format!("dedupe: {e}"))?;
+        let counts = if include_counts {
+            Some(
+                self.store
+                    .count_duplicate_raw_hashes_by_source(&filter)
+                    .map_err(|e| format!("dedupe counts: {e}"))?,
+            )
+        } else {
+            None
+        };
         let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
         let payload_groups: Vec<Value> = groups
             .iter()
@@ -1833,7 +1873,7 @@ impl AnamnesisServer {
                 group
             })
             .collect();
-        Ok(json!({
+        let mut payload = json!({
             "count":              groups.len(),
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
@@ -1842,7 +1882,11 @@ impl AnamnesisServer {
                 "instance": instance,
             },
             "groups":             payload_groups,
-        }))
+        });
+        if let Some(c) = &counts {
+            payload["counts"] = render_dedupe_counts(c);
+        }
+        Ok(payload)
     }
 
     /// Round 78 (PR-78): MCP-side `tag_record`. Admin-gated
@@ -3009,6 +3053,11 @@ fn tools_list_payload_all() -> Value {
                             "type": "boolean",
                             "default": false,
                             "description": "Reveal `raw_hash` and `native_path`. Off by default."
+                        },
+                        "include_counts": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 98: attach a `counts` block with `total_groups` (duplicate groups matching the filter), `total_records` (sum of live records across whole groups), and `by_source[]` (per-`(adapter, instance)` duplicate-record breakdown). Counts ignore `limit` and reflect the full filter-scoped set. `by_source` counts records (not group memberships) so mixed-source groups don't double-count: sum(by_source.duplicate_record_count) == total_records."
                         }
                     }
                 }
