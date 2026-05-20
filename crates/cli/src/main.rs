@@ -145,6 +145,15 @@ enum Command {
         /// shape unchanged.
         #[arg(long)]
         trace: bool,
+        /// Round 79 (PR-78b): restrict to records that carry this
+        /// user tag (set via `anamnesis tag-record`). The filter
+        /// pushes down into FTS, BLOB-vec fallback, and sqlite-vec
+        /// at the SQL recall stage, so a single tagged record
+        /// surfaces even in a 1700-untagged corpus. Tag is
+        /// normalised the same way `tag-record` normalises writes
+        /// (`trim().to_lowercase()`).
+        #[arg(long)]
+        user_tag: Option<String>,
     },
 
     /// Apply or remove user tags on a record (local overlay).
@@ -744,6 +753,7 @@ async fn main() -> Result<()> {
             mode,
             json,
             trace,
+            user_tag,
         } => {
             cmd_search(
                 &data_dir,
@@ -758,6 +768,7 @@ async fn main() -> Result<()> {
                 &mode,
                 json,
                 trace,
+                user_tag.as_deref(),
             )
             .await
         }
@@ -2183,6 +2194,7 @@ async fn cmd_search(
     mode_str: &str,
     json: bool,
     trace: bool,
+    user_tag: Option<&str>,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let mode = match mode_str {
@@ -2228,6 +2240,14 @@ async fn cmd_search(
         _ => Some(open_active_provider(data_dir, &store)?),
     };
 
+    // Round 79: normalise the user-tag through the same code
+    // `tag_record` writes through, so `--user-tag Keep` finds
+    // tags stored as `keep`.
+    let user_tag_normalised = match user_tag {
+        Some(raw) => Some(anamnesis_store::normalize_user_tag_name(raw)?),
+        None => None,
+    };
+
     // PR-C: build the SQL-level filter from the same CLI knobs the
     // post-filter used to consume. We turn `Kind` / `Scope` back into
     // their lower-case string form to match how the store writes them.
@@ -2238,6 +2258,7 @@ async fn cmd_search(
         scope: scope_filter.map(|s| format!("{s:?}").to_lowercase()),
         time_from,
         time_to,
+        user_tag: user_tag_normalised,
     };
 
     // Round 76: always use the traced primitive so the live search
@@ -2990,6 +3011,10 @@ async fn cmd_eval_quality(
             scope: scope_filter.map(|s| format!("{s:?}").to_lowercase()),
             time_from: None,
             time_to: None,
+            // Round 79: eval-quality intentionally doesn't gate on
+            // user_tag (a judgment is about query relevance, not
+            // tag membership). Future PR-78c could add it.
+            user_tag: None,
         };
         let hits = run_search(
             &store,

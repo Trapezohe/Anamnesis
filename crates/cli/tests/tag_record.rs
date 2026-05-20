@@ -212,3 +212,69 @@ fn tag_record_json_payload_carries_normalised_state() {
     assert_eq!(v["changed"], 2);
     assert_eq!(v["user_tags"], serde_json::json!(["keep", "todo"]));
 }
+
+// ─── Round-79 PR-78b: search --user-tag filter ─────────────────────
+
+/// `--user-tag` returns only records carrying that tag, and
+/// normalises case+whitespace through the shared helper so a
+/// query for `KEEP` hits a tag stored as `keep`.
+#[test]
+fn search_user_tag_filter_hits_only_tagged_records() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "Keep-Forever"])
+        .assert()
+        .success();
+
+    // With the tag: 1 hit.
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "search",
+            "uniqueTagMarkerR78",
+            "--mode",
+            "fulltext",
+            "--json",
+            "--user-tag",
+            "  KEEP-FOREVER  ",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["record_id"], rid);
+    assert_eq!(results[0]["user_tags"], serde_json::json!(["keep-forever"]));
+}
+
+#[test]
+fn search_user_tag_filter_no_match_returns_empty() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    // No tag added — query for any tag must return zero hits.
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "search",
+            "uniqueTagMarkerR78",
+            "--mode",
+            "fulltext",
+            "--json",
+            "--user-tag",
+            "never-applied",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["results"].as_array().unwrap().len(), 0);
+}

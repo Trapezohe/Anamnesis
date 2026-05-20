@@ -99,6 +99,17 @@ pub fn ensure_vec_table(tx: &Transaction<'_>, dim: i64) -> rusqlite::Result<Stri
     //   embedding float[N] distance=cosine — the vector itself
     //   adapter / instance / kind / scope / created_at — metadata,
     //   filterable inside the KNN scan (mirrors `SearchFilter`)
+    //   record_id TEXT                     — metadata column added in
+    //                                        Round 79 (PR-78b) so
+    //                                        `--user-tag` can push
+    //                                        `record_id IN (SELECT …
+    //                                        FROM user_record_tags …)`
+    //                                        inside the KNN MATERIALIZED
+    //                                        CTE. Without this column,
+    //                                        the filter would have to
+    //                                        run post-RRF, which loses
+    //                                        minority-tag records under
+    //                                        skewed corpora.
     //   +chunk_id TEXT                     — auxiliary, returned but
     //                                        not indexed
     let ddl = format!(
@@ -111,6 +122,7 @@ pub fn ensure_vec_table(tx: &Transaction<'_>, dim: i64) -> rusqlite::Result<Stri
              kind       TEXT,
              scope      TEXT,
              created_at INTEGER,
+             record_id  TEXT,
              +chunk_id  TEXT
          );"
     );
@@ -196,16 +208,23 @@ pub fn backfill_if_pending(conn: &mut Connection) -> rusqlite::Result<()> {
 
     for dim in dims {
         let tx = conn.transaction()?;
+        let table = vec_table_name(dim);
+        // Round 79 (PR-78b): vec0 schema gained a `record_id`
+        // metadata column. A pre-PR-78b store will have the old
+        // 8-column table on disk; `CREATE VIRTUAL TABLE IF NOT
+        // EXISTS` would no-op and the new INSERT would fail
+        // because `record_id` isn't part of that schema. DROP
+        // first, then recreate with the current schema. Safe
+        // because vec0 is a rebuildable index — the BLOB column
+        // in `chunk_embeddings` is the source of truth.
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
         let table = ensure_vec_table(&tx, dim)?;
-        // Clean re-populate. The registry insert already happened, so a
-        // crash mid-loop just leaves the flag set and we retry next open.
-        tx.execute_batch(&format!("DELETE FROM {table};"))?;
         let inserted = tx.execute(
             &format!(
                 "INSERT INTO {table}( \
                      vec_key, model_id, embedding, \
                      adapter, instance, kind, scope, created_at, \
-                     chunk_id) \
+                     record_id, chunk_id) \
                  SELECT \
                      e.model_id || char(31) || e.chunk_id, \
                      e.model_id, \
@@ -215,6 +234,7 @@ pub fn backfill_if_pending(conn: &mut Connection) -> rusqlite::Result<()> {
                      r.kind, \
                      r.scope, \
                      r.created_at, \
+                     rc.record_id, \
                      e.chunk_id \
                  FROM chunk_embeddings e \
                  JOIN record_chunks rc ON rc.id = e.chunk_id \
@@ -287,11 +307,11 @@ pub fn upsert_vec_row(
             "INSERT INTO {table}( \
                  vec_key, model_id, embedding, \
                  adapter, instance, kind, scope, created_at, \
-                 chunk_id) \
+                 record_id, chunk_id) \
              SELECT \
                  ?1, ?2, ?3, \
                  r.adapter, COALESCE(r.instance, ''), r.kind, r.scope, r.created_at, \
-                 ?4 \
+                 rc.record_id, ?4 \
              FROM record_chunks rc \
              JOIN records r ON r.id = rc.record_id \
              WHERE rc.id = ?4"
