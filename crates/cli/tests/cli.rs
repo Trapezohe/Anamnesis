@@ -262,6 +262,181 @@ fn source_remove_drops_entry() {
         .stdout(contains("no sources registered"));
 }
 
+/// Round 82 PR-78d: `source list` table renders the new `tagged`
+/// column. Seed records directly via the store, tag one, and
+/// verify the header + a count line appear together.
+#[test]
+fn source_list_reports_tagged_record_count_column() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::{Store, UserTagOperation};
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+
+    // Seed 3 records on claude-code; tag only 1.
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    for n in ["a", "b", "c"] {
+        let r = AnamnesisRecord {
+            id: RecordId::from_parts("claude-code", None, n),
+            source: SourceDescriptor {
+                adapter: "claude-code".into(),
+                instance: None,
+                version: "0".into(),
+            },
+            content: format!("body for {n}"),
+            embedding: None,
+            scope: Scope::User,
+            kind: Kind::Fact,
+            created_at: Utc::now(),
+            updated_at: None,
+            tags: vec![],
+            metadata: Default::default(),
+            provenance: Provenance {
+                native_id: n.into(),
+                native_path: None,
+                captured_at: Utc::now(),
+                raw_hash: format!("h-{n}"),
+                derived_from: None,
+            },
+            schema_version: SCHEMA_VERSION,
+        };
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+    }
+    let id_a = RecordId::from_parts("claude-code", None, "a");
+    store
+        .tag_record(
+            &id_a,
+            &["keep".into(), "todo".into()],
+            UserTagOperation::Add,
+        )
+        .unwrap();
+    drop(store); // release the lock before the CLI re-opens it
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("tagged"),
+        "header row must include `tagged`: {stdout}"
+    );
+    // The data row must carry: adapter=claude-code, records=3,
+    // tagged=1. We assert these without pinning column widths.
+    let data_line = stdout
+        .lines()
+        .find(|l| l.starts_with("claude-code"))
+        .unwrap_or_else(|| panic!("no claude-code data line in:\n{stdout}"));
+    let tokens: Vec<&str> = data_line.split_whitespace().collect();
+    // adapter, instance(possibly "-"), records, chunks, tagged, ...
+    assert_eq!(tokens[0], "claude-code");
+    assert!(
+        tokens.contains(&"3"),
+        "records=3 must appear in row: {data_line}"
+    );
+    // tagged=1: this is the only `1` token sandwiched between
+    // record/chunk counts and the `<never>` last_import marker.
+    assert!(
+        tokens.contains(&"1"),
+        "tagged=1 must appear in row: {data_line}"
+    );
+}
+
+/// Status JSON also surfaces `tagged_record_count` so a script
+/// that consumes `anamnesis status --json` doesn't need a second
+/// store round-trip for the same answer.
+#[test]
+fn status_json_surfaces_tagged_record_count_per_source() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::{Store, UserTagOperation};
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "z"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "z body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "z".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-z".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    store
+        .tag_record(&r.id, &["keep".into()], UserTagOperation::Add)
+        .unwrap();
+    drop(store);
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let sources = v["per_source"].as_array().unwrap_or_else(|| {
+        // Fall back to `sources` if the JSON layout changes — we
+        // only care that the field is present at depth-1.
+        v["sources"].as_array().expect("per-source array somewhere")
+    });
+    let cc = sources
+        .iter()
+        .find(|s| s["adapter"] == "claude-code")
+        .expect("claude-code source in status JSON");
+    assert_eq!(
+        cc["tagged_record_count"], 1,
+        "status --json must surface tagged_record_count per source"
+    );
+}
+
 #[test]
 fn model_list_shows_five_curated_with_active() {
     let dir = tmp_dir();

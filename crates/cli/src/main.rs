@@ -1245,6 +1245,11 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
                     "last_import_at": r.source.last_import_at,
                     "record_count": r.record_count,
                     "chunk_count": r.chunk_count,
+                    // Round-82: per-source distinct-record count
+                    // for `user_record_tags`. Lets `status --json`
+                    // consumers spot "where do my keep-forever
+                    // records live" without another round trip.
+                    "tagged_record_count": r.tagged_record_count,
                     // Round-16 additions — let consumers branch on
                     // staleness without re-computing it from `now`.
                     "freshness": freshness.label,
@@ -1480,13 +1485,15 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             // Round-9: show per-source counts alongside last_import so
             // operators can spot "registered but empty" sources at a
             // glance — same signal MCP agents get from list_sources.
+            // Round-82: add `tagged` column so operators can see
+            // where their curated `user_tags` actually live.
             let rows = store.list_sources_with_counts()?;
             if rows.is_empty() {
                 println!("no sources registered");
             } else {
                 println!(
-                    "{:<14} {:<14} {:<8} {:<8} {:<20} {}",
-                    "adapter", "instance", "records", "chunks", "last_import", "location"
+                    "{:<14} {:<14} {:<8} {:<8} {:<8} {:<20} {}",
+                    "adapter", "instance", "records", "chunks", "tagged", "last_import", "location"
                 );
                 for r in rows {
                     let last = r
@@ -1499,11 +1506,12 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
                         })
                         .unwrap_or_else(|| "<never>".into());
                     println!(
-                        "{:<14} {:<14} {:<8} {:<8} {:<20} {}",
+                        "{:<14} {:<14} {:<8} {:<8} {:<8} {:<20} {}",
                         r.source.adapter,
                         r.source.instance,
                         r.record_count,
                         r.chunk_count,
+                        r.tagged_record_count,
                         last,
                         r.source.location.unwrap_or_default(),
                     );
