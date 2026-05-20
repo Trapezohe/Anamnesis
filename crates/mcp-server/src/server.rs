@@ -496,7 +496,7 @@ impl AnamnesisServer {
         let result = match name.as_str() {
             "search_memories" => self.tool_search_memories(args.clone()).await,
             "get_record" => self.tool_get_record(args.clone()).await,
-            "list_sources" => self.tool_list_sources().await,
+            "list_sources" => self.tool_list_sources(args.clone()).await,
             "import_source" => self.tool_import_source(args.clone()).await,
             "trace_provenance" => self.tool_trace_provenance(args.clone()).await,
             "doctor" => self.tool_doctor(args.clone()).await,
@@ -991,8 +991,22 @@ impl AnamnesisServer {
         }))
     }
 
-    async fn tool_list_sources(&self) -> Result<Value, String> {
+    async fn tool_list_sources(&self, args: Value) -> Result<Value, String> {
         let store = &self.store;
+        // Round 96 (PR-78r): optional `source` + `instance`
+        // filter narrows the `sources[]` array only — the
+        // top-level `stats` block still reflects the whole
+        // store so existing R0 clients reading `stats.records`
+        // see the same values they always have.
+        let source_filter = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let instance_filter = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
         let stats = store.stats().map_err(|e| format!("stats: {e}"))?;
         // Round-9: per-source counts + last_import_at let an agent
         // distinguish "bad retrieval" from "stale source" without a
@@ -1002,8 +1016,19 @@ impl AnamnesisServer {
         let rows = store
             .list_sources_with_counts()
             .map_err(|e| format!("list: {e}"))?;
+        let filtered: Vec<&anamnesis_store::SourceWithCounts> = rows
+            .iter()
+            .filter(|r| match source_filter {
+                Some(s) => r.source.adapter == s,
+                None => true,
+            })
+            .filter(|r| match instance_filter {
+                Some(i) => r.source.instance == i,
+                None => true,
+            })
+            .collect();
         Ok(json!({
-            "sources": rows.iter().map(|r| json!({
+            "sources": filtered.iter().map(|r| json!({
                 "adapter": r.source.adapter,
                 "instance": if r.source.instance.is_empty() {
                     Value::Null
@@ -1858,6 +1883,13 @@ impl AnamnesisServer {
             anamnesis_store::UserTagOperation::Remove => "remove",
             anamnesis_store::UserTagOperation::Replace => "replace",
         };
+        // Round 96 (PR-78r): opt-in stats block — `total_user_tags`
+        // after the mutation. Default off; existing R78 / R81
+        // consumers see the same wire shape.
+        let include_stats = args
+            .get("include_stats")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let mutation = self
             .store
@@ -1875,13 +1907,19 @@ impl AnamnesisServer {
             }),
         ));
 
-        Ok(json!({
+        let mut payload = json!({
             "record_id": mutation.record_id.0,
             "operation": op_label,
             "requested": mutation.requested,
             "changed":   mutation.changed,
             "user_tags": mutation.user_tags,
-        }))
+        });
+        if include_stats {
+            payload["stats"] = json!({
+                "total_user_tags": mutation.user_tags.len(),
+            });
+        }
+        Ok(payload)
     }
 
     /// Round 84 (PR-78f): MCP-side `audit_tail`. Admin-gated
@@ -2698,8 +2736,23 @@ fn tools_list_payload_all() -> Value {
                 "name": "list_sources",
                 "description": "List registered sources + active model + counters. Each source carries \
                                 `record_count`, `chunk_count`, `tagged_record_count` (R82: distinct \
-                                records with ≥1 user_tag), `last_import_at`, and `location`.",
-                "inputSchema": {"type": "object", "properties": {}}
+                                records with ≥1 user_tag), `last_import_at`, and `location`. \
+                                Round 96: optional `source` / `instance` narrow the `sources[]` array; \
+                                the top-level `stats` block keeps reporting the whole store so existing \
+                                consumers reading `stats.records` are unaffected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Round 96: restrict the sources array to one adapter id (e.g. `mem0`)."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Round 96: restrict the sources array to one instance discriminator. Only meaningful when `source` is also set."
+                        }
+                    }
+                }
             },
             {
                 "name": "source_show",
@@ -2991,6 +3044,11 @@ fn tools_list_payload_all() -> Value {
                             "enum": ["add", "remove", "replace"],
                             "default": "add",
                             "description": "`add` inserts (set semantic); `remove` deletes (set semantic); `replace` installs `tags` as the full post-call set, deleting anything not in the input."
+                        },
+                        "include_stats": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 96: append a `stats` block (`total_user_tags`: post-mutation tag count) to the response. Default off — keeps the wire shape back-compatible."
                         }
                     },
                     "required": ["record_id", "tags"]
