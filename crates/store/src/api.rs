@@ -3249,6 +3249,107 @@ impl Store {
         };
         Ok(rows)
     }
+
+    /// Round 86 (PR-78h): per-`(adapter, instance)` import-error
+    /// view for `anamnesis source show` / MCP `source_show`.
+    /// **Distinct from `recent_import_errors(Some(adapter), ..)`**:
+    /// that helper is adapter-scoped, this one also filters by
+    /// instance, so a `(mem0, self-hosted)` view can't leak rows
+    /// from `(mem0, cloud)`. The `idx_errors_source` index on
+    /// `(adapter, instance, occurred_at DESC)` (migration 0002)
+    /// keeps this O(log N + limit).
+    ///
+    /// `instance = None` matches rows stored as `""` (the default
+    /// instance), same convention every other read path uses.
+    pub fn recent_import_errors_for_source(
+        &self,
+        adapter: &str,
+        instance: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ImportErrorRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let inst = instance.unwrap_or("");
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT adapter, instance, native_id, native_path, phase, error, occurred_at \
+             FROM import_errors \
+             WHERE adapter = ?1 AND instance = ?2 \
+             ORDER BY occurred_at DESC, id DESC \
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![adapter, inst, limit as i64], |r| {
+                Ok(ImportErrorRow {
+                    adapter: r.get(0)?,
+                    instance: r.get(1)?,
+                    native_id: r.get(2)?,
+                    native_path: r.get(3)?,
+                    phase: r.get(4)?,
+                    error: r.get(5)?,
+                    occurred_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Round 86 (PR-78h): single-source variant of
+    /// [`Store::list_sources_with_counts`]. Returns `None` when
+    /// the `(adapter, instance)` pair isn't in the registry —
+    /// CLI / MCP turn that into a loud "source not found" error.
+    ///
+    /// `instance = None` matches the `""` default-instance row.
+    /// Counts come from the same scalar-subquery shape
+    /// `list_sources_with_counts` uses, so the JOIN-amplification
+    /// guard is identical.
+    pub fn get_source_with_counts(
+        &self,
+        adapter: &str,
+        instance: Option<&str>,
+    ) -> Result<Option<SourceWithCounts>> {
+        let inst = instance.unwrap_or("");
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.adapter, s.instance, s.location, s.config_json, \
+                    s.added_at, s.last_import_at, \
+                    (SELECT COUNT(*) \
+                       FROM records r \
+                      WHERE r.adapter = s.adapter \
+                        AND r.instance = s.instance) AS record_count, \
+                    (SELECT COUNT(*) \
+                       FROM record_chunks rc \
+                       JOIN records r ON r.id = rc.record_id \
+                      WHERE r.adapter = s.adapter \
+                        AND r.instance = s.instance) AS chunk_count, \
+                    (SELECT COUNT(DISTINCT urt.record_id) \
+                       FROM user_record_tags urt \
+                       JOIN records r ON r.id = urt.record_id \
+                      WHERE r.adapter = s.adapter \
+                        AND r.instance = s.instance) AS tagged_record_count \
+             FROM sources s \
+             WHERE s.adapter = ?1 AND s.instance = ?2",
+        )?;
+        let row = stmt
+            .query_row(params![adapter, inst], |r| {
+                Ok(SourceWithCounts {
+                    source: SourceRow {
+                        adapter: r.get(0)?,
+                        instance: r.get(1)?,
+                        location: r.get(2)?,
+                        config_json: r.get(3)?,
+                        added_at: r.get(4)?,
+                        last_import_at: r.get(5)?,
+                    },
+                    record_count: r.get::<_, i64>(6)? as u64,
+                    chunk_count: r.get::<_, i64>(7)? as u64,
+                    tagged_record_count: r.get::<_, i64>(8)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5094,6 +5195,115 @@ mod tests {
 
         let zero = store.recent_import_errors(None, 0).unwrap();
         assert!(zero.is_empty());
+    }
+
+    // ─── Round-86 PR-78h: source_show backing helpers ────────────────
+
+    /// Per-source error helper must filter by **both** adapter
+    /// and instance — pinning the no-leakage invariant codex
+    /// flagged as risk #2. Two mem0 instances each get a
+    /// distinct error; the `(mem0, self-hosted)` query returns
+    /// only the self-hosted one.
+    #[test]
+    fn source_show_recent_import_errors_for_source_does_not_leak_across_instances() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .log_import_error(
+                "mem0",
+                Some("self-hosted"),
+                Some("h1"),
+                None,
+                "parse",
+                "self-error",
+            )
+            .unwrap();
+        store
+            .log_import_error(
+                "mem0",
+                Some("cloud"),
+                Some("c1"),
+                None,
+                "parse",
+                "cloud-error",
+            )
+            .unwrap();
+        // A third row in a different adapter, must also stay out.
+        store
+            .log_import_error("claude-code", None, Some("cc1"), None, "parse", "cc-error")
+            .unwrap();
+
+        let scoped = store
+            .recent_import_errors_for_source("mem0", Some("self-hosted"), 10)
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].error, "self-error");
+        let cloud = store
+            .recent_import_errors_for_source("mem0", Some("cloud"), 10)
+            .unwrap();
+        assert_eq!(cloud.len(), 1);
+        assert_eq!(cloud[0].error, "cloud-error");
+        let cc = store
+            .recent_import_errors_for_source("claude-code", None, 10)
+            .unwrap();
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0].error, "cc-error");
+        // limit=0 short-circuits like the adapter-scoped variant.
+        let zero = store
+            .recent_import_errors_for_source("mem0", Some("self-hosted"), 0)
+            .unwrap();
+        assert!(zero.is_empty());
+    }
+
+    /// `get_source_with_counts` returns `Some` with the same
+    /// JOIN-amplification-safe counts as `list_sources_with_counts`,
+    /// and `None` for `(adapter, instance)` pairs that aren't in
+    /// the registry (CLI/MCP map that to a loud "source not found").
+    #[test]
+    fn source_show_get_source_with_counts_returns_counts_or_none() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", None, Some("/cc"), None)
+            .unwrap();
+        // Seed two records + tag one — the same shape R82's tests use.
+        for n in ["a", "b"] {
+            let r = make_record("claude-code", n, &format!("body {n}"), Kind::Fact);
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &c, None).unwrap();
+        }
+        let id_a = RecordId::from_parts("claude-code", None, "a");
+        store
+            .tag_record(
+                &id_a,
+                &["keep".into(), "todo".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+
+        // Hit: counts match.
+        let hit = store
+            .get_source_with_counts("claude-code", None)
+            .unwrap()
+            .expect("registered source");
+        assert_eq!(hit.source.adapter, "claude-code");
+        assert_eq!(hit.source.instance, "");
+        assert_eq!(hit.record_count, 2);
+        assert!(hit.chunk_count >= 2);
+        assert_eq!(
+            hit.tagged_record_count, 1,
+            "two tags on one record = 1 tagged record"
+        );
+
+        // Miss: unknown adapter → None.
+        assert!(store
+            .get_source_with_counts("does-not-exist", None)
+            .unwrap()
+            .is_none());
+
+        // Miss: wrong instance on a registered adapter → None.
+        assert!(store
+            .get_source_with_counts("claude-code", Some("not-registered"))
+            .unwrap()
+            .is_none());
     }
 
     /// A batch that mixes already-imported (raw_hash-equal → no-op) records

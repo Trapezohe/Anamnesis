@@ -578,6 +578,21 @@ enum SourceCmd {
     },
     /// List configured sources.
     List,
+    /// Round 86: per-source detail view. Same counts as
+    /// `source list` (records, chunks, tagged) for one
+    /// `(adapter, instance)`, plus the last few `import_errors`
+    /// for that source so an operator can answer "why is this
+    /// source empty / stale / broken" in one call.
+    Show {
+        /// `adapter` or `adapter:instance`. Same parser as `remove`.
+        target: String,
+        /// Max recent import errors to show. Default 5, cap 10.
+        #[arg(long, default_value_t = 5)]
+        errors: usize,
+        /// Emit JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a registered source.
     Remove {
         /// `adapter` or `adapter:instance`.
@@ -1565,7 +1580,97 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             println!("removed: {target}");
             Ok(())
         }
+        SourceCmd::Show {
+            target,
+            errors,
+            json,
+        } => cmd_source_show(&store, &target, errors, json),
     }
+}
+
+/// Round 86 (PR-78h): `anamnesis source show <adapter[:instance]>`
+/// — per-source detail. Missing source is a loud non-zero exit so
+/// a typo in scripted usage doesn't pass silently.
+fn cmd_source_show(store: &Store, target: &str, errors: usize, json: bool) -> Result<()> {
+    let errors = errors.clamp(1, 10);
+    let (adapter, instance) = split_target(target);
+    let swc = match store.get_source_with_counts(adapter, instance)? {
+        Some(s) => s,
+        None => return Err(anyhow!("source not found: {target}")),
+    };
+    let recent = store.recent_import_errors_for_source(adapter, instance, errors)?;
+
+    if json {
+        let payload = serde_json::json!({
+            "source": {
+                "adapter": swc.source.adapter,
+                "instance": if swc.source.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(swc.source.instance.clone())
+                },
+                "location": swc.source.location,
+                "added_at": swc.source.added_at,
+                "last_import_at": swc.source.last_import_at,
+                "record_count": swc.record_count,
+                "chunk_count": swc.chunk_count,
+                "tagged_record_count": swc.tagged_record_count,
+            },
+            "recent_import_errors": recent.iter().map(|e| serde_json::json!({
+                "adapter": e.adapter,
+                "instance": if e.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(e.instance.clone())
+                },
+                "native_id": e.native_id,
+                "native_path": e.native_path,
+                "phase": e.phase,
+                "error": e.error,
+                "occurred_at": e.occurred_at,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let inst_label = instance_label(&swc.source.instance);
+        let last_import = swc
+            .source
+            .last_import_at
+            .map(|t| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%MZ").to_string())
+                    .unwrap_or_else(|| t.to_string())
+            })
+            .unwrap_or_else(|| "<never>".into());
+        println!("adapter      : {}", swc.source.adapter);
+        println!("instance     : {inst_label}");
+        if let Some(loc) = &swc.source.location {
+            println!("location     : {loc}");
+        }
+        println!("added_at     : {}", swc.source.added_at);
+        println!("last_import  : {last_import}");
+        println!("records      : {}", swc.record_count);
+        println!("chunks       : {}", swc.chunk_count);
+        println!("tagged       : {}", swc.tagged_record_count);
+        if recent.is_empty() {
+            println!("recent import errors : (none)");
+        } else {
+            println!("recent import errors (top {}):", recent.len());
+            for e in &recent {
+                println!(
+                    "  [{phase} @ {occurred_at}] {error} (native_id={native_id})",
+                    phase = e.phase,
+                    occurred_at = e.occurred_at,
+                    error = e.error,
+                    native_id = e.native_id.as_deref().unwrap_or("-"),
+                );
+                if let Some(p) = &e.native_path {
+                    println!("       native_path: {p}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn split_target(t: &str) -> (&str, Option<&str>) {

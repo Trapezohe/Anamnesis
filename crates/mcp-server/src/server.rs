@@ -59,6 +59,11 @@ pub const ADMIN_TOOLS: &[&str] = &[
     // source locations — non-admin agents shouldn't be able to
     // back-door read those.
     "audit_tail",
+    // Round 86 (PR-78h): `source_show` includes `recent_import_errors`
+    // which carry `native_path` + adapter-side error text (e.g.
+    // file paths, parse traces). Same gating logic as audit_tail.
+    // `list_sources` (no per-row error detail) stays non-admin.
+    "source_show",
 ];
 
 /// Was this tool tagged as admin?
@@ -362,6 +367,7 @@ impl AnamnesisServer {
             "dedupe" => self.tool_dedupe(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
             "audit_tail" => self.tool_audit_tail(args.clone()).await,
+            "source_show" => self.tool_source_show(args.clone()).await,
             other => {
                 self.record_metric_safely(
                     Some(started_at),
@@ -1759,6 +1765,97 @@ impl AnamnesisServer {
         }))
     }
 
+    /// Round 86 (PR-78h): MCP-side `source_show`. Admin-gated
+    /// because `recent_import_errors` rows carry `native_path` +
+    /// adapter-side error text, same sensitivity contract as
+    /// `audit_tail`. The non-admin `list_sources` already
+    /// surfaces the counts (without per-row error detail) so a
+    /// read-only agent doesn't lose anything by being held out
+    /// of this one.
+    ///
+    /// Wire shape:
+    ///   * `source`: same fields as one row of `list_sources` plus
+    ///     `tagged_record_count` (R82).
+    ///   * `recent_import_errors`: newest-first, capped at the
+    ///     caller's `error_limit` (default 5, hard cap 10 — kept
+    ///     small so the response stays bounded even on a noisy
+    ///     adapter).
+    ///   * Missing `(adapter, instance)` → `Err(format!(..))`,
+    ///     not `null`, so MCP clients exit on typo'd ids.
+    async fn tool_source_show(&self, args: Value) -> Result<Value, String> {
+        const ERROR_LIMIT_DEFAULT: usize = 5;
+        const ERROR_LIMIT_MAX: usize = 10;
+        let adapter = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "source_show.source is required".to_string())?;
+        let instance = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let error_limit = args
+            .get("error_limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(ERROR_LIMIT_DEFAULT)
+            .clamp(1, ERROR_LIMIT_MAX);
+
+        let swc = self
+            .store
+            .get_source_with_counts(adapter, instance)
+            .map_err(|e| format!("source_show: {e}"))?
+            .ok_or_else(|| {
+                let target = match instance {
+                    Some(i) => format!("{adapter}:{i}"),
+                    None => adapter.to_string(),
+                };
+                format!("source_show: source not found: {target}")
+            })?;
+        let recent = self
+            .store
+            .recent_import_errors_for_source(adapter, instance, error_limit)
+            .map_err(|e| format!("source_show: {e}"))?;
+
+        let recent_payload: Vec<Value> = recent
+            .iter()
+            .map(|e| {
+                json!({
+                    "adapter": e.adapter,
+                    "instance": if e.instance.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(e.instance.clone())
+                    },
+                    "native_id":   e.native_id,
+                    "native_path": e.native_path,
+                    "phase":       e.phase,
+                    "error":       e.error,
+                    "occurred_at": e.occurred_at,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "source": {
+                "adapter": swc.source.adapter,
+                "instance": if swc.source.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(swc.source.instance.clone())
+                },
+                "location":             swc.source.location,
+                "added_at":             swc.source.added_at,
+                "last_import_at":       swc.source.last_import_at,
+                "record_count":         swc.record_count,
+                "chunk_count":          swc.chunk_count,
+                "tagged_record_count":  swc.tagged_record_count,
+            },
+            "recent_import_errors": recent_payload,
+            "error_limit": error_limit,
+        }))
+    }
+
     /// Build the right adapter for a registered source and call
     /// `MemoryAdapter::health().await`. Mirrors the CLI's
     /// `run_adapter_health` — the dispatch table stays in lockstep with
@@ -2318,6 +2415,35 @@ fn tools_list_payload_all() -> Value {
                                 `record_count`, `chunk_count`, `tagged_record_count` (R82: distinct \
                                 records with ≥1 user_tag), `last_import_at`, and `location`.",
                 "inputSchema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "source_show",
+                "description": "Round 86: per-source detail view for one `(adapter, instance)`. \
+                                Returns the same source object as `list_sources` plus a \
+                                `recent_import_errors[]` array (newest-first, capped by \
+                                `error_limit`, default 5 / max 10). ADMIN-GATED — the import-error \
+                                rows carry `native_path` + adapter-side error text. Missing source \
+                                returns a tool error.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Adapter id (e.g. `claude-code`, `mem0`)."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Optional instance discriminator. Omit for the default-instance row."
+                        },
+                        "error_limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 5,
+                            "description": "Max recent import-error rows. Clamped to [1, 10]."
+                        }
+                    },
+                    "required": ["source"]
+                }
             },
             {
                 "name": "import_source",
@@ -2891,8 +3017,8 @@ mod tests {
         // R73 added forget_record (6→7). R74 added list_forgotten
         // (7→8). R75 added unforget_record (8→9). R77 added
         // dedupe (9→10). R78 added tag_record (10→11). R84 added
-        // audit_tail (11→12).
-        assert_eq!(names.len(), 12);
+        // audit_tail (11→12). R86 added source_show (12→13).
+        assert_eq!(names.len(), 13);
         for expected in [
             "search_memories",
             "get_record",
@@ -2906,6 +3032,7 @@ mod tests {
             "dedupe",
             "tag_record",
             "audit_tail",
+            "source_show",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
