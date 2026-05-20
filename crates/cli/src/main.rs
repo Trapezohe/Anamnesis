@@ -198,6 +198,17 @@ enum Command {
     /// payload bytes). Semantic / near-duplicate is a much bigger
     /// product decision and explicitly out of scope.
     Dedupe {
+        /// Scope to duplicate groups that include ≥1 record from
+        /// this adapter (e.g. `mem0`, `claude-code`). The full
+        /// sibling set is still returned so you can see which
+        /// non-matching records share the same `raw_hash`.
+        #[arg(long)]
+        source: Option<String>,
+        /// Scope to duplicate groups that include ≥1 record from
+        /// this `(adapter, instance)`. Only meaningful with
+        /// `--source`.
+        #[arg(long)]
+        instance: Option<String>,
         /// Max number of groups to return. Default 20, cap 100.
         #[arg(long, default_value_t = 20)]
         limit: u32,
@@ -822,10 +833,19 @@ async fn main() -> Result<()> {
             json,
         } => cmd_tag_record(&data_dir, &record_id, &tags, remove, json),
         Command::Dedupe {
+            source,
+            instance,
             limit,
             json,
             include_sensitive,
-        } => cmd_dedupe(&data_dir, limit, json, include_sensitive),
+        } => cmd_dedupe(
+            &data_dir,
+            source.as_deref(),
+            instance.as_deref(),
+            limit,
+            json,
+            include_sensitive,
+        ),
         Command::Unforget { record_id, json } => cmd_unforget(&data_dir, &record_id, json),
         Command::ListForgotten {
             source,
@@ -2723,8 +2743,21 @@ fn cmd_tag_record(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// dedupe (Round 77 PR-77)
+// dedupe (Round 77 PR-77, Round 80 source/instance filter)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Compact label for the dedupe filter, shared by the human
+/// "no groups" / "N groups" headers so the operator can see at
+/// a glance whether the empty result is "nothing's duplicated"
+/// or "your filter knocked everything out."
+fn filter_label(source: Option<&str>, instance: Option<&str>) -> String {
+    match (source, instance) {
+        (Some(s), Some(i)) => format!("source={s}, instance={i}"),
+        (Some(s), None) => format!("source={s}"),
+        (None, Some(i)) => format!("instance={i}"),
+        (None, None) => String::new(),
+    }
+}
 
 /// `anamnesis dedupe` — read-only exact-duplicate report keyed on
 /// `records.raw_hash`. Groups records with identical source payload
@@ -2739,12 +2772,19 @@ fn cmd_tag_record(
 /// `anamnesis forget <record_id>` for the action half.
 fn cmd_dedupe(
     data_dir: &std::path::Path,
+    source: Option<&str>,
+    instance: Option<&str>,
     limit: u32,
     json: bool,
     include_sensitive: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
-    let groups = store.list_duplicate_raw_hashes(limit)?;
+    let filter = anamnesis_store::DuplicateRawHashFilter {
+        source: source.map(str::to_owned),
+        instance: instance.map(str::to_owned),
+        limit,
+    };
+    let groups = store.list_duplicate_raw_hashes_filtered(&filter)?;
     let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
 
     if json {
@@ -2752,6 +2792,10 @@ fn cmd_dedupe(
             "count": groups.len(),
             "limit": effective_limit,
             "sensitive_included": include_sensitive,
+            "filter": {
+                "source": source,
+                "instance": instance,
+            },
             "groups": groups.iter().map(|g| {
                 let mut group = serde_json::json!({
                     "record_count": g.records.len(),
@@ -2779,11 +2823,23 @@ fn cmd_dedupe(
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if groups.is_empty() {
-        println!("no duplicate raw_hash groups");
+        let scope = filter_label(source, instance);
+        if scope.is_empty() {
+            println!("no duplicate raw_hash groups");
+        } else {
+            println!("no duplicate raw_hash groups (filter: {scope})");
+        }
     } else {
+        let scope = filter_label(source, instance);
+        let scope_suffix = if scope.is_empty() {
+            String::new()
+        } else {
+            format!(" (filter: {scope})")
+        };
         println!(
-            "{} duplicate raw_hash group(s){}",
+            "{} duplicate raw_hash group(s){}{}",
             groups.len(),
+            scope_suffix,
             if include_sensitive {
                 " (including sensitive fields)"
             } else {

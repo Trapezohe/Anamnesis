@@ -152,3 +152,128 @@ async fn dedupe_include_sensitive_reveals_fields() {
         .collect();
     assert_eq!(paths.len(), 2);
 }
+
+// ─── Round-80: source / instance filter ────────────────────────────
+
+/// Build a fixture with two duplicate groups so the filter has
+/// something to narrow.
+///   * h-mixed: mem0 + claude-code (filter target)
+///   * h-cc: two claude-code records (irrelevant under
+///     `source=mem0`)
+fn build_bundle_two_groups() -> (AnamnesisServer, tempfile::TempDir) {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let make = |adapter: &str, native: &str, hash: &str| AnamnesisRecord {
+        id: RecordId::from_parts(adapter, None, native),
+        source: SourceDescriptor {
+            adapter: adapter.into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: format!("{adapter}|{native} content"),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/{adapter}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: hash.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        make("mem0", "m1", "h-mixed"),
+        make("claude-code", "c1", "h-mixed"),
+        make("claude-code", "x1", "h-cc"),
+        make("claude-code", "x2", "h-cc"),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+    let server =
+        AnamnesisServer::new(store, None, data_dir.path().to_path_buf()).with_admin_tools(false);
+    (server, data_dir)
+}
+
+/// `source` arg is callable without admin and echoed back in the
+/// payload so an MCP client can render "filter: source=mem0" in
+/// its UI without re-tracking the request.
+#[tokio::test]
+async fn dedupe_source_filter_scopes_groups_and_echoes_filter() {
+    let (server, _data) = build_bundle_two_groups();
+    let body = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"source": "mem0", "include_sensitive": true}),
+        ))
+        .await;
+    assert!(body.error.is_none(), "dedupe with source must succeed");
+    let payload = extract_payload(&body);
+    assert_eq!(payload["count"], 1, "h-cc group filtered out");
+    assert_eq!(payload["filter"]["source"], "mem0");
+    assert!(payload["filter"]["instance"].is_null());
+    let group = &payload["groups"][0];
+    assert_eq!(group["raw_hash"], "h-mixed");
+    // Both adapters surfaced in the matching group.
+    let adapters: std::collections::BTreeSet<String> = group["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["adapter"].as_str().unwrap().to_string())
+        .collect();
+    assert!(adapters.contains("mem0"));
+    assert!(adapters.contains("claude-code"));
+}
+
+/// Empty-string args are normalised to absent (so a client that
+/// always sends `{"source": ""}` doesn't accidentally filter on
+/// the empty source — there is no such adapter).
+#[tokio::test]
+async fn dedupe_empty_string_source_is_treated_as_absent() {
+    let (server, _data) = build_bundle_two_groups();
+    let body = server
+        .handle(tool_call("dedupe", json!({"source": ""})))
+        .await;
+    assert!(body.error.is_none());
+    let payload = extract_payload(&body);
+    assert_eq!(
+        payload["count"], 2,
+        "empty source string must not filter; got {payload}"
+    );
+    assert!(payload["filter"]["source"].is_null());
+}
+
+/// tools/list schema advertises the new `source` and `instance`
+/// optional string args.
+#[tokio::test]
+async fn dedupe_tools_list_advertises_source_and_instance_args() {
+    let (server, _data) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let dedupe = tools
+        .iter()
+        .find(|t| t["name"] == "dedupe")
+        .expect("dedupe in tools/list");
+    let props = &dedupe["inputSchema"]["properties"];
+    assert_eq!(
+        props["source"]["type"], "string",
+        "dedupe must advertise `source` arg: {dedupe}"
+    );
+    assert_eq!(
+        props["instance"]["type"], "string",
+        "dedupe must advertise `instance` arg: {dedupe}"
+    );
+}

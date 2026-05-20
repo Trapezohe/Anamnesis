@@ -512,6 +512,27 @@ pub struct DuplicateRawHashGroup {
     pub records: Vec<DuplicateRawHashRecord>,
 }
 
+/// Round 80 (PR-77 follow-up): filter for
+/// `Store::list_duplicate_raw_hashes_filtered`. Scopes the
+/// duplicate report to groups whose member records include at
+/// least one matching `(adapter, instance)`. Groups are
+/// returned **whole** — all siblings stay visible because the
+/// operator needs the full set to decide which to `forget`.
+///
+/// `limit` is clamped to
+/// `[1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT]` by the store,
+/// same as the unfiltered API.
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateRawHashFilter {
+    /// Adapter id (e.g. `"mem0"`). `None` matches any adapter.
+    pub source: Option<String>,
+    /// Instance discriminator. Only meaningful when `source` is
+    /// also set. `None` matches any instance.
+    pub instance: Option<String>,
+    /// Max groups to return. Clamped by the store.
+    pub limit: u32,
+}
+
 /// Round 74 (PR-74): filter for `Store::list_forgotten`. Mirrors
 /// the `(adapter, instance)` natural key the tombstones are
 /// indexed on so the operator can scope to a single source. `limit`
@@ -1216,31 +1237,88 @@ impl Store {
     ///
     /// Read-only — never writes to the store.
     pub fn list_duplicate_raw_hashes(&self, limit: u32) -> Result<Vec<DuplicateRawHashGroup>> {
-        let limit = limit.clamp(1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
+        self.list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+            source: None,
+            instance: None,
+            limit,
+        })
+    }
+
+    /// Round 80: same as `list_duplicate_raw_hashes` but scopes
+    /// the eligible groups to those whose member records include
+    /// at least one matching `(adapter, instance)`. **Whole
+    /// groups** are returned — siblings outside the filter stay
+    /// visible so the operator can decide which to `forget`.
+    ///
+    /// SQL shape (load-bearing): the `(adapter, instance)`
+    /// constraint lives in the first-pass `GROUP BY raw_hash
+    /// HAVING COUNT(*) > 1` *via a subquery on the eligible
+    /// hashes*, NOT in the second-pass member fetch. Filtering
+    /// after the outer `LIMIT` would let a huge irrelevant
+    /// duplicate group consume the limit and starve the
+    /// operator's actual target.
+    pub fn list_duplicate_raw_hashes_filtered(
+        &self,
+        filter: &DuplicateRawHashFilter,
+    ) -> Result<Vec<DuplicateRawHashGroup>> {
+        let limit = filter.limit.clamp(1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
         let conn = self.conn.lock();
-        // First pass: the raw_hash values that have ≥2 records.
-        // Tiny result set even on big stores (one row per duplicate
-        // group), so it's fine to materialise into a Vec.
+
+        // First pass: pick the duplicate hashes, optionally
+        // narrowed to groups that contain >=1 record matching
+        // the source/instance filter. We use an inner subquery
+        // to find the eligible hashes; the outer GROUP BY uses
+        // them to enforce HAVING COUNT(*) > 1 across the *full*
+        // record set (so a group with 1 mem0 + 5 claude-code is
+        // still a duplicate group, not collapsed to a singleton
+        // by the filter).
+        let mut sql = String::from(
+            "SELECT raw_hash, COUNT(*) AS n, MAX(created_at) AS newest \
+             FROM records \
+             WHERE raw_hash IN (",
+        );
+        let mut eligible_params: Vec<rusqlite::types::Value> = Vec::new();
+        if filter.source.is_some() || filter.instance.is_some() {
+            sql.push_str("SELECT raw_hash FROM records WHERE 1=1");
+            if let Some(s) = &filter.source {
+                sql.push_str(" AND adapter = ?");
+                eligible_params.push(rusqlite::types::Value::Text(s.clone()));
+            }
+            if let Some(i) = &filter.instance {
+                sql.push_str(" AND instance = ?");
+                eligible_params.push(rusqlite::types::Value::Text(i.clone()));
+            }
+        } else {
+            // No filter: trivially "all hashes are eligible."
+            sql.push_str("SELECT raw_hash FROM records");
+        }
+        sql.push_str(
+            ") \
+             GROUP BY raw_hash \
+             HAVING COUNT(*) > 1 \
+             ORDER BY COUNT(*) DESC, MAX(created_at) DESC, raw_hash ASC \
+             LIMIT ?",
+        );
+        eligible_params.push(rusqlite::types::Value::Integer(limit as i64));
+
         let hashes: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT raw_hash \
-                 FROM records \
-                 GROUP BY raw_hash \
-                 HAVING COUNT(*) > 1 \
-                 ORDER BY COUNT(*) DESC, MAX(created_at) DESC, raw_hash ASC \
-                 LIMIT ?1",
-            )?;
+            let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
-                .query_map(params![limit as i64], |r| r.get::<_, String>(0))?
+                .query_map(rusqlite::params_from_iter(eligible_params.iter()), |r| {
+                    r.get::<_, String>(0)
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             mapped
         };
         if hashes.is_empty() {
             return Ok(Vec::new());
         }
+
         // Second pass: pull every record for those hashes in one
         // IN() query — order so siblings are grouped contiguously
         // and the operator sees newest-first inside each group.
+        // **Groups are not filtered at this stage**: the operator
+        // needs the full sibling set to decide which to forget.
         let placeholders = std::iter::repeat_n("?", hashes.len())
             .collect::<Vec<_>>()
             .join(",");
@@ -1272,10 +1350,6 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // Re-assemble in the priority order picked by the first pass
-        // (size DESC, newest DESC, raw_hash ASC). The second SQL
-        // ordered by raw_hash for grouping; we re-sort the *outer*
-        // sequence using the priority `hashes` carries.
         let mut by_hash: std::collections::HashMap<String, Vec<DuplicateRawHashRecord>> =
             std::collections::HashMap::new();
         for (h, rec) in rows {
@@ -5333,6 +5407,159 @@ mod tests {
             0,
             "group should drop out once forget left only 1 live sibling",
         );
+    }
+
+    // ─── Round-80: list_duplicate_raw_hashes_filtered ───────────────
+
+    /// `--source` keeps a group if ≥1 member matches, AND returns
+    /// the whole sibling set (the non-matching siblings stay
+    /// visible because the operator may want to `forget` either
+    /// side).
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_keeps_group_whole_when_source_partial_match() {
+        let store = Store::open_in_memory().unwrap();
+        // h-mixed: one mem0 + one claude-code, both sharing hash.
+        let _m = seed_with_raw_hash(&store, "mem0", "m1", "h-mixed");
+        let _c = seed_with_raw_hash(&store, "claude-code", "c1", "h-mixed");
+
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: Some("mem0".into()),
+                instance: None,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].records.len(),
+            2,
+            "filter scopes eligibility, NOT membership — both siblings must surface"
+        );
+        let adapters: std::collections::BTreeSet<_> = groups[0]
+            .records
+            .iter()
+            .map(|r| r.adapter.as_str())
+            .collect();
+        assert!(adapters.contains("mem0"));
+        assert!(adapters.contains("claude-code"));
+    }
+
+    /// A duplicate group with no matching member must be excluded.
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_excludes_groups_with_no_source_match() {
+        let store = Store::open_in_memory().unwrap();
+        // h-A: two claude-code records (no mem0).
+        let _a1 = seed_with_raw_hash(&store, "claude-code", "a1", "h-A");
+        let _a2 = seed_with_raw_hash(&store, "claude-code", "a2", "h-A");
+        // h-B: two mem0 records.
+        let _b1 = seed_with_raw_hash(&store, "mem0", "b1", "h-B");
+        let _b2 = seed_with_raw_hash(&store, "mem0", "b2", "h-B");
+
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: Some("mem0".into()),
+                instance: None,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].raw_hash, "h-B");
+    }
+
+    /// **Filter-before-LIMIT** discipline: a huge irrelevant group
+    /// must not eat the limit. With `limit=1` and a 3-row
+    /// claude-code group ranked first, the mem0 group still wins
+    /// because the filter narrows eligibility first.
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_limit_not_starved_by_irrelevant_group() {
+        let store = Store::open_in_memory().unwrap();
+        // Irrelevant: 3-row claude-code group (highest rank
+        // without the filter).
+        for n in ["x1", "x2", "x3"] {
+            seed_with_raw_hash(&store, "claude-code", n, "h-X");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Relevant: 2-row mem0 group.
+        for n in ["y1", "y2"] {
+            seed_with_raw_hash(&store, "mem0", n, "h-Y");
+        }
+
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: Some("mem0".into()),
+                instance: None,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].raw_hash, "h-Y",
+            "filter must run before LIMIT — h-X would otherwise outrank h-Y on size"
+        );
+    }
+
+    /// `instance` alone narrows eligibility without `source`,
+    /// matching the CLI shape where the user might want
+    /// "everything from instance=primary."
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_by_instance_alone() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Helper to set adapter+instance on a forced raw_hash.
+        // `instance` lives on `source`, not `provenance`.
+        let seed_inst = |adapter: &str, native: &str, instance: &str, hash: &str| {
+            let mut r = make_record(
+                adapter,
+                native,
+                &format!("{adapter}|{native} content"),
+                Kind::Fact,
+            );
+            r.source.instance = Some(instance.into());
+            // RecordId is derived from (adapter, instance, native_id),
+            // so re-derive it after stamping the instance — otherwise
+            // both p1 and p2 collide on the no-instance id and the
+            // second upsert overwrites the first.
+            r.id = RecordId::from_parts(adapter, Some(instance), native);
+            r.provenance.raw_hash = hash.into();
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &chunks, None).unwrap();
+        };
+
+        // h-P: contains a record on instance=primary (eligible).
+        seed_inst("mem0", "p1", "primary", "h-P");
+        seed_inst("mem0", "p2", "secondary", "h-P");
+        // h-S: only secondary (NOT eligible under instance=primary).
+        seed_inst("mem0", "s1", "secondary", "h-S");
+        seed_inst("mem0", "s2", "secondary", "h-S");
+
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: None,
+                instance: Some("primary".into()),
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].raw_hash, "h-P");
+        // Full sibling set still returned, secondary included.
+        assert_eq!(groups[0].records.len(), 2);
+    }
+
+    /// Empty filter must behave identically to the legacy
+    /// unfiltered API — backward compatibility guarantee.
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_empty_filter_matches_legacy() {
+        let store = Store::open_in_memory().unwrap();
+        let _a = seed_with_raw_hash(&store, "claude-code", "a", "h-shared");
+        let _b = seed_with_raw_hash(&store, "mem0", "b", "h-shared");
+
+        let legacy = store.list_duplicate_raw_hashes(20).unwrap();
+        let filtered = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter::default())
+            .unwrap();
+        assert_eq!(legacy.len(), filtered.len());
+        assert_eq!(legacy[0].raw_hash, filtered[0].raw_hash);
+        assert_eq!(legacy[0].records.len(), filtered[0].records.len());
     }
 
     // ─── Round-78: user_record_tags ────────────────────────────────

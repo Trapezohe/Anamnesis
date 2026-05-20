@@ -155,3 +155,139 @@ fn dedupe_include_sensitive_reveals_fields() {
             && paths.iter().any(|p| p.ends_with("beta.md"))
     );
 }
+
+// ─── Round-80: --source / --instance filter ─────────────────────────
+
+/// Seed two duplicate groups so the filter has something to
+/// narrow:
+///   * h-mixed: mem0/claude-code (filter target)
+///   * h-other: two claude-code records (irrelevant)
+fn seed_two_groups(data_dir: &Path) {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let db = data_dir.join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let make = |adapter: &str, native: &str, hash: &str| AnamnesisRecord {
+        id: RecordId::from_parts(adapter, None, native),
+        source: SourceDescriptor {
+            adapter: adapter.into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: format!("{adapter}|{native} content"),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/{adapter}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: hash.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        make("mem0", "m1", "h-mixed"),
+        make("claude-code", "c1", "h-mixed"),
+        make("claude-code", "x1", "h-other"),
+        make("claude-code", "x2", "h-other"),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+}
+
+/// `--source mem0` returns only the mixed group, but with the
+/// full sibling set (mem0 + claude-code) — the operator needs to
+/// see what they'd be choosing between.
+#[test]
+fn dedupe_source_filter_scopes_groups_keeps_siblings_whole() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "dedupe",
+            "--source",
+            "mem0",
+            "--json",
+            "--include-sensitive",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["count"], 1, "h-other group filtered out: {stdout}");
+    assert_eq!(v["filter"]["source"], "mem0");
+    assert!(v["filter"]["instance"].is_null());
+    let group = &v["groups"][0];
+    assert_eq!(group["raw_hash"], "h-mixed");
+    // Both adapters visible.
+    let adapters: std::collections::BTreeSet<String> = group["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["adapter"].as_str().unwrap().to_string())
+        .collect();
+    assert!(adapters.contains("mem0"));
+    assert!(adapters.contains("claude-code"));
+}
+
+/// `--source` that nobody matches returns an empty report and
+/// the filter is echoed back so the operator can see "ok, you
+/// said `letta`, that's why it's empty."
+#[test]
+fn dedupe_source_filter_unknown_adapter_human_shows_filter() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--source", "letta"])
+        .assert()
+        .success()
+        .stdout(contains("no duplicate raw_hash groups"))
+        .stdout(contains("filter: source=letta"));
+}
+
+/// Limit-before-filter regression guard: with `--limit 1`, the
+/// 2-row mem0-containing group must win even though the 2-row
+/// pure-claude-code group has the same size. The filter narrows
+/// eligibility *before* the LIMIT clause.
+#[test]
+fn dedupe_source_filter_limit_picks_filtered_group() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "dedupe",
+            "--source",
+            "mem0",
+            "--limit",
+            "1",
+            "--json",
+            "--include-sensitive",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["groups"][0]["raw_hash"], "h-mixed");
+}

@@ -13,12 +13,13 @@ pub mod cjk;
 mod vec_ext;
 
 pub use api::{
-    normalize_user_tag_name, ChunkHit, ChunkLookup, DuplicateRawHashGroup, DuplicateRawHashRecord,
-    ForgetRecordOutcome, ForgottenRecord, LineageChain, ListForgottenFilter, McpRequestMetric,
-    McpToolMetricSummary, PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter,
-    SourceRow, SourceWithCounts, StoreStats, UnforgetRecordOutcome, UserTagMutation,
-    UserTagOperation, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT, LIST_FORGOTTEN_MAX_LIMIT,
-    MAX_LIST_LIMIT, MCP_METRICS_CAP, TAG_RECORD_MAX_BATCH, USER_TAG_MAX_LEN,
+    normalize_user_tag_name, ChunkHit, ChunkLookup, DuplicateRawHashFilter, DuplicateRawHashGroup,
+    DuplicateRawHashRecord, ForgetRecordOutcome, ForgottenRecord, LineageChain,
+    ListForgottenFilter, McpRequestMetric, McpToolMetricSummary, PendingEmbeddingJob, RecordHeader,
+    RecordSummary, SearchFilter, SourceRow, SourceWithCounts, StoreStats, UnforgetRecordOutcome,
+    UserTagMutation, UserTagOperation, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT,
+    LIST_FORGOTTEN_MAX_LIMIT, MAX_LIST_LIMIT, MCP_METRICS_CAP, TAG_RECORD_MAX_BATCH,
+    USER_TAG_MAX_LEN,
 };
 
 use std::path::Path;
