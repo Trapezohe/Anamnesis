@@ -18,7 +18,10 @@ pub mod error;
 pub mod model;
 pub mod query;
 
-pub use audit::{Audit, AuditEntry};
+pub use audit::{
+    Audit, AuditEntry, AuditTailOptions, AuditTailRow, AUDIT_TAIL_DEFAULT_LIMIT,
+    AUDIT_TAIL_MAX_LIMIT,
+};
 pub use config::{Config, ConfigError, EmbeddingConfig, ServerConfig, SourceEntry};
 
 pub use adapter::{HealthStatus, MemoryAdapter, RawDelta, RawRecord, ScanOpts, WatchOpts};

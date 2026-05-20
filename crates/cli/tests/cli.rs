@@ -2062,3 +2062,132 @@ fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
                 .and(contains("DOCTOR_GENERIC_MCP_NOSUCH")),
         );
 }
+
+// ─── Round-84 PR-78f: audit tail ────────────────────────────────────
+
+/// Empty store has no audit.log → CLI prints a friendly empty
+/// message (not an error) and exits 0.
+#[test]
+fn audit_tail_empty_store_prints_friendly_message() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail"])
+        .assert()
+        .success()
+        .stdout(contains("no audit entries yet"));
+}
+
+/// After a forget call lands an audit entry, `audit tail --json`
+/// returns it with full detail, including `via` + `outcome`. The
+/// `filter` block echoes the operator-supplied --action.
+#[test]
+fn audit_tail_json_returns_recent_forget_entries() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    // Seed a record so we can forget it.
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "auditme"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "auditable body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "auditme".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-audit".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    drop(store);
+
+    // forget appends one audit entry with action="forget".
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["forget", &r.id.0, "--reason", "auditing"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--action", "forget", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["filter"]["action"], "forget");
+    let entries = v["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "must capture the forget entry");
+    let forget_entry = entries
+        .iter()
+        .find(|e| e["action"] == "forget")
+        .expect("forget entry");
+    assert_eq!(forget_entry["detail"]["outcome"], "forgotten");
+    assert_eq!(forget_entry["detail"]["reason"], "auditing");
+}
+
+/// `--action` filter excludes unrelated entries. Two operations
+/// land (`forget` + `search` via CLI), `--action search` shows
+/// only the search rows.
+#[test]
+fn audit_tail_action_filter_excludes_other_actions() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    // `search` writes an audit entry even on an empty store.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "anything", "--mode", "fulltext"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "different", "--mode", "fulltext"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--action", "search", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    assert!(entries.len() >= 2);
+    for e in entries {
+        assert_eq!(e["action"], "search");
+    }
+}

@@ -613,6 +613,10 @@ enum ModelCmd {
 #[derive(Subcommand, Debug)]
 enum AuditCmd {
     /// List every Stage 2 extraction run, newest first.
+    ///
+    /// Note: this reads `data_dir/audit/stage2.jsonl` (extractor
+    /// runs). For the global mutation/search log
+    /// (`data_dir/audit.log`), use `audit tail`.
     List {
         /// Maximum number of runs to list.
         #[arg(long, default_value_t = 20)]
@@ -621,13 +625,41 @@ enum AuditCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Show one specific run by its 1-based line number in the audit
-    /// log (use `list` to find numbers). Pass `last` for the most
-    /// recent run.
+    /// Show one specific Stage 2 run by its 1-based line number
+    /// in `data_dir/audit/stage2.jsonl` (use `list` to find
+    /// numbers). Pass `last` for the most recent run.
     Show {
         /// Line number (1-based) or `last`.
         target: String,
         /// Emit JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Round 84: tail the global mutation / search audit log at
+    /// `data_dir/audit.log` (the same file `Audit::record` appends
+    /// to from every CLI and MCP write). Each line is a JSONL
+    /// `AuditEntry { timestamp, action, detail }`.
+    ///
+    /// Distinct from `audit list/show`, which reads the separate
+    /// Stage 2 extractor log.
+    Tail {
+        /// Maximum number of entries to return.
+        #[arg(long = "limit", short = 'n', default_value_t = 20)]
+        limit: usize,
+        /// Filter to entries with this exact `action` (e.g.
+        /// `forget`, `search`, `import`, `tag_record`). Omit for
+        /// all actions.
+        #[arg(long)]
+        action: Option<String>,
+        /// Drop entries older than this relative lookback.
+        /// Shapes: `Nd` (days), `Nh` (hours), `Nm` (minutes), or
+        /// bare integer (seconds). Same grammar as `doctor --since`.
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit full JSON (with `detail`). The human renderer
+        /// shows only `line_no / timestamp / action / via /
+        /// outcome|status` so a casual tail doesn't dump search
+        /// queries or forget reasons into the terminal.
         #[arg(long)]
         json: bool,
     },
@@ -4352,11 +4384,126 @@ async fn run_all_detectors() -> Vec<anamnesis_core::discovery::DetectedSource> {
 }
 
 fn cmd_audit(data_dir: &std::path::Path, sub: AuditCmd) -> Result<()> {
-    let entries = read_audit_log(data_dir)?;
     match sub {
-        AuditCmd::List { limit, json } => audit_list(&entries, limit, json),
-        AuditCmd::Show { target, json } => audit_show(&entries, &target, json),
+        // Stage 2 audit (extractor runs) lives in a separate file
+        // — `data_dir/audit/stage2.jsonl`. These two arms route
+        // there.
+        AuditCmd::List { limit, json } => {
+            let entries = read_audit_log(data_dir)?;
+            audit_list(&entries, limit, json)
+        }
+        AuditCmd::Show { target, json } => {
+            let entries = read_audit_log(data_dir)?;
+            audit_show(&entries, &target, json)
+        }
+        // Round 84: global mutation/search audit at
+        // `data_dir/audit.log`. Different file, different reader.
+        AuditCmd::Tail {
+            limit,
+            action,
+            since,
+            json,
+        } => cmd_audit_tail(data_dir, limit, action.as_deref(), since.as_deref(), json),
     }
+}
+
+/// Round 84 (PR-78f): `anamnesis audit tail` — read
+/// `data_dir/audit.log` and print the last N entries with
+/// optional action/since filters. CLI is the "operator mode"
+/// surface; --json carries full `detail`, the human renderer is
+/// summary-only so a casual tail doesn't dump search queries or
+/// forget reasons.
+fn cmd_audit_tail(
+    data_dir: &std::path::Path,
+    limit: usize,
+    action: Option<&str>,
+    since: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let since_dt: Option<chrono::DateTime<chrono::Utc>> = match since {
+        Some(spec) => {
+            let lookback_seconds = parse_doctor_since(spec)?;
+            Some(chrono::Utc::now() - chrono::Duration::seconds(lookback_seconds))
+        }
+        None => None,
+    };
+
+    let opts = anamnesis_core::AuditTailOptions {
+        limit: Some(limit),
+        since: since_dt,
+        action: action.map(str::to_owned),
+    };
+    let audit = anamnesis_core::Audit::new(data_dir);
+    let rows = audit
+        .tail(&opts)
+        .map_err(|e| anyhow!("read audit.log: {e}"))?;
+    let effective_limit = limit.clamp(1, anamnesis_core::AUDIT_TAIL_MAX_LIMIT);
+
+    if json {
+        let payload = serde_json::json!({
+            "count": rows.len(),
+            "limit": effective_limit,
+            "filter": {
+                "action": action,
+                "since":  since,
+            },
+            "entries": rows.iter().map(|r| serde_json::json!({
+                "line_no":   r.line_no,
+                "timestamp": r.entry.timestamp,
+                "action":    r.entry.action,
+                "detail":    r.entry.detail,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if rows.is_empty() {
+        if action.is_some() || since.is_some() {
+            println!("no audit entries matched (filter applied)");
+        } else {
+            println!("no audit entries yet (data_dir/audit.log empty or missing)");
+        }
+    } else {
+        println!(
+            "{:>5}  {:<25}  {:<18}  {:<6}  {}",
+            "line", "timestamp", "action", "via", "outcome"
+        );
+        for r in &rows {
+            let via = r
+                .entry
+                .detail
+                .get("via")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Outcome / status / changed — small structured
+            // surface that's safe to print without revealing
+            // free-form `reason` or `query`. Any of the three may
+            // be set depending on the action.
+            let outcome = r
+                .entry
+                .detail
+                .get("outcome")
+                .or_else(|| r.entry.detail.get("status"))
+                .or_else(|| r.entry.detail.get("changed"))
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            println!(
+                "{:>5}  {:<25}  {:<18}  {:<6}  {}",
+                r.line_no,
+                r.entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
+                r.entry.action,
+                via,
+                outcome,
+            );
+        }
+        println!();
+        println!(
+            "({} entries shown — pass --json for full detail including reason/query/etc.)",
+            rows.len()
+        );
+    }
+    Ok(())
 }
 
 fn audit_list(entries: &[serde_json::Value], limit: usize, json: bool) -> Result<()> {

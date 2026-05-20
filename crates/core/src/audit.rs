@@ -4,11 +4,49 @@
 //! JSON Lines record under `$DATA_DIR/audit.log`. No rotation in Phase 1;
 //! ops can `tail -f` or `jq` directly.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Round 84 (PR-78f): default `limit` for `Audit::tail` when the
+/// caller leaves it unset. Matches `tail -n 10` muscle memory but
+/// rounded up to surface more context per call.
+pub const AUDIT_TAIL_DEFAULT_LIMIT: usize = 20;
+/// Round 84: hard cap on how many entries `Audit::tail` will return
+/// in one call. Guards against an operator typo (`-n 1000000`) that
+/// would dump the whole log into a terminal.
+pub const AUDIT_TAIL_MAX_LIMIT: usize = 1000;
+
+/// Round 84 (PR-78f): filter + limit knobs for [`Audit::tail`].
+/// All fields are optional; the default produces the last
+/// [`AUDIT_TAIL_DEFAULT_LIMIT`] entries unfiltered.
+#[derive(Debug, Clone, Default)]
+pub struct AuditTailOptions {
+    /// Cap on entries returned. `None` → [`AUDIT_TAIL_DEFAULT_LIMIT`].
+    /// Caller-supplied values above [`AUDIT_TAIL_MAX_LIMIT`] are
+    /// clamped down to the cap.
+    pub limit: Option<usize>,
+    /// Optional lower bound on `entry.timestamp`. Entries strictly
+    /// older than this are dropped before the limit applies.
+    pub since: Option<DateTime<Utc>>,
+    /// Exact-match filter on `entry.action`. `None` returns all
+    /// actions.
+    pub action: Option<String>,
+}
+
+/// Round 84: one row of `Audit::tail` output. Carries the 1-based
+/// file line number (so an operator can correlate with a raw
+/// `head` / `sed` peek) alongside the parsed entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditTailRow {
+    /// 1-based line number in `$DATA_DIR/audit.log`. Matches the
+    /// muscle memory of `tail -n N` + `head -n LINE`.
+    pub line_no: usize,
+    /// The parsed audit entry — same shape `Audit::record` wrote.
+    pub entry: AuditEntry,
+}
 
 /// Audit log handle. Cheap to construct.
 #[derive(Debug, Clone)]
@@ -55,6 +93,82 @@ impl Audit {
             .open(&self.log_path)?;
         writeln!(file, "{line}")?;
         Ok(())
+    }
+
+    /// Round 84 (PR-78f): read the last N audit entries from
+    /// `$DATA_DIR/audit.log`, in **file order** (oldest first
+    /// within the returned window), with optional
+    /// `since` / `action` filters applied before the limit. This
+    /// is the read counterpart to `Audit::record`.
+    ///
+    /// Behaviour:
+    ///   * Missing log file → empty Vec, not an error. A store
+    ///     that's never had a mutation has no audit yet.
+    ///   * Malformed JSON line → silently skipped + tracing::warn.
+    ///     A casual operator who hand-edited `audit.log` should
+    ///     still get a working `audit tail`.
+    ///   * `limit` clamped to `[1, AUDIT_TAIL_MAX_LIMIT]`. `None`
+    ///     uses `AUDIT_TAIL_DEFAULT_LIMIT`.
+    ///   * Implementation reads the whole file. v0.1.0 acceptable;
+    ///     a streaming reverse reader is a follow-up once real
+    ///     deployments hit multi-MB logs.
+    pub fn tail(&self, opts: &AuditTailOptions) -> std::io::Result<Vec<AuditTailRow>> {
+        let limit = opts
+            .limit
+            .unwrap_or(AUDIT_TAIL_DEFAULT_LIMIT)
+            .clamp(1, AUDIT_TAIL_MAX_LIMIT);
+
+        let file = match std::fs::File::open(&self.log_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let reader = std::io::BufReader::new(file);
+
+        let mut matched: Vec<AuditTailRow> = Vec::new();
+        for (idx, line) in reader.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, "audit.log read error, stopping tail walk early");
+                    break;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: AuditEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        line_no,
+                        "skipping malformed audit.log line"
+                    );
+                    continue;
+                }
+            };
+            if let Some(since) = opts.since {
+                if entry.timestamp < since {
+                    continue;
+                }
+            }
+            if let Some(action) = &opts.action {
+                if &entry.action != action {
+                    continue;
+                }
+            }
+            matched.push(AuditTailRow { line_no, entry });
+        }
+
+        // Keep the last `limit` in file order — same window
+        // semantic as `tail -n LIMIT [matching file]`.
+        if matched.len() > limit {
+            let drop_n = matched.len() - limit;
+            matched.drain(..drop_n);
+        }
+        Ok(matched)
     }
 }
 
@@ -154,5 +268,161 @@ mod tests {
         ));
         // No need to assert anything except that the call completes.
         audit.record(AuditEntry::new("safe", json!({})));
+    }
+
+    // ─── Round-84 PR-78f: Audit::tail ────────────────────────────────
+
+    /// Missing log → empty Vec, not an error. A store that's
+    /// never had a mutation has no audit yet.
+    #[test]
+    fn tail_returns_empty_when_log_does_not_exist() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        let rows = audit.tail(&AuditTailOptions::default()).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// `tail -n N` semantic: the last N entries in **file order**
+    /// (oldest first within the window). 1-based `line_no` lines
+    /// up with `head -n LINE`.
+    #[test]
+    fn tail_returns_last_n_entries_in_file_order() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        for action in ["a", "b", "c", "d", "e"] {
+            audit.record(AuditEntry::new(action, json!({})));
+        }
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].entry.action, "c");
+        assert_eq!(rows[0].line_no, 3);
+        assert_eq!(rows[1].entry.action, "d");
+        assert_eq!(rows[1].line_no, 4);
+        assert_eq!(rows[2].entry.action, "e");
+        assert_eq!(rows[2].line_no, 5);
+    }
+
+    /// `--action` exact-matches the entry's action field. Filter
+    /// runs *before* the limit so a giant unrelated action
+    /// (e.g. 500 `search` rows) doesn't starve a small target
+    /// (e.g. 3 `forget` rows).
+    #[test]
+    fn tail_filters_by_action_before_limit() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        for _ in 0..10 {
+            audit.record(AuditEntry::new("search", json!({})));
+        }
+        audit.record(AuditEntry::new("forget", json!({"why": "test"})));
+        for _ in 0..10 {
+            audit.record(AuditEntry::new("search", json!({})));
+        }
+
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(5),
+                action: Some("forget".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.action, "forget");
+        assert_eq!(rows[0].entry.detail["why"], "test");
+    }
+
+    /// `--since` drops entries strictly older than the given
+    /// instant. Combine with `--action` to reproduce "show me
+    /// what was forgotten in the last hour."
+    #[test]
+    fn tail_filters_by_since_timestamp() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        // Write 3 entries, then capture a cutoff, then write 2 more.
+        for action in ["old1", "old2", "old3"] {
+            audit.record(AuditEntry::new(action, json!({})));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let cutoff = Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for action in ["new1", "new2"] {
+            audit.record(AuditEntry::new(action, json!({})));
+        }
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(100),
+                since: Some(cutoff),
+                ..Default::default()
+            })
+            .unwrap();
+        let actions: Vec<&str> = rows.iter().map(|r| r.entry.action.as_str()).collect();
+        assert_eq!(actions, vec!["new1", "new2"]);
+    }
+
+    /// Malformed JSON lines are skipped, not fatal. An operator
+    /// who hand-edited `audit.log` (or whose disk corrupted one
+    /// row) should still get a working tail.
+    #[test]
+    fn tail_skips_malformed_jsonl_lines() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        audit.record(AuditEntry::new("good1", json!({})));
+        // Append a junk line directly.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(audit.path())
+                .unwrap();
+            writeln!(file, "this is not json {{").unwrap();
+        }
+        audit.record(AuditEntry::new("good2", json!({})));
+
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].entry.action, "good1");
+        assert_eq!(rows[0].line_no, 1);
+        assert_eq!(rows[1].entry.action, "good2");
+        assert_eq!(
+            rows[1].line_no, 3,
+            "line_no must still reflect the *file* line, including the skipped row"
+        );
+    }
+
+    /// Limit clamps to `[1, AUDIT_TAIL_MAX_LIMIT]` so a typo'd
+    /// `-n 1000000` can't exhaust memory.
+    #[test]
+    fn tail_clamps_limit_to_max() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        for i in 0..5 {
+            audit.record(AuditEntry::new(format!("a{i}"), json!({})));
+        }
+        // Way over the cap → returns ≤ cap, never panics.
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(AUDIT_TAIL_MAX_LIMIT * 10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(rows.len() <= AUDIT_TAIL_MAX_LIMIT);
+        assert_eq!(rows.len(), 5, "actual data is 5 rows");
+        // Limit of 0 clamps up to 1.
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

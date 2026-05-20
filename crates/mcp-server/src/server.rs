@@ -54,6 +54,11 @@ pub const ADMIN_TOOLS: &[&str] = &[
     "unforget_record",
     "list_forgotten",
     "tag_record",
+    // Round 84 (PR-78f): `audit_tail` is read-only but the
+    // entries it surfaces carry search queries, forget reasons,
+    // source locations — non-admin agents shouldn't be able to
+    // back-door read those.
+    "audit_tail",
 ];
 
 /// Was this tool tagged as admin?
@@ -75,6 +80,30 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
         "reason":       r.reason,
         "forgotten_at": r.forgotten_at,
     })
+}
+
+/// Round 84 (PR-78f): parse the MCP `audit_tail.since` arg —
+/// same grammar as CLI `parse_doctor_since` (Nd / Nh / Nm /
+/// bare seconds), returns the wall-clock instant `now - spec`
+/// so the caller can compare with `entry.timestamp` directly.
+fn parse_audit_since(spec: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("cannot be empty".into());
+    }
+    let (num_str, mult): (&str, i64) = match spec.chars().last() {
+        Some('d') | Some('D') => (&spec[..spec.len() - 1], 86_400),
+        Some('h') | Some('H') => (&spec[..spec.len() - 1], 3_600),
+        Some('m') | Some('M') => (&spec[..spec.len() - 1], 60),
+        _ => (spec, 1),
+    };
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| format!("must be `Nd` / `Nh` / `Nm` / bare seconds; got {spec:?}"))?;
+    if n < 0 {
+        return Err(format!("must be non-negative; got {spec:?}"));
+    }
+    Ok(chrono::Utc::now() - chrono::Duration::seconds(n.saturating_mul(mult)))
 }
 
 /// Round 83 (PR-78e): MCP wire shape for `forget_record { dry_run: true }`.
@@ -285,6 +314,7 @@ impl AnamnesisServer {
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             "dedupe" => self.tool_dedupe(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
+            "audit_tail" => self.tool_audit_tail(args.clone()).await,
             other => {
                 self.record_metric_safely(
                     Some(started_at),
@@ -1569,6 +1599,88 @@ impl AnamnesisServer {
         }))
     }
 
+    /// Round 84 (PR-78f): MCP-side `audit_tail`. Admin-gated
+    /// (the entries can carry search queries / forget reasons /
+    /// source locations); even then, the default response shape
+    /// is the **redacted summary** — `line_no`, `timestamp`,
+    /// `action`, `via`, `outcome`/`status` only. The full
+    /// per-entry `detail` payload is opt-in via
+    /// `include_detail: true` so an MCP agent doesn't
+    /// accidentally feed user-typed search text back into its
+    /// own context.
+    async fn tool_audit_tail(&self, args: Value) -> Result<Value, String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let since_spec = args
+            .get("since")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let since_dt: Option<chrono::DateTime<chrono::Utc>> = match since_spec {
+            Some(spec) => {
+                Some(parse_audit_since(spec).map_err(|e| format!("audit_tail.since: {e}"))?)
+            }
+            None => None,
+        };
+        let include_detail = args
+            .get("include_detail")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let opts = anamnesis_core::AuditTailOptions {
+            limit,
+            since: since_dt,
+            action: action.clone(),
+        };
+        let audit = anamnesis_core::Audit::new(&self.data_dir);
+        let rows = audit
+            .tail(&opts)
+            .map_err(|e| format!("audit_tail: read audit.log: {e}"))?;
+        let effective_limit = limit
+            .unwrap_or(anamnesis_core::AUDIT_TAIL_DEFAULT_LIMIT)
+            .clamp(1, anamnesis_core::AUDIT_TAIL_MAX_LIMIT);
+
+        let entries: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut row = json!({
+                    "line_no":   r.line_no,
+                    "timestamp": r.entry.timestamp,
+                    "action":    r.entry.action,
+                    "via":       r.entry.detail.get("via").cloned().unwrap_or(Value::Null),
+                    "outcome": r
+                        .entry
+                        .detail
+                        .get("outcome")
+                        .or_else(|| r.entry.detail.get("status"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                });
+                if include_detail {
+                    row["detail"] = r.entry.detail.clone();
+                }
+                row
+            })
+            .collect();
+
+        Ok(json!({
+            "count":           rows.len(),
+            "limit":           effective_limit,
+            "include_detail":  include_detail,
+            "filter": {
+                "action": action,
+                "since":  since_spec,
+            },
+            "entries": entries,
+        }))
+    }
+
     /// Build the right adapter for a registered source and call
     /// `MemoryAdapter::health().await`. Mirrors the CLI's
     /// `run_adapter_health` — the dispatch table stays in lockstep with
@@ -2366,6 +2478,42 @@ fn tools_list_payload_all() -> Value {
                     },
                     "required": ["record_id", "tags"]
                 }
+            },
+            {
+                "name": "audit_tail",
+                "description": "Round 84: tail the global mutation/search audit log at `data_dir/audit.log` \
+                                (every CLI + MCP write appends one JSONL entry via Audit::record). \
+                                ADMIN-GATED — the entries can include search queries, forget reasons, \
+                                and source locations, so non-admin agents shouldn't be able to \
+                                back-door read those. Default response is **redacted summary**: each \
+                                entry carries only `line_no / timestamp / action / via / outcome`. \
+                                Pass `include_detail: true` to receive the full per-entry `detail` \
+                                payload. Limit clamped to [1, 1000]. Distinct from the CLI's stage 2 \
+                                `audit list/show`, which reads a separate extractor log.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 20,
+                            "description": "Max entries to return. Clamped to [1, 1000] by the server."
+                        },
+                        "action": {
+                            "type": "string",
+                            "description": "Exact-match filter on `entry.action` (e.g. `forget`, `search`, `import`, `tag_record`). Omit for all actions."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Relative lookback. Shapes: `Nd` (days), `Nh` (hours), `Nm` (minutes), or bare integer (seconds). Same grammar as `doctor.since`."
+                        },
+                        "include_detail": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "When true, attach the full per-entry `detail` payload. Default off — keeps search queries / forget reasons out of the response by default."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -2649,8 +2797,9 @@ mod tests {
         let names = tool_names_from(&resp.result.unwrap());
         // R73 added forget_record (6→7). R74 added list_forgotten
         // (7→8). R75 added unforget_record (8→9). R77 added
-        // dedupe (9→10). R78 added tag_record (10→11).
-        assert_eq!(names.len(), 11);
+        // dedupe (9→10). R78 added tag_record (10→11). R84 added
+        // audit_tail (11→12).
+        assert_eq!(names.len(), 12);
         for expected in [
             "search_memories",
             "get_record",
@@ -2663,6 +2812,7 @@ mod tests {
             "list_forgotten",
             "dedupe",
             "tag_record",
+            "audit_tail",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
