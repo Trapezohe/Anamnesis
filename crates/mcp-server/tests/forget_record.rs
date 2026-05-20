@@ -535,3 +535,138 @@ async fn unforget_record_unknown_id_is_tool_error() {
         "error must explain why; got {msg}"
     );
 }
+
+// ─── Round-83 PR-78e: forget_record dry_run ──────────────────────────
+
+/// `dry_run: true` returns the cascade preview, marks
+/// `dry_run: true` in the payload, and does NOT mutate the
+/// store (record still gettable) and does NOT append an audit
+/// entry.
+#[tokio::test]
+async fn forget_record_dry_run_previews_without_mutating_or_auditing() {
+    let (bundle, id) = build_bundle(true);
+
+    // Capture audit baseline (file may not exist yet).
+    let audit_path = bundle.audit_dir.join("audit.log");
+    let audit_before = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "preview", "dry_run": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["dry_run"], true);
+    assert_eq!(payload["status"], "would-forget");
+    assert_eq!(payload["record_id"], id.0);
+    assert_eq!(payload["reason"], "preview");
+    assert_eq!(payload["would_delete"]["records"], 1);
+    assert!(payload["would_delete"]["record_chunks"].as_u64().unwrap() >= 1);
+    assert_eq!(payload["would_insert"]["record_tombstones"], 1);
+    assert_eq!(payload["would_insert"]["audit_log_entries"], 1);
+
+    // Mutation guard: audit file size is unchanged after the
+    // dry-run call returned. Capture this BEFORE running
+    // anything else so subsequent calls (like get_record) don't
+    // confound the size delta.
+    assert_eq!(
+        std::fs::metadata(&audit_path).ok().map(|m| m.len()),
+        audit_before,
+        "dry-run must not append to audit.log"
+    );
+
+    // The live record still resolves — get_record uses `id`, not
+    // `record_id`, matching the existing schema.
+    let still_there = bundle
+        .server
+        .handle(tool_call("get_record", json!({"id": id.0})))
+        .await;
+    assert!(still_there.error.is_none());
+    let still_there_payload = extract_payload(&still_there);
+    assert!(
+        !still_there_payload.is_null(),
+        "live record must still resolve after dry-run; got null"
+    );
+}
+
+/// Admin gate is still enforced for dry-run — the preview
+/// reveals raw_hash/native_path and destructive intent, so it
+/// must require the same ACL as the real forget.
+#[tokio::test]
+async fn forget_record_dry_run_is_still_admin_gated() {
+    let (bundle, id) = build_bundle(false);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "dry_run": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "dry-run must not bypass admin gate");
+}
+
+/// `dry_run: true` on an already-forgotten record returns
+/// `already-forgotten` with the existing tombstone and
+/// `dry_run: true` flag. No second audit entry.
+#[tokio::test]
+async fn forget_record_dry_run_already_forgotten_echoes_tombstone() {
+    let (bundle, id) = build_bundle(true);
+    // Real forget first.
+    bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "init"}),
+        ))
+        .await;
+    let audit_path = bundle.audit_dir.join("audit.log");
+    let audit_size_after_real = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+
+    // Now dry-run.
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "dry_run": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["dry_run"], true);
+    assert_eq!(payload["outcome"], "already-forgotten");
+    assert_eq!(payload["reason"], "init");
+
+    // No new audit entry appended.
+    assert_eq!(
+        std::fs::metadata(&audit_path).ok().map(|m| m.len()),
+        audit_size_after_real,
+        "dry-run on already-forgotten must not append to audit.log"
+    );
+}
+
+/// tools/list schema advertises the `dry_run` arg so MCP
+/// clients can introspect.
+#[tokio::test]
+async fn forget_record_tools_list_schema_advertises_dry_run() {
+    let (bundle, _id) = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let forget = tools
+        .iter()
+        .find(|t| t["name"] == "forget_record")
+        .expect("forget_record must be in admin tools/list");
+    let props = &forget["inputSchema"]["properties"];
+    assert_eq!(
+        props["dry_run"]["type"], "boolean",
+        "forget_record must advertise dry_run arg: {forget}"
+    );
+}

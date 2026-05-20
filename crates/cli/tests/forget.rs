@@ -422,3 +422,123 @@ fn list_forgotten_empty_store_says_so() {
         .success()
         .stdout(contains("no forgotten records"));
 }
+
+// ─── Round-83 PR-78e: forget --dry-run ──────────────────────────────
+
+/// `--dry-run` reports the cascade without mutating: the record
+/// is still searchable, list-forgotten count stays 0, and
+/// audit.log carries no new entry.
+#[test]
+fn forget_dry_run_reports_cascade_without_mutating() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+
+    // Baseline: forgetMeChannel still hits.
+    let pre_hits = search_hit_count(home.path(), data.path(), "forgetMeChannel");
+    assert_eq!(pre_hits, 1);
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+
+    // Capture audit.log size **immediately** before the dry-run
+    // so subsequent `search` / `list-forgotten` calls don't get
+    // counted against the dry-run's promise.
+    let audit_path = data.path().join("audit.log");
+    let audit_before = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+
+    // Dry-run.
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid, "--dry-run", "--json", "--reason", "preview"])
+        .output()
+        .unwrap();
+    // Capture audit.log immediately after the dry-run binary
+    // returns — this is the only window where "dry-run did not
+    // append" is a well-defined statement.
+    let audit_after = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+    assert_eq!(
+        audit_before, audit_after,
+        "dry-run must not append to audit.log"
+    );
+
+    assert!(out.status.success(), "dry-run must succeed on live record");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["status"], "would-forget");
+    assert_eq!(v["record_id"], rid);
+    assert_eq!(v["reason"], "preview");
+    assert_eq!(v["would_delete"]["records"], 1);
+    assert!(v["would_delete"]["record_chunks"].as_u64().unwrap() >= 1);
+    assert_eq!(v["would_insert"]["record_tombstones"], 1);
+    assert_eq!(v["would_insert"]["audit_log_entries"], 1);
+
+    // Mutation guard: the record is still searchable + no
+    // tombstone landed.
+    assert_eq!(
+        search_hit_count(home.path(), data.path(), "forgetMeChannel"),
+        1,
+        "dry-run must not delete the record"
+    );
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["count"], 0,
+        "dry-run must not write a tombstone (list-forgotten count must stay 0)"
+    );
+}
+
+/// `--dry-run` on an already-forgotten id reports
+/// `already-forgotten` and exits 0 — same idempotency contract
+/// as the real path. Mutation guard: no second tombstone.
+#[test]
+fn forget_dry_run_on_already_forgotten_is_idempotent() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+
+    // Real forget first.
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid])
+        .assert()
+        .success();
+    // Now dry-run should report already-forgotten.
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid, "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["status"], "already-forgotten");
+    // No additional cascade work would happen.
+    assert_eq!(v["would_delete"]["records"], 0);
+    assert_eq!(v["would_insert"]["record_tombstones"], 0);
+}
+
+/// `--dry-run` on a never-existed id exits non-zero — typo loud.
+#[test]
+fn forget_dry_run_not_found_exits_nonzero() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", "phantom-id-doesnt-exist", "--dry-run"])
+        .assert()
+        .failure();
+}
