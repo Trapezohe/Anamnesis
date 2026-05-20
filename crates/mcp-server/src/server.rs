@@ -147,6 +147,53 @@ fn forget_dry_run_payload(
     })
 }
 
+/// Round 85 (PR-78g): render `Store::lineage_chain` as the MCP
+/// `get_record { include_lineage: true }` payload. Each entry is
+/// a **summary** — record_id + provenance + classification but
+/// NOT the heavy `content` / `metadata` blob, so a deep chain
+/// doesn't bloat the get_record response. Agents that want full
+/// ancestor content re-call `get_record` for that id.
+///
+/// `chain[0]` is the leaf (the record the caller asked for);
+/// `chain[last]` is the furthest ancestor we could resolve.
+/// `complete: false` means `missing_parent` was hit before
+/// reaching a real root.
+fn build_lineage_payload(chain: &anamnesis_store::LineageChain) -> Value {
+    let records: Vec<Value> = chain
+        .records
+        .iter()
+        .map(|r| {
+            json!({
+                "record_id":    r.id.0,
+                "adapter":      r.source.adapter,
+                "instance": match &r.source.instance {
+                    Some(s) if !s.is_empty() => Value::String(s.clone()),
+                    _ => Value::Null,
+                },
+                "kind":         format!("{:?}", r.kind).to_lowercase(),
+                "scope":        format!("{:?}", r.scope).to_lowercase(),
+                "derived_from": r.provenance.derived_from.as_ref().map(|p| p.0.clone()),
+                "native_id":    r.provenance.native_id,
+                "native_path":  r.provenance.native_path,
+                "raw_hash":     r.provenance.raw_hash,
+                "captured_at":  r.provenance.captured_at.timestamp(),
+                "created_at":   r.created_at.timestamp(),
+            })
+        })
+        .collect();
+    let start = records
+        .first()
+        .and_then(|r| r["record_id"].as_str())
+        .map(str::to_owned);
+    json!({
+        "start":          start,
+        "depth":          records.len(),
+        "complete":       chain.missing_parent.is_none(),
+        "missing_parent": chain.missing_parent.as_ref().map(|p| p.0.clone()),
+        "chain":          records,
+    })
+}
+
 /// Round-22 (§-1.5 PR-5): parse an RFC3339 timestamp into the unix
 /// seconds form the `SearchFilter` stores. Used by `search_memories`
 /// for `since` / `until` parameters. Returns a string-form error so the
@@ -685,6 +732,15 @@ impl AnamnesisServer {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "get_record.id is required".to_string())?;
+        // Round 85 (PR-78g): optional provenance walk. Default
+        // false so the wire shape stays back-compatible for every
+        // existing MCP agent — they only opt in when they actually
+        // want lineage.
+        let include_lineage = args
+            .get("include_lineage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let store = &self.store;
         let rec = store
             .get_record(&RecordId(id.to_string()))
@@ -710,6 +766,24 @@ impl AnamnesisServer {
         // when no user tags) so agents can branch on absence
         // uniformly. Read is NOT admin-gated — only writes are.
         let user_tags = store.user_tags(&r.id).map_err(|e| format!("store: {e}"))?;
+
+        // Round 85 (PR-78g): leaf-to-root provenance chain via
+        // R74's existing `LineageChain`. Each chain entry is a
+        // *summary* (no `content`, no `metadata`) — agents that
+        // want full ancestor content re-call `get_record` for that
+        // id. This keeps the get_record payload bounded even when
+        // an extractor produced a deep chain. `chain[0]` is the
+        // record the caller asked for; `chain[last]` is the
+        // furthest ancestor we could resolve.
+        let lineage_payload: Option<Value> = if include_lineage {
+            let chain = store
+                .lineage_chain(&r.id)
+                .map_err(|e| format!("get_record.include_lineage: {e}"))?
+                .ok_or_else(|| "lineage: record vanished between lookup and walk".to_string())?;
+            Some(build_lineage_payload(&chain))
+        } else {
+            None
+        };
 
         Ok(json!({
             "record_id": r.id.0,
@@ -752,6 +826,10 @@ impl AnamnesisServer {
             // (which is adapter-derived and gets overwritten on
             // re-import). Empty array is the common case.
             "user_tags": user_tags,
+            // Round 85: provenance walk. Only present when the
+            // caller passed `include_lineage: true`. Default
+            // omission keeps the wire shape back-compatible.
+            "lineage": lineage_payload,
         }))
     }
 
@@ -2212,10 +2290,25 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "get_record",
-                "description": "Fetch one record by id.",
+                "description": "Fetch one record by id. Read-only, NOT admin-gated. \
+                                Pass `include_lineage: true` (Round 85) to attach a `lineage` \
+                                block carrying the leaf→root provenance chain — each entry is \
+                                a *summary* (provenance + classification, no content) to keep \
+                                the payload bounded; agents that want full ancestor content \
+                                re-call `get_record` for that id.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"id": {"type": "string"}},
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Record id (as returned by `search_memories` / `list_forgotten`)."
+                        },
+                        "include_lineage": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 85: attach `lineage.{start, depth, complete, missing_parent, chain[]}` from `Store::lineage_chain`. Default off — keeps the wire shape back-compatible."
+                        }
+                    },
                     "required": ["id"]
                 }
             },
