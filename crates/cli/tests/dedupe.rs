@@ -291,3 +291,82 @@ fn dedupe_source_filter_limit_picks_filtered_group() {
     assert_eq!(v["count"], 1);
     assert_eq!(v["groups"][0]["raw_hash"], "h-mixed");
 }
+
+// ─── Round-97 PR-78s: dedupe --include-counts ──────────────────────
+
+/// Default `dedupe --json` has no `counts` block — every R77
+/// consumer keeps working verbatim.
+#[test]
+fn dedupe_default_json_has_no_counts_block() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_duplicates(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v.get("counts").is_none(),
+        "default dedupe must not carry counts; got {v}"
+    );
+}
+
+/// `--include-counts` attaches the filter-scoped aggregate.
+/// `limit` doesn't affect counts; they always reflect the full
+/// matching set.
+#[test]
+fn dedupe_include_counts_reflects_full_set_ignoring_limit() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--limit", "1", "--json", "--include-counts"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["count"], 1, "rows still respect --limit");
+    let counts = &v["counts"];
+    // seed_two_groups builds h-mixed (mem0 + claude-code) and
+    // h-other (claude-code + claude-code) — 2 groups, 4 records.
+    assert_eq!(counts["total_groups"], 2);
+    assert_eq!(counts["total_records"], 4);
+    let by_source = counts["by_source"].as_array().unwrap();
+    let cc = by_source
+        .iter()
+        .find(|b| b["adapter"] == "claude-code")
+        .unwrap();
+    let mem = by_source.iter().find(|b| b["adapter"] == "mem0").unwrap();
+    assert_eq!(cc["duplicate_record_count"], 3);
+    assert_eq!(mem["duplicate_record_count"], 1);
+    assert!(cc["instance"].is_null());
+    assert!(mem["instance"].is_null());
+}
+
+/// Counts block carries only numerics — no `raw_hash`, no
+/// `native_path`, no `native_id`. Stays inside the existing
+/// dedupe redaction boundary.
+#[test]
+fn dedupe_counts_block_carries_no_sensitive_fields() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--json", "--include-counts"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let counts_str = serde_json::to_string(&v["counts"]).unwrap();
+    for forbidden in ["h-mixed", "h-other", "raw_hash", "native_path", "native_id"] {
+        assert!(
+            !counts_str.contains(forbidden),
+            "counts must not leak {forbidden:?}: {counts_str}"
+        );
+    }
+}
