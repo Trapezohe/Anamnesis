@@ -101,6 +101,64 @@ pub struct RankedChunk {
     pub from_fts: bool,
     /// `true` if vector search contributed to this hit.
     pub from_vec: bool,
+    /// Round 87 (PR-78i): per-stage score breakdown — the
+    /// rank + raw score + RRF contribution from FTS and vector,
+    /// plus `rrf_k` so the consumer can verify the arithmetic.
+    /// **Always populated**; consumers branch on the inner
+    /// `Option`s to know whether each stage contributed. CLI /
+    /// MCP only surface this when the caller opts in with
+    /// `--explain` / `explain: true` — the field exists on
+    /// every chunk so the search layer doesn't need a second
+    /// merge variant.
+    pub explain: ChunkScoreExplain,
+}
+
+/// Round 87 (PR-78i): a single search stage's contribution to a
+/// chunk's RRF score. Numeric-only — no record/chunk ids, no
+/// query, no snippet — so this fits the same privacy contract
+/// as `SearchTrace`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageScore {
+    /// 1-based rank in the stage's hit list (1 = top hit).
+    pub rank: usize,
+    /// Raw score from the underlying index. FTS uses negated
+    /// BM25 (larger = better, matches the existing `fts_score`);
+    /// vector uses cosine similarity in `[0, 1]`.
+    pub raw_score: f64,
+    /// `1.0 / (RRF_K + rank)` — what this stage contributed to
+    /// the chunk's combined RRF score.
+    pub rrf_contribution: f64,
+}
+
+/// Round 87 (PR-78i): per-chunk score breakdown attached to
+/// every `RankedChunk`. CLI/MCP only render it when the caller
+/// opts into `--explain` / `explain: true`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkScoreExplain {
+    /// FTS stage contribution. `None` when the chunk surfaced
+    /// only via vector kNN.
+    pub fts: Option<StageScore>,
+    /// Vector stage contribution. `None` when the chunk
+    /// surfaced only via FTS.
+    pub vector: Option<StageScore>,
+    /// The RRF constant used by this merge — pinned so the
+    /// consumer can verify `rrf_contribution = 1 / (rrf_k +
+    /// rank)`.
+    pub rrf_k: f64,
+}
+
+impl ChunkScoreExplain {
+    /// Empty explain — used as the default in places that don't
+    /// participate in RRF (e.g. a fulltext-only path that
+    /// rebuilds `RankedChunk`s directly). RRF merge fills the
+    /// real values in.
+    pub fn empty() -> Self {
+        Self {
+            fts: None,
+            vector: None,
+            rrf_k: RRF_K,
+        }
+    }
 }
 
 /// The composer.
@@ -332,7 +390,7 @@ pub struct SearchStageCounts {
 
 /// Pure RRF logic — separated for unit testing without a DB.
 pub mod rrf {
-    use super::{RankedChunk, RRF_K};
+    use super::{ChunkScoreExplain, RankedChunk, StageScore, RRF_K};
     use anamnesis_store::ChunkHit;
     use std::collections::HashMap;
 
@@ -342,7 +400,10 @@ pub mod rrf {
     /// returned `RankedChunk` also carries the raw per-modality scores
     /// (`fts_score`, `vector_score`) so downstream consumers — MCP
     /// agents in particular — can explain "why did this surface" without
-    /// a round trip back to the index.
+    /// a round trip back to the index. Round 87 attaches a structured
+    /// `explain` block with the 1-based rank and per-stage
+    /// `rrf_contribution = 1.0 / (RRF_K + rank)` so callers can
+    /// reproduce the arithmetic exactly.
     pub fn merge(fts: &[ChunkHit], vec: &[ChunkHit], limit: usize) -> Vec<RankedChunk> {
         let mut acc: HashMap<String, RankedChunk> = HashMap::new();
         for (rank, hit) in fts.iter().enumerate() {
@@ -358,10 +419,20 @@ pub mod rrf {
                     vector_score: None,
                     from_fts: false,
                     from_vec: false,
+                    explain: ChunkScoreExplain::empty(),
                 });
-            entry.score += 1.0 / (RRF_K + rank as f64 + 1.0);
+            // 1-based rank — matches operator intuition ("the
+            // top FTS hit is rank 1, not rank 0").
+            let rank_1 = rank + 1;
+            let contribution = 1.0 / (RRF_K + rank_1 as f64);
+            entry.score += contribution;
             entry.fts_score = Some(hit.score);
             entry.from_fts = true;
+            entry.explain.fts = Some(StageScore {
+                rank: rank_1,
+                raw_score: hit.score,
+                rrf_contribution: contribution,
+            });
         }
         for (rank, hit) in vec.iter().enumerate() {
             let entry = acc
@@ -376,10 +447,18 @@ pub mod rrf {
                     vector_score: None,
                     from_fts: false,
                     from_vec: false,
+                    explain: ChunkScoreExplain::empty(),
                 });
-            entry.score += 1.0 / (RRF_K + rank as f64 + 1.0);
+            let rank_1 = rank + 1;
+            let contribution = 1.0 / (RRF_K + rank_1 as f64);
+            entry.score += contribution;
             entry.vector_score = Some(hit.score);
             entry.from_vec = true;
+            entry.explain.vector = Some(StageScore {
+                rank: rank_1,
+                raw_score: hit.score,
+                rrf_contribution: contribution,
+            });
         }
         let mut out: Vec<RankedChunk> = acc.into_values().collect();
         out.sort_by(|a, b| {
@@ -461,6 +540,86 @@ pub mod rrf {
             // so a single tail hit isn't crushed by a single head hit.
             let out = merge(&[hit("top", 0.0)], &[], 1);
             assert!((out[0].score - (1.0 / 61.0)).abs() < 1e-9);
+        }
+
+        // ─── Round-87 PR-78i: per-stage explain breakdown ──────────
+
+        /// RRF merge populates `explain.fts.rank` (1-based) and
+        /// `explain.fts.rrf_contribution = 1/(K+rank)` on every
+        /// FTS-only hit. Pinned because the CLI / MCP wire
+        /// formats reproduce this arithmetic.
+        #[test]
+        fn merge_populates_fts_explain_with_rank_and_contribution() {
+            let out = merge(&[hit("a", 3.21), hit("b", 1.5)], &[], 10);
+            let a = out.iter().find(|r| r.chunk_id == "a").unwrap();
+            let a_fts = a
+                .explain
+                .fts
+                .as_ref()
+                .expect("FTS-only hit must have fts explain");
+            assert_eq!(a_fts.rank, 1);
+            assert!((a_fts.raw_score - 3.21).abs() < 1e-9);
+            assert!((a_fts.rrf_contribution - 1.0 / 61.0).abs() < 1e-9);
+            assert!(
+                a.explain.vector.is_none(),
+                "FTS-only hit has no vector breakdown"
+            );
+            assert!((a.explain.rrf_k - RRF_K).abs() < 1e-9);
+
+            let b = out.iter().find(|r| r.chunk_id == "b").unwrap();
+            let b_fts = b.explain.fts.as_ref().unwrap();
+            assert_eq!(b_fts.rank, 2);
+            assert!((b_fts.rrf_contribution - 1.0 / 62.0).abs() < 1e-9);
+        }
+
+        /// A chunk that hits in both FTS and vector lists carries
+        /// both `explain.fts` and `explain.vector`. Combined
+        /// `score` equals the sum of the two `rrf_contribution`s
+        /// — operators can verify the arithmetic without trusting
+        /// the implementation.
+        #[test]
+        fn merge_populates_both_stages_when_hit_in_both_lists() {
+            let fts = vec![hit("a", 5.0)];
+            let vec = vec![hit("a", 0.8)];
+            let out = merge(&fts, &vec, 10);
+            let a = out.iter().find(|r| r.chunk_id == "a").unwrap();
+            let fts_stage = a.explain.fts.as_ref().unwrap();
+            let vec_stage = a.explain.vector.as_ref().unwrap();
+            assert_eq!(fts_stage.rank, 1);
+            assert_eq!(vec_stage.rank, 1);
+            let sum = fts_stage.rrf_contribution + vec_stage.rrf_contribution;
+            assert!(
+                (a.score - sum).abs() < 1e-9,
+                "RankedChunk.score must equal Σ rrf_contribution across stages"
+            );
+        }
+
+        /// `ChunkScoreExplain` carries only numeric data — no
+        /// chunk_id, no record_id, no content, no query — so it
+        /// fits the same privacy contract as `SearchTrace`. Serde
+        /// the struct and grep for any forbidden text.
+        #[test]
+        fn chunk_explain_struct_carries_only_numeric_fields() {
+            let e = ChunkScoreExplain {
+                fts: Some(StageScore {
+                    rank: 1,
+                    raw_score: 3.21,
+                    rrf_contribution: 1.0 / 61.0,
+                }),
+                vector: None,
+                rrf_k: RRF_K,
+            };
+            // Debug-format the struct and assert no string fields
+            // exist. (We don't auto-derive Serialize on this type;
+            // the wire-format conversion lives at the CLI / MCP
+            // layer so the struct itself stays minimal.)
+            let dbg = format!("{e:?}");
+            for forbidden in ["chunk_id", "record_id", "content", "query", "snippet"] {
+                assert!(
+                    !dbg.contains(forbidden),
+                    "explain struct must NOT carry {forbidden}: {dbg}"
+                );
+            }
         }
     }
 }

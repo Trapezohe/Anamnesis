@@ -154,6 +154,14 @@ enum Command {
         /// (`trim().to_lowercase()`).
         #[arg(long)]
         user_tag: Option<String>,
+        /// Round 87 (PR-78i): attach a per-result `explain` block
+        /// breaking down the ranking arithmetic: best-chunk RRF
+        /// score, kind boost, and the FTS / vector stage ranks +
+        /// raw scores + `rrf_contribution = 1/(rrf_k + rank)`.
+        /// Default off. Orthogonal to `--trace` (which reports
+        /// stage *timings* and candidate counts).
+        #[arg(long)]
+        explain: bool,
     },
 
     /// Apply or remove user tags on a record (local overlay).
@@ -828,6 +836,7 @@ async fn main() -> Result<()> {
             json,
             trace,
             user_tag,
+            explain,
         } => {
             cmd_search(
                 &data_dir,
@@ -843,6 +852,7 @@ async fn main() -> Result<()> {
                 json,
                 trace,
                 user_tag.as_deref(),
+                explain,
             )
             .await
         }
@@ -2378,6 +2388,7 @@ async fn cmd_search(
     json: bool,
     trace: bool,
     user_tag: Option<&str>,
+    explain: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let mode = match mode_str {
@@ -2493,7 +2504,7 @@ async fn cmd_search(
             // CLI and MCP consumers can rely on identical JSON shapes.
             "results": filtered.iter().map(|p| {
                 let best = p.matched_chunks.first();
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "record_id": p.record.id.0,
                     "trace_id": p.record.id.0,
                     "chunk_id": best.map(|c| c.chunk_id.clone()),
@@ -2514,7 +2525,14 @@ async fn cmd_search(
                     // Round 78: user-tag overlay. Always emitted —
                     // empty array when the record has no user tags.
                     "user_tags": p.record.user_tags,
-                })
+                });
+                // Round 87 (PR-78i): opt-in score breakdown.
+                // Attached only when --explain is set, keeping
+                // the default wire shape byte-stable.
+                if explain {
+                    row["explain"] = render_score_explain(&p.score_explain());
+                }
+                row
             }).collect::<Vec<_>>(),
         });
         if trace {
@@ -2637,6 +2655,43 @@ async fn cmd_search(
         }
     }
     Ok(())
+}
+
+/// Round 87 (PR-78i): render `RecordScoreExplain` as JSON for
+/// the `--explain` payload. Shared between CLI and MCP via the
+/// `anamnesis-search` crate's struct, so the two surfaces can't
+/// drift on field names or arithmetic.
+fn render_score_explain(e: &anamnesis_search::RecordScoreExplain) -> serde_json::Value {
+    let stages = match &e.best_chunk_stages {
+        Some(s) => {
+            let fts = s.fts.as_ref().map(|st| {
+                serde_json::json!({
+                    "rank": st.rank,
+                    "raw_score": st.raw_score,
+                    "rrf_contribution": st.rrf_contribution,
+                })
+            });
+            let vector = s.vector.as_ref().map(|st| {
+                serde_json::json!({
+                    "rank": st.rank,
+                    "raw_score": st.raw_score,
+                    "rrf_contribution": st.rrf_contribution,
+                })
+            });
+            serde_json::json!({
+                "fts": fts,
+                "vector": vector,
+                "rrf_k": s.rrf_k,
+            })
+        }
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "record_score": e.record_score,
+        "best_chunk_rrf_score": e.best_chunk_rrf_score,
+        "kind_boost": e.kind_boost,
+        "stages": stages,
+    })
 }
 
 /// Render the search trace as a compact block under the human

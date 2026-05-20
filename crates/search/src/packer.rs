@@ -107,6 +107,59 @@ pub struct PackedRecord {
     pub score: f64,
 }
 
+/// Round 87 (PR-78i): one record's full ranking story, derived
+/// from its `PackedRecord`. CLI / MCP only render this when the
+/// caller opts into `--explain` / `explain: true`; the
+/// search-layer always *has* the data via `RankedChunk.explain`,
+/// this helper just keeps the math in one place so the two
+/// surfaces can't drift.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordScoreExplain {
+    /// `PackedRecord.score` — what the packer ranks records on.
+    /// Equals `best_chunk_rrf_score + kind_boost`.
+    pub record_score: f64,
+    /// The best chunk's RRF score (the raw sum across stages,
+    /// before the per-kind boost).
+    pub best_chunk_rrf_score: f64,
+    /// Bonus added for high-signal record kinds (`Fact`,
+    /// `Preference`, `Profile`). `0.0` for the rest.
+    pub kind_boost: f64,
+    /// The best chunk's per-stage breakdown (rank + raw score +
+    /// RRF contribution from FTS and vector). `None` if the
+    /// record was packed via a path that bypassed RRF merge
+    /// (e.g. unit-test fixtures).
+    pub best_chunk_stages: Option<crate::hybrid::ChunkScoreExplain>,
+}
+
+impl PackedRecord {
+    /// Round 87: structured per-record score breakdown for the
+    /// `--explain` wire field. Only meaningful for records that
+    /// went through `rrf::merge`; records packed via test
+    /// fixtures that bypass RRF report
+    /// `best_chunk_stages = None`.
+    pub fn score_explain(&self) -> RecordScoreExplain {
+        let best_chunk_rrf_score = self.matched_chunks.first().map(|c| c.score).unwrap_or(0.0);
+        let kind_boost = self.score - best_chunk_rrf_score;
+        let best_chunk_stages = self.matched_chunks.first().and_then(|c| {
+            // The synthesised empty explain (no FTS, no vector,
+            // default rrf_k) means this chunk didn't actually
+            // come through the RRF merge — surface `None` so
+            // CLI/MCP don't pretend they have a real breakdown.
+            if c.explain.fts.is_none() && c.explain.vector.is_none() {
+                None
+            } else {
+                Some(c.explain.clone())
+            }
+        });
+        RecordScoreExplain {
+            record_score: self.score,
+            best_chunk_rrf_score,
+            kind_boost,
+            best_chunk_stages,
+        }
+    }
+}
+
 /// Aggregate hits into records, apply provenance + diversity + budget.
 ///
 /// Hits with a `record_id` that no longer exists in the store (e.g. a
@@ -383,6 +436,11 @@ mod tests {
             vector_score: None,
             from_fts: true,
             from_vec: false,
+            // Round 87: the helper synthesises its own scores
+            // outside RRF, so the explain breakdown is empty —
+            // mirrors what `ChunkScoreExplain::empty()` does in
+            // production code paths that bypass `rrf::merge`.
+            explain: crate::hybrid::ChunkScoreExplain::empty(),
         }
     }
 
