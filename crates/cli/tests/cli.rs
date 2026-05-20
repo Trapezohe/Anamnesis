@@ -2063,6 +2063,116 @@ fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
         );
 }
 
+// ─── Round-88 PR-78j: source list --json ───────────────────────────
+
+/// Empty registry: `source list --json` returns the structured
+/// empty payload, not the human "no sources registered" prose.
+#[test]
+fn source_list_json_empty_registry_returns_structured_payload() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = v["sources"].as_array().unwrap();
+    assert!(
+        sources.is_empty(),
+        "must return empty array, got {sources:?}"
+    );
+}
+
+/// With a registered source + seeded records, `source list --json`
+/// reports counts and serialises the default instance as
+/// `null` — same wire convention MCP `list_sources` uses.
+#[test]
+fn source_list_json_reports_counts_and_null_default_instance() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::{Store, UserTagOperation};
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    for n in ["a", "b"] {
+        let r = AnamnesisRecord {
+            id: RecordId::from_parts("claude-code", None, n),
+            source: SourceDescriptor {
+                adapter: "claude-code".into(),
+                instance: None,
+                version: "0".into(),
+            },
+            content: format!("body {n}"),
+            embedding: None,
+            scope: Scope::User,
+            kind: Kind::Fact,
+            created_at: Utc::now(),
+            updated_at: None,
+            tags: vec![],
+            metadata: Default::default(),
+            provenance: Provenance {
+                native_id: n.into(),
+                native_path: None,
+                captured_at: Utc::now(),
+                raw_hash: format!("h-{n}"),
+                derived_from: None,
+            },
+            schema_version: SCHEMA_VERSION,
+        };
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+    }
+    let id_a = RecordId::from_parts("claude-code", None, "a");
+    store
+        .tag_record(&id_a, &["keep".into()], UserTagOperation::Add)
+        .unwrap();
+    drop(store);
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = v["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    let s = &sources[0];
+    assert_eq!(s["adapter"], "claude-code");
+    assert!(
+        s["instance"].is_null(),
+        "default instance must be null, got {s}"
+    );
+    assert_eq!(s["location"], "/tmp/cc");
+    assert_eq!(s["record_count"], 2);
+    assert!(s["chunk_count"].as_u64().unwrap() >= 2);
+    assert_eq!(s["tagged_record_count"], 1);
+    assert!(s["added_at"].as_i64().is_some());
+    assert!(s["last_import_at"].is_null());
+    // No active_model / stats block — that's status's job.
+    assert!(v.get("active_model").is_none());
+    assert!(v.get("stats").is_none());
+}
+
 // ─── Round-87 PR-78i: search --explain ─────────────────────────────
 
 /// Default `search --json` carries no `explain` field —

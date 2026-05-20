@@ -585,7 +585,14 @@ enum SourceCmd {
         token_env: Option<String>,
     },
     /// List configured sources.
-    List,
+    List {
+        /// Round 88: emit JSON instead of the human table.
+        /// Mirrors R86's `source show --json` shape and the
+        /// MCP `list_sources` wire format so scripts can
+        /// consume the same field set from either side.
+        #[arg(long)]
+        json: bool,
+    },
     /// Round 86: per-source detail view. Same counts as
     /// `source list` (records, chunks, tagged) for one
     /// `(adapter, instance)`, plus the last few `import_errors`
@@ -1546,13 +1553,24 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             );
             Ok(())
         }
-        SourceCmd::List => {
+        SourceCmd::List { json } => {
             // Round-9: show per-source counts alongside last_import so
             // operators can spot "registered but empty" sources at a
             // glance — same signal MCP agents get from list_sources.
             // Round-82: add `tagged` column so operators can see
             // where their curated `user_tags` actually live.
             let rows = store.list_sources_with_counts()?;
+            if json {
+                // Round 88: shape mirrors R86 `source_show.source`
+                // + MCP `list_sources.sources[]`. Empty registry
+                // returns `{ "sources": [] }` (not human prose)
+                // so scripts can branch uniformly.
+                let payload = serde_json::json!({
+                    "sources": rows.iter().map(render_source_with_counts_json).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("no sources registered");
             } else {
@@ -1596,6 +1614,27 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             json,
         } => cmd_source_show(&store, &target, errors, json),
     }
+}
+
+/// Round 88 (PR-78j): render a `SourceWithCounts` as the shared
+/// `source list --json` / `source show --json` source-object
+/// shape. Same field set the MCP `list_sources` wire emits, so
+/// any tool that already consumes one can parse the other.
+fn render_source_with_counts_json(swc: &anamnesis_store::SourceWithCounts) -> serde_json::Value {
+    serde_json::json!({
+        "adapter": swc.source.adapter,
+        "instance": if swc.source.instance.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(swc.source.instance.clone())
+        },
+        "location": swc.source.location,
+        "added_at": swc.source.added_at,
+        "last_import_at": swc.source.last_import_at,
+        "record_count": swc.record_count,
+        "chunk_count": swc.chunk_count,
+        "tagged_record_count": swc.tagged_record_count,
+    })
 }
 
 /// Round 86 (PR-78h): `anamnesis source show <adapter[:instance]>`
