@@ -242,6 +242,17 @@ enum Command {
         /// Reveal `raw_hash` and `native_path` fields. Default off.
         #[arg(long)]
         include_sensitive: bool,
+        /// Round 97: append a `counts` block reporting filter-
+        /// scoped totals — `total_groups` (duplicate groups
+        /// matching the filter, ignoring `--limit`),
+        /// `total_records` (sum of live records across those
+        /// whole groups), and `by_source[]` (per-`(adapter,
+        /// instance)` record breakdown). Counts respect the
+        /// same `--source` / `--instance` filter as the row
+        /// list but reflect the full matching set, not the
+        /// current page. Default off — back-compat.
+        #[arg(long)]
+        include_counts: bool,
     },
 
     /// Remove a tombstone so the source can resurrect the memory
@@ -957,6 +968,7 @@ async fn main() -> Result<()> {
             limit,
             json,
             include_sensitive,
+            include_counts,
         } => cmd_dedupe(
             &data_dir,
             source.as_deref(),
@@ -964,6 +976,7 @@ async fn main() -> Result<()> {
             limit,
             json,
             include_sensitive,
+            include_counts,
         ),
         Command::Unforget {
             record_id,
@@ -3315,6 +3328,7 @@ fn filter_label(source: Option<&str>, instance: Option<&str>) -> String {
 ///
 /// Read-only — no audit log, no store writes. Composes with
 /// `anamnesis forget <record_id>` for the action half.
+#[allow(clippy::too_many_arguments)]
 fn cmd_dedupe(
     data_dir: &std::path::Path,
     source: Option<&str>,
@@ -3322,6 +3336,7 @@ fn cmd_dedupe(
     limit: u32,
     json: bool,
     include_sensitive: bool,
+    include_counts: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::DuplicateRawHashFilter {
@@ -3331,9 +3346,16 @@ fn cmd_dedupe(
     };
     let groups = store.list_duplicate_raw_hashes_filtered(&filter)?;
     let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
+    // Round 97: filter-scoped aggregate. Counts reflect the
+    // full matching set; `limit` only affects `groups[]`.
+    let counts = if include_counts {
+        Some(store.count_duplicate_raw_hashes_by_source(&filter)?)
+    } else {
+        None
+    };
 
     if json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "count": groups.len(),
             "limit": effective_limit,
             "sensitive_included": include_sensitive,
@@ -3366,6 +3388,9 @@ fn cmd_dedupe(
                 group
             }).collect::<Vec<_>>(),
         });
+        if let Some(c) = &counts {
+            payload["counts"] = render_dedupe_counts_json(c);
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if groups.is_empty() {
         let scope = filter_label(source, instance);
@@ -3425,8 +3450,51 @@ fn cmd_dedupe(
         println!(
             "Pick one record per group to keep, then `anamnesis forget <record_id>` the others."
         );
+        if let Some(c) = &counts {
+            println!();
+            println!("Duplicate totals (filter-scoped):");
+            println!("  total_groups : {}", c.total_groups);
+            println!("  total_records: {}", c.total_records);
+            if !c.by_source.is_empty() {
+                println!("  by_source:");
+                for b in &c.by_source {
+                    let inst = if b.instance.is_empty() {
+                        "(default)".to_string()
+                    } else {
+                        b.instance.clone()
+                    };
+                    println!(
+                        "    {adapter:<14} {inst:<14} {n}",
+                        adapter = b.adapter,
+                        inst = inst,
+                        n = b.duplicate_record_count,
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Round 97 (PR-78s): render `count_duplicate_raw_hashes_by_source`
+/// as the `counts` JSON block for `dedupe --include-counts`. The
+/// `by_source` array counts records, not group memberships, so
+/// mixed-source groups don't double-count. Default instance
+/// serialises as JSON `null` matching the rest of the surface.
+fn render_dedupe_counts_json(c: &anamnesis_store::DuplicateRawHashCounts) -> serde_json::Value {
+    serde_json::json!({
+        "total_groups": c.total_groups,
+        "total_records": c.total_records,
+        "by_source": c.by_source.iter().map(|b| serde_json::json!({
+            "adapter": b.adapter,
+            "instance": if b.instance.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(b.instance.clone())
+            },
+            "duplicate_record_count": b.duplicate_record_count,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

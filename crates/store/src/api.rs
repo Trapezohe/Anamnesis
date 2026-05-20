@@ -639,6 +639,40 @@ pub struct DuplicateRawHashFilter {
     pub limit: u32,
 }
 
+/// Round 97 (PR-78s): aggregate counts produced by
+/// `Store::count_duplicate_raw_hashes_by_source`. The
+/// `by_source[]` bucket is keyed on `(adapter, instance)` and
+/// counts **records**, not group memberships — mixed-source
+/// groups would otherwise double-count under group-membership
+/// arithmetic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DuplicateRawHashCounts {
+    /// Number of duplicate groups matching the filter (each
+    /// group has ≥2 live members).
+    pub total_groups: u64,
+    /// Total live records across those groups — sums
+    /// `record_count` per group.
+    pub total_records: u64,
+    /// Per-`(adapter, instance)` duplicate-record breakdown.
+    /// Operator answer: "how many of my duplicate records sit
+    /// in mem0 vs claude-code?"
+    pub by_source: Vec<DuplicateRawHashSourceCount>,
+}
+
+/// Round 97 (PR-78s): one bucket of
+/// `DuplicateRawHashCounts.by_source`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateRawHashSourceCount {
+    /// Adapter id.
+    pub adapter: String,
+    /// Instance discriminator. Empty string for default; CLI /
+    /// MCP wire formats serialise that as JSON `null`.
+    pub instance: String,
+    /// Number of live records this source contributes to the
+    /// filter-scoped duplicate set.
+    pub duplicate_record_count: u64,
+}
+
 /// Round 74 (PR-74): filter for `Store::list_forgotten`. Mirrors
 /// the `(adapter, instance)` natural key the tombstones are
 /// indexed on so the operator can scope to a single source. `limit`
@@ -1841,6 +1875,111 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Round 97 (PR-78s): filter-scoped aggregate counts for
+    /// `dedupe --include-counts`.
+    ///
+    /// Returns the **full** filter-scoped duplicate set, not
+    /// just the current page. `filter.limit` is ignored.
+    ///
+    /// Semantic decisions (load-bearing):
+    ///   * `total_groups` is the number of duplicate groups
+    ///     that match the filter (same eligibility rule as
+    ///     `list_duplicate_raw_hashes_filtered`: a group is
+    ///     "matched" if ≥1 member matches `source`/`instance`).
+    ///   * `total_records` is the sum of live records across
+    ///     those whole groups — including non-matching siblings.
+    ///   * `by_source[]` counts **records**, not group
+    ///     memberships, because a mixed-source group belongs
+    ///     to multiple sources and group-arithmetic would
+    ///     double-count.
+    pub fn count_duplicate_raw_hashes_by_source(
+        &self,
+        filter: &DuplicateRawHashFilter,
+    ) -> Result<DuplicateRawHashCounts> {
+        let conn = self.conn.lock();
+
+        // First pass: pick the eligible duplicate hashes,
+        // optionally narrowed by source/instance. Same shape as
+        // `list_duplicate_raw_hashes_filtered` but without the
+        // LIMIT — counts must reflect the full matching set.
+        let mut sql = String::from(
+            "SELECT raw_hash, COUNT(*) AS n \
+             FROM records \
+             WHERE raw_hash IN (",
+        );
+        let mut bound: Vec<rusqlite::types::Value> = Vec::new();
+        if filter.source.is_some() || filter.instance.is_some() {
+            sql.push_str("SELECT raw_hash FROM records WHERE 1=1");
+            if let Some(s) = &filter.source {
+                sql.push_str(" AND adapter = ?");
+                bound.push(rusqlite::types::Value::Text(s.clone()));
+            }
+            if let Some(i) = &filter.instance {
+                sql.push_str(" AND instance = ?");
+                bound.push(rusqlite::types::Value::Text(i.clone()));
+            }
+        } else {
+            sql.push_str("SELECT raw_hash FROM records");
+        }
+        sql.push_str(
+            ") \
+             GROUP BY raw_hash \
+             HAVING COUNT(*) > 1",
+        );
+        let group_rows: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+        if group_rows.is_empty() {
+            return Ok(DuplicateRawHashCounts::default());
+        }
+        let total_groups = group_rows.len() as u64;
+        let total_records: u64 = group_rows.iter().map(|(_, n)| *n as u64).sum();
+
+        // Second pass: per-`(adapter, instance)` record count
+        // across all eligible groups (whole sibling set
+        // included — that's how filtered membership works in
+        // R80's API).
+        let placeholders = std::iter::repeat_n("?", group_rows.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let by_source_sql = format!(
+            "SELECT adapter, instance, COUNT(*) AS n \
+             FROM records \
+             WHERE raw_hash IN ({placeholders}) \
+             GROUP BY adapter, instance \
+             ORDER BY n DESC, adapter ASC, instance ASC"
+        );
+        let hash_params: Vec<rusqlite::types::Value> = group_rows
+            .iter()
+            .map(|(h, _)| rusqlite::types::Value::Text(h.clone()))
+            .collect();
+        let by_source: Vec<DuplicateRawHashSourceCount> = {
+            let mut stmt = conn.prepare(&by_source_sql)?;
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(hash_params.iter()), |r| {
+                    Ok(DuplicateRawHashSourceCount {
+                        adapter: r.get(0)?,
+                        instance: r.get(1)?,
+                        duplicate_record_count: r.get::<_, i64>(2)? as u64,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+
+        Ok(DuplicateRawHashCounts {
+            total_groups,
+            total_records,
+            by_source,
+        })
     }
 
     /// Round 78 (PR-78): apply or remove user-tags on a record.
@@ -6694,6 +6833,138 @@ mod tests {
         assert_eq!(legacy.len(), filtered.len());
         assert_eq!(legacy[0].raw_hash, filtered[0].raw_hash);
         assert_eq!(legacy[0].records.len(), filtered[0].records.len());
+    }
+
+    // ─── Round-97 PR-78s: count_duplicate_raw_hashes_by_source ─────
+
+    /// Aggregate counts reflect the **full** filter-scoped
+    /// duplicate set, not the current page. `limit=1` doesn't
+    /// truncate `total_groups`/`total_records` — that's the whole
+    /// point of `--include-counts`.
+    #[test]
+    fn count_duplicate_raw_hashes_aggregates_full_set_ignoring_limit() {
+        let store = Store::open_in_memory().unwrap();
+        // 3 duplicate groups, 2 records each.
+        for name in ["g1-a", "g1-b"] {
+            seed_with_raw_hash(&store, "claude-code", name, "h-g1");
+        }
+        for name in ["g2-a", "g2-b"] {
+            seed_with_raw_hash(&store, "claude-code", name, "h-g2");
+        }
+        for name in ["g3-a", "g3-b"] {
+            seed_with_raw_hash(&store, "mem0", name, "h-g3");
+        }
+
+        // limit=1 truncates the *rows*, but counts must see all
+        // 3 groups.
+        let counts = store
+            .count_duplicate_raw_hashes_by_source(&DuplicateRawHashFilter {
+                source: None,
+                instance: None,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(counts.total_groups, 3);
+        assert_eq!(counts.total_records, 6);
+        // by_source counts records, not groups: claude-code = 4
+        // (two groups of 2), mem0 = 2.
+        let cc = counts
+            .by_source
+            .iter()
+            .find(|b| b.adapter == "claude-code")
+            .unwrap();
+        assert_eq!(cc.duplicate_record_count, 4);
+        let mem = counts
+            .by_source
+            .iter()
+            .find(|b| b.adapter == "mem0")
+            .unwrap();
+        assert_eq!(mem.duplicate_record_count, 2);
+    }
+
+    /// **Load-bearing**: mixed-source groups contribute records
+    /// to *every* source they touch — `by_source` cannot
+    /// double-count by treating a mixed group as belonging to
+    /// each member adapter. The count must be record-level.
+    #[test]
+    fn count_duplicate_raw_hashes_by_source_counts_records_not_group_memberships() {
+        let store = Store::open_in_memory().unwrap();
+        // Mixed-source group: 1 mem0 + 1 claude-code on the
+        // same hash.
+        seed_with_raw_hash(&store, "mem0", "m", "h-mixed");
+        seed_with_raw_hash(&store, "claude-code", "c", "h-mixed");
+
+        let counts = store
+            .count_duplicate_raw_hashes_by_source(&DuplicateRawHashFilter::default())
+            .unwrap();
+        assert_eq!(counts.total_groups, 1);
+        assert_eq!(counts.total_records, 2);
+        let mem = counts
+            .by_source
+            .iter()
+            .find(|b| b.adapter == "mem0")
+            .unwrap();
+        let cc = counts
+            .by_source
+            .iter()
+            .find(|b| b.adapter == "claude-code")
+            .unwrap();
+        assert_eq!(mem.duplicate_record_count, 1);
+        assert_eq!(cc.duplicate_record_count, 1);
+        // Records, not groups: sum across by_source equals
+        // total_records (2), NOT total_records × adapter_count.
+        let by_source_sum: u64 = counts
+            .by_source
+            .iter()
+            .map(|b| b.duplicate_record_count)
+            .sum();
+        assert_eq!(by_source_sum, counts.total_records);
+    }
+
+    /// `source` filter narrows eligibility before counting: a
+    /// group has to contain ≥1 record from the named adapter to
+    /// be counted. But once eligible, the whole sibling set
+    /// contributes to `total_records` and `by_source[]` — same
+    /// semantic as `list_duplicate_raw_hashes_filtered`.
+    #[test]
+    fn count_duplicate_raw_hashes_by_source_respects_filter() {
+        let store = Store::open_in_memory().unwrap();
+        // h-mixed: 1 mem0 + 1 claude-code (filter-matched on `mem0`).
+        seed_with_raw_hash(&store, "mem0", "m", "h-mixed");
+        seed_with_raw_hash(&store, "claude-code", "c", "h-mixed");
+        // h-cc-only: 2 claude-code records (NOT matched on `mem0`).
+        seed_with_raw_hash(&store, "claude-code", "cc1", "h-cc");
+        seed_with_raw_hash(&store, "claude-code", "cc2", "h-cc");
+
+        let counts = store
+            .count_duplicate_raw_hashes_by_source(&DuplicateRawHashFilter {
+                source: Some("mem0".into()),
+                instance: None,
+                limit: 0,
+            })
+            .unwrap();
+        assert_eq!(counts.total_groups, 1, "only h-mixed has a mem0 member");
+        assert_eq!(
+            counts.total_records, 2,
+            "the whole sibling set counts toward total_records"
+        );
+        // by_source surfaces both adapters in the matched
+        // group, including the non-mem0 sibling — that's the
+        // operator-visible "where does this duplicate set live."
+        assert_eq!(counts.by_source.len(), 2);
+    }
+
+    /// No duplicates → empty counts, not an error.
+    #[test]
+    fn count_duplicate_raw_hashes_by_source_returns_empty_when_no_duplicates() {
+        let store = Store::open_in_memory().unwrap();
+        seed_with_raw_hash(&store, "claude-code", "solo", "h-singleton");
+        let counts = store
+            .count_duplicate_raw_hashes_by_source(&DuplicateRawHashFilter::default())
+            .unwrap();
+        assert_eq!(counts.total_groups, 0);
+        assert_eq!(counts.total_records, 0);
+        assert!(counts.by_source.is_empty());
     }
 
     // ─── Round-78: user_record_tags ────────────────────────────────
