@@ -619,6 +619,15 @@ enum SourceCmd {
     },
     /// List configured sources.
     List {
+        /// Round 99: restrict to one adapter id (`mem0`,
+        /// `claude-code`, ...). Mirrors the MCP
+        /// `list_sources { source }` filter from R96.
+        #[arg(long)]
+        source: Option<String>,
+        /// Round 99: restrict to one instance discriminator.
+        /// Only meaningful when `--source` is also set.
+        #[arg(long)]
+        instance: Option<String>,
         /// Round 88: emit JSON instead of the human table.
         /// Mirrors R86's `source show --json` shape and the
         /// MCP `list_sources` wire format so scripts can
@@ -1610,13 +1619,31 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             );
             Ok(())
         }
-        SourceCmd::List { json } => {
+        SourceCmd::List {
+            source,
+            instance,
+            json,
+        } => {
             // Round-9: show per-source counts alongside last_import so
             // operators can spot "registered but empty" sources at a
             // glance — same signal MCP agents get from list_sources.
             // Round-82: add `tagged` column so operators can see
             // where their curated `user_tags` actually live.
+            // Round-99: optional `--source` / `--instance` filter
+            // mirrors R96 MCP `list_sources { source, instance }`.
             let rows = store.list_sources_with_counts()?;
+            let filter_applied = source.is_some() || instance.is_some();
+            let rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| match source.as_deref() {
+                    Some(s) => r.source.adapter == s,
+                    None => true,
+                })
+                .filter(|r| match instance.as_deref() {
+                    Some(i) => r.source.instance == i,
+                    None => true,
+                })
+                .collect();
             if json {
                 // Round 88: shape mirrors R86 `source_show.source`
                 // + MCP `list_sources.sources[]`. Empty registry
@@ -1629,7 +1656,11 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
                 return Ok(());
             }
             if rows.is_empty() {
-                println!("no sources registered");
+                if filter_applied {
+                    println!("no sources matched filter");
+                } else {
+                    println!("no sources registered");
+                }
             } else {
                 println!(
                     "{:<14} {:<14} {:<8} {:<8} {:<8} {:<20} {}",
