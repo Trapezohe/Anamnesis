@@ -2198,35 +2198,36 @@ impl AnamnesisServer {
             .and_then(|v| v.as_u64())
             .map(|n| n as i64)
             .unwrap_or(20);
+        // Round 94 (PR-78p): symmetric with R93's
+        // `find_related.user_tag` — let the operator narrow the
+        // preference summary to records carrying a specific
+        // user tag (e.g. `keep-forever`). Normalised through the
+        // same helper `tag_record` writes through, so
+        // `Keep-Forever` matches a tag stored as `keep-forever`.
+        let user_tag = match args.get("user_tag").and_then(|v| v.as_str()) {
+            Some(raw) => Some(
+                anamnesis_store::normalize_user_tag_name(raw)
+                    .map_err(|e| format!("summarize_my_preferences.user_tag: {e}"))?,
+            ),
+            None => None,
+        };
         let store = &self.store;
-        let conn = store.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content, kind, native_path, created_at FROM records \
-                 WHERE scope = 'user' ORDER BY created_at DESC LIMIT ?1",
-            )
-            .map_err(|e| format!("prepare: {e}"))?;
-        let rows: Vec<(String, String, String, Option<String>, i64)> = stmt
-            .query_map([limit], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })
-            .map_err(|e| format!("query: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+        // Filter pushes down at the SQL recall stage (same R79
+        // discipline as search): the store helper does the
+        // EXISTS subquery before LIMIT so a single tagged
+        // record surfaces under a heavy untagged-majority corpus.
+        let rows = store
+            .summarize_preferences_records(limit, user_tag.as_deref())
+            .map_err(|e| format!("summarize_my_preferences query: {e}"))?;
 
         let mut bullets = String::new();
-        for (id, content, kind, path, _) in &rows {
+        for row in &rows {
             bullets.push_str(&format!(
                 "- [{kind}] {content_short}  (id={id_short}, source={src})\n",
-                content_short = trim_for_prompt(content, 240),
-                id_short = &id[..id.len().min(12)],
-                src = path.as_deref().unwrap_or("?"),
+                kind = row.kind,
+                content_short = trim_for_prompt(&row.content, 240),
+                id_short = &row.id[..row.id.len().min(12)],
+                src = row.native_path.as_deref().unwrap_or("?"),
             ));
         }
         if bullets.is_empty() {
@@ -2396,7 +2397,8 @@ fn prompts_list_payload() -> Value {
                 "name": "summarize_my_preferences",
                 "description": "Summarize the user's stable preferences from Anamnesis user-scope records.",
                 "arguments": [
-                    {"name": "limit", "description": "Max records to include (default 20)", "required": false}
+                    {"name": "limit", "description": "Max records to include (default 20)", "required": false},
+                    {"name": "user_tag", "description": "Round 94: restrict to records carrying this user tag (overlay table from R78). Tag is normalised (`trim().to_lowercase()`) to match `tag_record` writes. Filter pushes down at the SQL recall stage before LIMIT.", "required": false}
                 ]
             },
             {
@@ -4148,6 +4150,98 @@ mod tests {
         assert!(text.contains("Summarize"));
         assert!(text.contains("thorough error handling"));
         assert!(text.contains("real DB"));
+    }
+
+    // ─── Round-94 PR-78p: summarize_my_preferences user_tag ──────
+
+    /// `user_tag` narrows the preference summary to records
+    /// carrying the named user tag. Filter is normalised (so
+    /// `Keep-Forever` matches `keep-forever`) and pushes down
+    /// before the LIMIT clause — a single tagged record
+    /// surfaces even under a heavy untagged-majority corpus.
+    #[tokio::test]
+    async fn prompt_summarize_preferences_honors_user_tag_filter() {
+        let r1 = make_record(
+            "claude-code",
+            "p-tagged",
+            "User prefers uniquePrefMarkerTAG",
+            1700000000,
+        );
+        let r2 = make_record(
+            "mem0",
+            "p-untagged",
+            "User likes uniquePrefMarkerUNTAG",
+            1700001000,
+        );
+        let s = server_with_records(&[r1, r2]);
+        s.store
+            .tag_record(
+                &anamnesis_core::model::RecordId::from_parts("claude-code", None, "p-tagged"),
+                &["keep-forever".into()],
+                anamnesis_store::UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "summarize_my_preferences",
+                    "arguments": {"limit": 10, "user_tag": "Keep-Forever"},
+                }),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("uniquePrefMarkerTAG"),
+            "tagged record must surface: {text}"
+        );
+        assert!(
+            !text.contains("uniquePrefMarkerUNTAG"),
+            "untagged record must be filtered out: {text}"
+        );
+    }
+
+    /// Bogus `user_tag` (control character) is rejected with a
+    /// clear error referencing the parameter name.
+    #[tokio::test]
+    async fn prompt_summarize_preferences_user_tag_rejects_invalid_input() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "summarize_my_preferences",
+                    "arguments": {"user_tag": "bad\nnewline"},
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_some(), "must reject bad user_tag");
+        let msg = resp.error.unwrap().message;
+        assert!(
+            msg.contains("user_tag"),
+            "error must mention parameter name; got {msg}"
+        );
+    }
+
+    /// `prompts/list` advertises the new `user_tag` arg.
+    #[tokio::test]
+    async fn prompts_list_advertises_summarize_my_preferences_user_tag_arg() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("prompts/list", Value::Null)).await;
+        let prompts = resp.result.unwrap()["prompts"].as_array().unwrap().clone();
+        let p = prompts
+            .iter()
+            .find(|p| p["name"] == "summarize_my_preferences")
+            .expect("summarize_my_preferences must be in prompts/list");
+        let args = p["arguments"].as_array().unwrap();
+        assert!(
+            args.iter().any(|a| a["name"] == "user_tag"),
+            "must advertise user_tag: {args:?}"
+        );
     }
 
     #[tokio::test]

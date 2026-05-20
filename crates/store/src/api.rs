@@ -654,6 +654,25 @@ pub struct ListForgottenFilter {
     pub limit: u32,
 }
 
+/// Round 94 (PR-78p): minimal projection consumed by the MCP
+/// `summarize_my_preferences` prompt. Just the fields the
+/// prompt renders into bullet text — no `tags`, no `metadata`,
+/// no embedding readiness — so the read stays cheap even on a
+/// big user-scope corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizePreferencesRow {
+    /// Hashed `records.id`.
+    pub id: String,
+    /// `records.content` body.
+    pub content: String,
+    /// `records.kind` lowercase string (`fact`, `preference`, ...).
+    pub kind: String,
+    /// `records.native_path` if the adapter has one.
+    pub native_path: Option<String>,
+    /// `records.created_at` unix seconds — used for ordering.
+    pub created_at: i64,
+}
+
 /// Round 90 (PR-78l): one `(adapter, instance)` bucket from
 /// `Store::count_forgotten_by_source`. Used by
 /// `list_forgotten --include-counts` to give operators a
@@ -1565,6 +1584,60 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Round 94 (PR-78p): backing read for the MCP
+    /// `summarize_my_preferences` prompt. Returns
+    /// user-scope record summaries newest-first, optionally
+    /// narrowed by a single normalised `user_tag` (filter
+    /// pushes down at the SQL recall stage so a single tagged
+    /// record surfaces even under a heavy untagged-majority
+    /// corpus — same discipline as R79 search).
+    ///
+    /// Caller normalises `user_tag` via `normalize_user_tag_name`
+    /// before passing it in; this method does NOT re-normalise so
+    /// the error path stays with the caller (CLI / MCP layer).
+    pub fn summarize_preferences_records(
+        &self,
+        limit: i64,
+        user_tag: Option<&str>,
+    ) -> Result<Vec<SummarizePreferencesRow>> {
+        let conn = self.conn.lock();
+        let row_map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<SummarizePreferencesRow> {
+            Ok(SummarizePreferencesRow {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                kind: r.get(2)?,
+                native_path: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        };
+        let rows: Vec<SummarizePreferencesRow> = if let Some(tag) = user_tag {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, kind, native_path, created_at \
+                 FROM records r \
+                 WHERE scope = 'user' \
+                   AND EXISTS ( \
+                     SELECT 1 FROM user_record_tags urt \
+                      WHERE urt.record_id = r.id AND urt.tag = ?1 \
+                   ) \
+                 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let mapped = stmt
+                .query_map(params![tag, limit], row_map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, kind, native_path, created_at FROM records \
+                 WHERE scope = 'user' ORDER BY created_at DESC LIMIT ?1",
+            )?;
+            let mapped = stmt
+                .query_map(params![limit], row_map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
         Ok(rows)
     }
 
