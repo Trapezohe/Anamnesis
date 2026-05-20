@@ -432,14 +432,24 @@ pub const TAG_RECORD_MAX_BATCH: usize = 32;
 
 /// Which direction a `tag_record` call is moving the overlay.
 /// Distinguished as an enum (not a `bool add: true`) so the
-/// CLI / MCP wire stays readable and a future `Toggle` /
-/// `Replace` semantic doesn't need a third boolean.
+/// CLI / MCP wire stays readable and a future `Toggle` semantic
+/// doesn't need a third boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserTagOperation {
     /// Insert each tag; existing rows are a no-op (set semantics).
     Add,
     /// Delete each tag; missing rows are a no-op (set semantics).
     Remove,
+    /// Round 81 (PR-78c): atomically install the input tags as the
+    /// **full** post-call set on the record — anything not in the
+    /// input is deleted, anything new is inserted. Equivalent to
+    /// `Remove(all existing)` + `Add(requested)` but one
+    /// `Immediate` transaction (no half-applied state).
+    ///
+    /// Empty input is allowed for `Replace` and means "clear all
+    /// user tags on this record." `Add` and `Remove` still reject
+    /// empty input — those operations would be no-ops without it.
+    Replace,
 }
 
 /// Result of `Store::tag_record`. Carries the resolved tags the
@@ -459,6 +469,11 @@ pub struct UserTagMutation {
     pub requested: Vec<String>,
     /// How many rows in `user_record_tags` actually changed.
     /// `Add`: new (record_id, tag) pairs. `Remove`: deletions.
+    /// `Replace` (Round 81): the **set delta** — additions plus
+    /// deletions between the previous and the requested set, not
+    /// the raw "deleted N then inserted M" row count. Re-replacing
+    /// with the same set therefore reports `0`, matching the
+    /// idempotent semantic of Add/Remove.
     pub changed: u32,
     /// Full post-call set of user tags on this record, sorted
     /// ASCII-ascending. Stable so callers can render it
@@ -1395,7 +1410,15 @@ impl Store {
         tags: &[String],
         operation: UserTagOperation,
     ) -> Result<UserTagMutation> {
-        let requested = normalize_user_tags(tags)?;
+        // Round 81: Replace is the only operation that accepts an
+        // empty tag list (= "clear all tags"). Add/Remove are
+        // no-ops on empty input so we keep rejecting them — the
+        // caller probably forgot a positional arg.
+        let requested = if matches!(operation, UserTagOperation::Replace) && tags.is_empty() {
+            Vec::new()
+        } else {
+            normalize_user_tags(tags)?
+        };
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -1437,6 +1460,43 @@ impl Store {
                     )?;
                     changed += n as u32;
                 }
+            }
+            UserTagOperation::Replace => {
+                // Read the current set inside the same Immediate
+                // transaction so a concurrent writer can't slip
+                // between the read and the delete/insert.
+                let current: std::collections::BTreeSet<String> = {
+                    let mut stmt =
+                        tx.prepare("SELECT tag FROM user_record_tags WHERE record_id = ?1")?;
+                    let mapped = stmt
+                        .query_map(params![id.0], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+                    mapped
+                };
+                let target: std::collections::BTreeSet<String> =
+                    requested.iter().cloned().collect();
+                // Set delta drives `changed` — re-replacing with
+                // the same set reports 0, matching Add/Remove's
+                // idempotent semantic. We don't count the raw
+                // DELETE+INSERT row totals.
+                let to_remove: Vec<&String> = current.difference(&target).collect();
+                let to_add: Vec<&String> = target.difference(&current).collect();
+                for t in &to_remove {
+                    tx.execute(
+                        "DELETE FROM user_record_tags WHERE record_id = ?1 AND tag = ?2",
+                        params![id.0, t],
+                    )?;
+                }
+                let now = chrono::Utc::now().timestamp();
+                for t in &to_add {
+                    tx.execute(
+                        "INSERT INTO user_record_tags(record_id, tag, created_at) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(record_id, tag) DO NOTHING",
+                        params![id.0, t, now],
+                    )?;
+                }
+                changed = (to_add.len() + to_remove.len()) as u32;
             }
         }
 
@@ -5649,6 +5709,133 @@ mod tests {
             .map(|i| format!("t{i}"))
             .collect();
         assert!(store.tag_record(&id, &many, UserTagOperation::Add).is_err());
+    }
+
+    // ─── Round-81 PR-78c: tag_record Replace ────────────────────────
+
+    /// `Replace` overwrites the prior set: anything not in the
+    /// input disappears, anything new is inserted. `changed` is
+    /// the set delta (1 added + 1 removed = 2, not the 3-row
+    /// physical delete+insert count).
+    #[test]
+    fn tag_record_replace_overwrites_prior_set_with_delta_count() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-rep");
+
+        // Prime with {keep, todo}.
+        store
+            .tag_record(&id, &["keep".into(), "todo".into()], UserTagOperation::Add)
+            .unwrap();
+
+        // Replace with {keep, final} — `todo` goes, `final` added.
+        let m = store
+            .tag_record(
+                &id,
+                &["keep".into(), "final".into()],
+                UserTagOperation::Replace,
+            )
+            .unwrap();
+        assert_eq!(m.operation, UserTagOperation::Replace);
+        // Set delta: 1 added (final) + 1 removed (todo) = 2.
+        assert_eq!(
+            m.changed, 2,
+            "changed must be set delta, not raw delete+insert rows"
+        );
+        assert_eq!(
+            m.user_tags,
+            vec!["final".to_string(), "keep".to_string()],
+            "post-call set must equal the requested set"
+        );
+    }
+
+    /// Replacing with the same set is a no-op — `changed = 0`
+    /// even though every row was physically rewritten internally.
+    /// This is the property that makes Replace safely re-runnable
+    /// (e.g. from an idempotent migration script).
+    #[test]
+    fn tag_record_replace_idempotent_when_set_unchanged() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-idem");
+
+        store
+            .tag_record(&id, &["a".into(), "b".into()], UserTagOperation::Add)
+            .unwrap();
+
+        // Same set, in different order — set delta is empty.
+        let m = store
+            .tag_record(&id, &["b".into(), "a".into()], UserTagOperation::Replace)
+            .unwrap();
+        assert_eq!(m.changed, 0, "same-set replace must report 0 changes");
+        assert_eq!(m.user_tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Empty `Replace` clears the overlay. This is the only
+    /// path through `tag_record` that accepts an empty tag list —
+    /// `Add`/`Remove` still reject it because they would be
+    /// no-ops without input.
+    #[test]
+    fn tag_record_replace_empty_clears_all_user_tags() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-clear");
+
+        store
+            .tag_record(
+                &id,
+                &["one".into(), "two".into(), "three".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+        assert_eq!(store.user_tags(&id).unwrap().len(), 3);
+
+        let m = store
+            .tag_record(&id, &[], UserTagOperation::Replace)
+            .unwrap();
+        assert_eq!(m.changed, 3, "clearing 3 tags = 3 deletions");
+        assert!(m.requested.is_empty());
+        assert!(m.user_tags.is_empty());
+        // And the table really is empty for this record.
+        assert!(store.user_tags(&id).unwrap().is_empty());
+    }
+
+    /// Empty `Add`/`Remove` still error — only `Replace` carries
+    /// the "explicit clear" intent. Guards against a CLI/MCP
+    /// regression where someone wires an empty list to Add and
+    /// silently no-ops.
+    #[test]
+    fn tag_record_add_or_remove_empty_still_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-empty");
+        assert!(store.tag_record(&id, &[], UserTagOperation::Add).is_err());
+        assert!(store
+            .tag_record(&id, &[], UserTagOperation::Remove)
+            .is_err());
+    }
+
+    /// Replace still respects the per-call cap and per-tag
+    /// validation — sets >32 tags or contains malformed tags
+    /// must fail before any write happens.
+    #[test]
+    fn tag_record_replace_respects_cap_and_validation() {
+        let store = Store::open_in_memory().unwrap();
+        let id = seed_one(&store, "claude-code", "rec-cap");
+
+        // Seed something so we can prove the failed Replace
+        // didn't touch it.
+        store
+            .tag_record(&id, &["pre".into()], UserTagOperation::Add)
+            .unwrap();
+
+        let many: Vec<String> = (0..(TAG_RECORD_MAX_BATCH + 1))
+            .map(|i| format!("t{i}"))
+            .collect();
+        assert!(store
+            .tag_record(&id, &many, UserTagOperation::Replace)
+            .is_err());
+        assert!(store
+            .tag_record(&id, &["bad\nnewline".into()], UserTagOperation::Replace)
+            .is_err());
+        // Pre-existing tag survives the failed Replace.
+        assert_eq!(store.user_tags(&id).unwrap(), vec!["pre".to_string()]);
     }
 
     /// **Load-bearing**: this is the test that justifies a

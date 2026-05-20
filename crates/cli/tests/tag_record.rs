@@ -254,6 +254,114 @@ fn search_user_tag_filter_hits_only_tagged_records() {
     assert_eq!(results[0]["user_tags"], serde_json::json!(["keep-forever"]));
 }
 
+// ─── Round-81 PR-78c: tag-record --replace ─────────────────────────
+
+/// `--replace` installs the input as the full post-call set,
+/// overwriting prior tags in one atomic call. JSON payload uses
+/// `operation: "replace"` and the set delta in `changed`.
+#[test]
+fn tag_record_replace_overwrites_prior_set() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+
+    // Seed {keep, todo} with the legacy add path.
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "keep", "todo"])
+        .assert()
+        .success();
+
+    // Replace with {keep, final} — todo gone, final added.
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "keep", "final", "--replace", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["operation"], "replace");
+    assert_eq!(v["changed"], 2, "set delta: 1 removed + 1 added");
+    assert_eq!(v["user_tags"], serde_json::json!(["final", "keep"]));
+
+    let tags = user_tags_in_search(home.path(), data.path(), "uniqueTagMarkerR78");
+    assert_eq!(tags, vec!["final".to_string(), "keep".to_string()]);
+}
+
+/// `--replace` with no positional tags clears the overlay.
+/// This is the only path that accepts an empty tag list.
+#[test]
+fn tag_record_replace_with_no_tags_clears_overlay() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+
+    // Seed two tags.
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "a", "b"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "--replace", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["operation"], "replace");
+    assert_eq!(v["changed"], 2, "two tags cleared = 2 deletions");
+    assert_eq!(v["requested"], serde_json::json!([]));
+    assert_eq!(v["user_tags"], serde_json::json!([]));
+
+    assert!(user_tags_in_search(home.path(), data.path(), "uniqueTagMarkerR78").is_empty());
+}
+
+/// `--remove` and `--replace` are mutually exclusive at the
+/// clap level. Catches a user pasting both flags without
+/// realising the semantic conflict.
+#[test]
+fn tag_record_replace_and_remove_are_mutually_exclusive() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid, "x", "--remove", "--replace"])
+        .assert()
+        .failure();
+}
+
+/// Without `--replace`, an empty positional `tags` is still
+/// rejected by clap (matches prior R78 behaviour). Guards
+/// against a regression where someone widens the required check.
+#[test]
+fn tag_record_add_with_no_tags_still_fails() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "uniqueTagMarkerR78");
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["tag-record", &rid])
+        .assert()
+        .failure();
+}
+
 #[test]
 fn search_user_tag_filter_no_match_returns_empty() {
     let home = tmp_dir();

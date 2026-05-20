@@ -172,12 +172,21 @@ enum Command {
         /// Record id (as returned by `anamnesis search` /
         /// `list-forgotten`).
         record_id: String,
-        /// One or more tags to apply.
-        #[arg(required = true)]
+        /// One or more tags to apply. Required for `add` /
+        /// `--remove`; optional for `--replace` (an empty list
+        /// means "clear all user tags on this record").
+        #[arg(required_unless_present = "replace")]
         tags: Vec<String>,
         /// Remove the tags instead of adding them.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "replace")]
         remove: bool,
+        /// Round 81: atomically install the given tags as the
+        /// **full** post-call set on this record — anything not
+        /// in `tags` is deleted, anything new is inserted, all
+        /// in one transaction. Passing no tags clears the
+        /// overlay. Mutually exclusive with `--remove`.
+        #[arg(long)]
+        replace: bool,
         /// Emit JSON instead of the human one-liner.
         #[arg(long)]
         json: bool,
@@ -830,8 +839,9 @@ async fn main() -> Result<()> {
             record_id,
             tags,
             remove,
+            replace,
             json,
-        } => cmd_tag_record(&data_dir, &record_id, &tags, remove, json),
+        } => cmd_tag_record(&data_dir, &record_id, &tags, remove, replace, json),
         Command::Dedupe {
             source,
             instance,
@@ -2695,22 +2705,29 @@ fn cmd_tag_record(
     record_id: &str,
     tags: &[String],
     remove: bool,
+    replace: bool,
     json: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let id = anamnesis_core::model::RecordId(record_id.to_string());
-    let op = if remove {
+    // clap already enforces `replace` and `remove` are mutually
+    // exclusive (`conflicts_with = "replace"` on `--remove`), so
+    // the precedence here is deterministic.
+    let op = if replace {
+        anamnesis_store::UserTagOperation::Replace
+    } else if remove {
         anamnesis_store::UserTagOperation::Remove
     } else {
         anamnesis_store::UserTagOperation::Add
     };
+    let op_label = operation_label(op);
     let mutation = store.tag_record(&id, tags, op)?;
 
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
         "tag_record",
         serde_json::json!({
             "record_id": record_id,
-            "operation": if remove { "remove" } else { "add" },
+            "operation": op_label,
             "requested": mutation.requested,
             "changed": mutation.changed,
         }),
@@ -2719,19 +2736,27 @@ fn cmd_tag_record(
     if json {
         let payload = serde_json::json!({
             "record_id": mutation.record_id.0,
-            "operation": if remove { "remove" } else { "add" },
+            "operation": op_label,
             "requested": mutation.requested,
             "changed": mutation.changed,
             "user_tags": mutation.user_tags,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        let verb = if remove { "removed" } else { "added" };
+        let verb = match op {
+            anamnesis_store::UserTagOperation::Add => "added",
+            anamnesis_store::UserTagOperation::Remove => "removed",
+            anamnesis_store::UserTagOperation::Replace => "replaced to",
+        };
+        let req = if mutation.requested.is_empty() {
+            "(empty set — cleared)".to_string()
+        } else {
+            mutation.requested.join(", ")
+        };
         println!(
             "{verb} {n} tag(s) on {id} (requested: {req})",
             n = mutation.changed,
             id = mutation.record_id.0,
-            req = mutation.requested.join(", "),
         );
         if mutation.user_tags.is_empty() {
             println!("  user_tags: (none)");
@@ -2740,6 +2765,17 @@ fn cmd_tag_record(
         }
     }
     Ok(())
+}
+
+/// Stable string label for a `UserTagOperation`. Shared between
+/// the CLI's JSON payload and audit log so the wire shape matches
+/// the MCP surface exactly.
+fn operation_label(op: anamnesis_store::UserTagOperation) -> &'static str {
+    match op {
+        anamnesis_store::UserTagOperation::Add => "add",
+        anamnesis_store::UserTagOperation::Remove => "remove",
+        anamnesis_store::UserTagOperation::Replace => "replace",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
