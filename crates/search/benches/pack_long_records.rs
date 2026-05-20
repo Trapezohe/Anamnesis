@@ -103,6 +103,9 @@ fn make_hits() -> Vec<RankedChunk> {
                 vector_score: None,
                 from_fts: true,
                 from_vec: false,
+                // Round 87 (PR-78i): benchmark fixtures bypass
+                // RRF merge, so the explain block is empty.
+                explain: anamnesis_search::ChunkScoreExplain::empty(),
             }
         })
         .collect()

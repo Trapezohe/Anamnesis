@@ -2063,6 +2063,158 @@ fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
         );
 }
 
+// ─── Round-87 PR-78i: search --explain ─────────────────────────────
+
+/// Default `search --json` carries no `explain` field —
+/// back-compat with every existing R8/R71 consumer.
+#[test]
+fn search_default_json_has_no_explain_field() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "x"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "uniqueExplainMarker body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "x".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-x".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    drop(store);
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search",
+            "uniqueExplainMarker",
+            "--mode",
+            "fulltext",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = &v["results"][0];
+    assert!(
+        row.get("explain").is_none(),
+        "default search must NOT carry an `explain` field; got {row}"
+    );
+}
+
+/// `--explain` attaches a numeric breakdown to every result.
+/// Fields: `record_score`, `best_chunk_rrf_score`, `kind_boost`,
+/// `stages.fts.{rank,raw_score,rrf_contribution}`, `stages.rrf_k`.
+/// Asserts the arithmetic: `record_score == best_chunk_rrf_score
+/// + kind_boost` and `rrf_contribution == 1/(rrf_k + rank)`.
+#[test]
+fn search_explain_attaches_numeric_breakdown() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "x"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "uniqueExplainArith body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "x".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-x".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    drop(store);
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search",
+            "uniqueExplainArith",
+            "--mode",
+            "fulltext",
+            "--json",
+            "--explain",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = &v["results"][0];
+    let explain = &row["explain"];
+    assert!(!explain.is_null(), "must carry explain block");
+    let record_score = explain["record_score"].as_f64().unwrap();
+    let best = explain["best_chunk_rrf_score"].as_f64().unwrap();
+    let boost = explain["kind_boost"].as_f64().unwrap();
+    assert!(
+        (record_score - (best + boost)).abs() < 1e-9,
+        "record_score must equal best_chunk_rrf_score + kind_boost; got {explain}"
+    );
+    let stages = &explain["stages"];
+    let fts = &stages["fts"];
+    let rrf_k = stages["rrf_k"].as_f64().unwrap();
+    let rank = fts["rank"].as_u64().unwrap() as f64;
+    let contribution = fts["rrf_contribution"].as_f64().unwrap();
+    assert!(
+        (contribution - 1.0 / (rrf_k + rank)).abs() < 1e-9,
+        "rrf_contribution must equal 1 / (rrf_k + rank); got {explain}"
+    );
+}
+
 // ─── Round-86 PR-78h: source show ──────────────────────────────────
 
 /// `source show` on an unregistered adapter exits non-zero

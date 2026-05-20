@@ -87,6 +87,44 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 87 (PR-78i): render `RecordScoreExplain` as the
+/// `search_memories({ explain: true })` per-result block. Same
+/// shape as the CLI `--explain` payload — they share the
+/// `anamnesis-search::RecordScoreExplain` struct so they can't
+/// drift.
+fn render_score_explain(e: &anamnesis_search::RecordScoreExplain) -> Value {
+    let stages = match &e.best_chunk_stages {
+        Some(s) => {
+            let fts = s.fts.as_ref().map(|st| {
+                json!({
+                    "rank": st.rank,
+                    "raw_score": st.raw_score,
+                    "rrf_contribution": st.rrf_contribution,
+                })
+            });
+            let vector = s.vector.as_ref().map(|st| {
+                json!({
+                    "rank": st.rank,
+                    "raw_score": st.raw_score,
+                    "rrf_contribution": st.rrf_contribution,
+                })
+            });
+            json!({
+                "fts": fts,
+                "vector": vector,
+                "rrf_k": s.rrf_k,
+            })
+        }
+        None => Value::Null,
+    };
+    json!({
+        "record_score": e.record_score,
+        "best_chunk_rrf_score": e.best_chunk_rrf_score,
+        "kind_boost": e.kind_boost,
+        "stages": stages,
+    })
+}
+
 /// Round 84 (PR-78f): parse the MCP `audit_tail.since` arg —
 /// same grammar as CLI `parse_doctor_since` (Nd / Nh / Nm /
 /// bare seconds), returns the wall-clock instant `now - spec`
@@ -590,6 +628,14 @@ impl AnamnesisServer {
         // Round-71: opt-in per-stage breakdown. Default off — when
         // omitted the response shape is byte-identical to pre-R71.
         let trace_requested = args.get("trace").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Round 87 (PR-78i): opt-in per-hit score breakdown
+        // (record_score / best_chunk_rrf_score / kind_boost / FTS
+        // + vector stage ranks + contributions). Orthogonal to
+        // `trace`; default off keeps the result-row shape stable.
+        let explain_requested = args
+            .get("explain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // Round 79 (PR-78b): `--user-tag` filter on the read path.
         // Normalised through the shared `normalize_user_tag_name`
         // so `Keep` written by `tag_record` matches `keep` from
@@ -676,7 +722,7 @@ impl AnamnesisServer {
         let mut payload = json!({
             "results": filtered.iter().map(|p| {
                 let best = p.matched_chunks.first();
-                json!({
+                let mut row = json!({
                     "record_id": p.record.id.0,
                     // Alias the record id as `trace_id` so an agent that
                     // already holds a result can call
@@ -702,7 +748,12 @@ impl AnamnesisServer {
                     // Round 78: user-tag overlay. Always emitted —
                     // empty array when the record has no user tags.
                     "user_tags": p.record.user_tags,
-                })
+                });
+                // Round 87 (PR-78i): opt-in score breakdown.
+                if explain_requested {
+                    row["explain"] = render_score_explain(&p.score_explain());
+                }
+                row
             }).collect::<Vec<_>>()
         });
         if trace_requested {
@@ -2380,6 +2431,17 @@ fn tools_list_payload_all() -> Value {
                                             sqlite-vec at the SQL recall stage, so a single tagged record \
                                             surfaces even under a heavy untagged-majority corpus. Tag is \
                                             normalised (`trim().to_lowercase()`) to match `tag_record` writes."
+                        },
+                        "explain": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 87: attach a per-result `explain` block breaking down the \
+                                            ranking arithmetic — record_score, best_chunk_rrf_score, kind_boost, \
+                                            and the FTS / vector stage ranks + raw scores + \
+                                            `rrf_contribution = 1/(rrf_k + rank)`. Numeric-only (no record/chunk \
+                                            ids, no query, no snippet beyond what `results[]` already exposes). \
+                                            Orthogonal to `trace` (stage timings + candidate counts) — both can \
+                                            be true."
                         }
                     },
                     "required": ["query"]
