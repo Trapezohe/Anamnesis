@@ -1590,6 +1590,37 @@ impl AnamnesisServer {
             .get("record_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "unforget_record.record_id is required".to_string())?;
+        // Round 95 (PR-78q): dry_run preview. Doesn't delete the
+        // tombstone, doesn't append to audit. Still admin-gated
+        // because the response includes raw_hash/native_path/reason.
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if dry_run {
+            let preview = self
+                .store
+                .preview_unforget_record(&RecordId(record_id.to_string()))
+                .map_err(|e| format!("unforget_record: {e}"))?;
+            return match preview {
+                anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => Ok(json!({
+                    "dry_run":             true,
+                    "outcome":             "would-unforget",
+                    "record_id":           r.record_id.0,
+                    "adapter":             r.adapter,
+                    "instance":            if r.instance.is_empty() { Value::Null } else { Value::String(r.instance) },
+                    "native_id":           r.native_id,
+                    "forgotten_at":        r.forgotten_at,
+                    "record_resurrected":  false,
+                    "requires_reimport":   true,
+                    "would_delete":        { "record_tombstones": 1 },
+                    "would_insert":        { "audit_log_entries": 1 },
+                })),
+                anamnesis_store::UnforgetRecordOutcome::NotForgotten => Err(format!(
+                    "unforget_record: no tombstone for id {record_id:?} — nothing to unforget (dry-run)"
+                )),
+            };
+        }
 
         let outcome = self
             .store
@@ -2840,6 +2871,14 @@ fn tools_list_payload_all() -> Value {
                             "type": "string",
                             "description": "Record id to unforget — same shape as \
                                             `list_forgotten.rows[].record_id`."
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 95: preview the tombstone the real unforget would delete. \
+                                            Returns `outcome: \"would-unforget\"` plus `would_delete.record_tombstones=1` \
+                                            and `would_insert.audit_log_entries=1`. Does NOT mutate the store and does NOT \
+                                            append an audit entry. Symmetric with `forget_record { dry_run: true }`."
                         }
                     },
                     "required": ["record_id"]

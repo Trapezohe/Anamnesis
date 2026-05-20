@@ -670,3 +670,105 @@ async fn forget_record_tools_list_schema_advertises_dry_run() {
         "forget_record must advertise dry_run arg: {forget}"
     );
 }
+
+// ─── Round-95 PR-78q: unforget_record dry_run ────────────────────
+
+/// `dry_run: true` returns the tombstone without removing it,
+/// does NOT append to audit, and is still admin-gated. Symmetric
+/// with R83's `forget_record { dry_run: true }`.
+#[tokio::test]
+async fn unforget_record_dry_run_previews_without_mutating_or_auditing() {
+    let (bundle, id) = build_bundle(true);
+    // Forget first so a tombstone exists.
+    bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({"record_id": id.0, "reason": "init"}),
+        ))
+        .await;
+
+    let audit_path = bundle.audit_dir.join("audit.log");
+    let audit_before = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({"record_id": id.0, "dry_run": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["dry_run"], true);
+    assert_eq!(payload["outcome"], "would-unforget");
+    assert_eq!(payload["record_id"], id.0);
+    assert_eq!(payload["would_delete"]["record_tombstones"], 1);
+    assert_eq!(payload["would_insert"]["audit_log_entries"], 1);
+
+    // Mutation guard: audit unchanged, tombstone still present.
+    assert_eq!(
+        std::fs::metadata(&audit_path).ok().map(|m| m.len()),
+        audit_before,
+        "dry-run must not append to audit.log"
+    );
+    let resp = bundle
+        .server
+        .handle(tool_call("list_forgotten", json!({})))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 1, "tombstone must still be present");
+}
+
+#[tokio::test]
+async fn unforget_record_dry_run_is_still_admin_gated() {
+    let (bundle, id) = build_bundle(false);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({"record_id": id.0, "dry_run": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "dry-run must not bypass admin gate");
+}
+
+#[tokio::test]
+async fn unforget_record_dry_run_unknown_id_returns_error() {
+    let (bundle, _id) = build_bundle(true);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({"record_id": "no-such-id", "dry_run": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "must error on unknown id");
+    let msg = resp.error.unwrap().message;
+    assert!(
+        msg.contains("nothing to unforget"),
+        "error must explain why; got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn unforget_record_tools_list_schema_advertises_dry_run() {
+    let (bundle, _id) = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let unforget = tools
+        .iter()
+        .find(|t| t["name"] == "unforget_record")
+        .expect("unforget_record in admin tools/list");
+    let props = &unforget["inputSchema"]["properties"];
+    assert_eq!(
+        props["dry_run"]["type"], "boolean",
+        "unforget_record must advertise dry_run: {unforget}"
+    );
+}

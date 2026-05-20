@@ -1451,6 +1451,61 @@ impl Store {
         }))
     }
 
+    /// Round 95 (PR-78q): dry-run preview for [`unforget_record`].
+    ///
+    /// Returns the existing tombstone (so the operator can verify
+    /// they're targeting the right row) or
+    /// [`UnforgetRecordOutcome::NotForgotten`] if no tombstone
+    /// exists. **Does not mutate the store** — no DELETE, no
+    /// commit, no audit-log write. The CLI / MCP surfaces are
+    /// responsible for not calling `Audit::record` either.
+    pub fn preview_unforget_record(&self, id: &RecordId) -> Result<UnforgetRecordOutcome> {
+        let conn = self.conn.lock();
+        // Columns alias quiets clippy::type_complexity.
+        type TombstoneCols = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            i64,
+        );
+        let existing: Option<TombstoneCols> = conn
+            .query_row(
+                "SELECT adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                 FROM record_tombstones WHERE record_id = ?1",
+                params![id.0],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match existing {
+            Some((adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at)) => {
+                UnforgetRecordOutcome::Unforgotten(ForgottenRecord {
+                    record_id: id.clone(),
+                    adapter,
+                    instance,
+                    native_id,
+                    native_path,
+                    raw_hash,
+                    reason,
+                    forgotten_at,
+                })
+            }
+            None => UnforgetRecordOutcome::NotForgotten,
+        })
+    }
+
     /// Round 74 (PR-74): paginated read of `record_tombstones`,
     /// newest-first. Used by `anamnesis list-forgotten` and the
     /// admin-gated MCP `list_forgotten` tool to surface what's
@@ -6338,6 +6393,55 @@ mod tests {
         let second = store.unforget_record(&r.id).unwrap();
         assert!(matches!(first, UnforgetRecordOutcome::Unforgotten(_)));
         assert!(matches!(second, UnforgetRecordOutcome::NotForgotten));
+    }
+
+    // ─── Round-95 PR-78q: preview_unforget_record ─────────────────
+
+    /// Preview returns the existing tombstone without touching
+    /// the store. List-forgotten still sees the row afterward.
+    #[test]
+    fn preview_unforget_record_returns_tombstone_without_deleting() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("claude-code", "rec-prev-un", "x", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store.forget_record(&r.id, Some("test-reason")).unwrap();
+
+        let preview = store.preview_unforget_record(&r.id).unwrap();
+        match preview {
+            UnforgetRecordOutcome::Unforgotten(rec) => {
+                assert_eq!(rec.record_id, r.id);
+                assert_eq!(rec.reason.as_deref(), Some("test-reason"));
+            }
+            UnforgetRecordOutcome::NotForgotten => {
+                panic!("preview must return the existing tombstone")
+            }
+        }
+
+        // Mutation guard: tombstone still in the table.
+        let still_there = store
+            .list_forgotten(&ListForgottenFilter {
+                source: None,
+                instance: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(
+            still_there.len(),
+            1,
+            "preview must NOT delete the tombstone"
+        );
+        assert_eq!(still_there[0].record_id, r.id);
+    }
+
+    /// Missing tombstone → `NotForgotten`, matches the real
+    /// `unforget_record` shape so CLI/MCP can branch uniformly.
+    #[test]
+    fn preview_unforget_record_returns_not_forgotten_for_unknown_id() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId::from_parts("claude-code", None, "phantom");
+        let preview = store.preview_unforget_record(&phantom).unwrap();
+        assert!(matches!(preview, UnforgetRecordOutcome::NotForgotten));
     }
 
     // ─── Round-77: list_duplicate_raw_hashes ────────────────────────

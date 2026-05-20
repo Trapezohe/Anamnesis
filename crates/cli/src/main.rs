@@ -253,6 +253,12 @@ enum Command {
         /// Emit JSON instead of the human one-liner.
         #[arg(long)]
         json: bool,
+        /// Round 95: don't actually unforget — print the existing
+        /// tombstone, the would-write audit entry count, and exit
+        /// 0. The tombstone is NOT deleted and `audit.log` is NOT
+        /// appended. Symmetric with R83's `forget --dry-run`.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// List tombstoned records (audit view).
@@ -943,7 +949,11 @@ async fn main() -> Result<()> {
             json,
             include_sensitive,
         ),
-        Command::Unforget { record_id, json } => cmd_unforget(&data_dir, &record_id, json),
+        Command::Unforget {
+            record_id,
+            json,
+            dry_run,
+        } => cmd_unforget(&data_dir, &record_id, json, dry_run),
         Command::ListForgotten {
             source,
             instance,
@@ -3034,9 +3044,17 @@ fn cmd_forget_dry_run(
 ///   - 0 on `Unforgotten` (tombstone removed).
 ///   - non-zero on `NotForgotten` so a paste mistake from
 ///     `list-forgotten` is loud rather than silently a no-op.
-fn cmd_unforget(data_dir: &std::path::Path, record_id: &str, json: bool) -> Result<()> {
+fn cmd_unforget(
+    data_dir: &std::path::Path,
+    record_id: &str,
+    json: bool,
+    dry_run: bool,
+) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let id = anamnesis_core::model::RecordId(record_id.to_string());
+    if dry_run {
+        return cmd_unforget_dry_run(&store, record_id, &id, json);
+    }
     let outcome = store.unforget_record(&id)?;
 
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
@@ -3090,6 +3108,65 @@ fn cmd_unforget(data_dir: &std::path::Path, record_id: &str, json: bool) -> Resu
     ) {
         return Err(anyhow!(
             "no tombstone for id {record_id:?} — nothing to unforget"
+        ));
+    }
+    Ok(())
+}
+
+/// Round 95 (PR-78q): `anamnesis unforget --dry-run` — preview
+/// the tombstone the real `unforget` would remove. Does NOT
+/// call `store.unforget_record` and does NOT append to
+/// `audit.log`. Same exit-code policy as the real path:
+/// missing tombstone exits non-zero so a typo'd id stays loud.
+fn cmd_unforget_dry_run(
+    store: &Store,
+    record_id: &str,
+    id: &anamnesis_core::model::RecordId,
+    json: bool,
+) -> Result<()> {
+    let preview = store.preview_unforget_record(id)?;
+    if json {
+        let payload = match &preview {
+            anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => serde_json::json!({
+                "dry_run": true,
+                "status": "would-unforget",
+                "record_id": r.record_id.0,
+                "adapter": r.adapter,
+                "instance": if r.instance.is_empty() { None } else { Some(&r.instance) },
+                "native_id": r.native_id,
+                "forgotten_at": r.forgotten_at,
+                "record_resurrected": false,
+                "requires_reimport": true,
+                "would_delete": { "record_tombstones": 1 },
+                "would_insert": { "audit_log_entries": 1 },
+            }),
+            anamnesis_store::UnforgetRecordOutcome::NotForgotten => serde_json::json!({
+                "dry_run": true,
+                "status": "not-forgotten",
+                "record_id": record_id,
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if let anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) = &preview {
+        let inst = if r.instance.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", r.instance)
+        };
+        println!(
+            "DRY-RUN — would unforget {} (adapter={}{inst}, native_id={})",
+            r.record_id.0, r.adapter, r.native_id
+        );
+        println!("  would write: 1 audit entry, delete 1 tombstone");
+        println!("  (the record itself is NOT resurrected; re-import the source to bring it back)");
+    }
+
+    if matches!(
+        preview,
+        anamnesis_store::UnforgetRecordOutcome::NotForgotten
+    ) {
+        return Err(anyhow!(
+            "no tombstone for id {record_id:?} — nothing to unforget (dry-run)"
         ));
     }
     Ok(())
