@@ -2279,6 +2279,19 @@ impl AnamnesisServer {
         // this dilutes the top-N. These args let the caller scope the
         // recall to one source / kind / scope without breaking any
         // existing text/limit-only invocation.
+        //
+        // Round 93 (PR-78o): also honour `user_tag` so an agent can
+        // narrow related-memory lookup to records the operator has
+        // curated. Normalised through the same helper `tag_record`
+        // writes through, so `--user-tag Keep` finds tags stored
+        // as `keep`.
+        let user_tag = match args.get("user_tag").and_then(|v| v.as_str()) {
+            Some(raw) => Some(
+                anamnesis_store::normalize_user_tag_name(raw)
+                    .map_err(|e| format!("find_related.user_tag: {e}"))?,
+            ),
+            None => None,
+        };
         let filter = anamnesis_store::SearchFilter {
             source: args
                 .get("source")
@@ -2293,6 +2306,7 @@ impl AnamnesisServer {
                 .get("scope")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            user_tag,
             ..Default::default()
         };
 
@@ -2395,6 +2409,7 @@ fn prompts_list_payload() -> Value {
                     {"name": "instance", "description": "Restrict to one instance discriminator (only meaningful when `source` is also set)", "required": false},
                     {"name": "kind", "description": "Restrict to one Kind: fact | preference | feedback | reference | episode | skill | unknown", "required": false},
                     {"name": "scope", "description": "Restrict to one Scope: user | project | session | ephemeral", "required": false},
+                    {"name": "user_tag", "description": "Round 93: restrict to records carrying this user tag (overlay table from R78). Tag is normalised (`trim().to_lowercase()`) to match `tag_record` writes — `Keep-Forever` matches `keep-forever`. Filter pushes down at the SQL recall stage, so a single tagged record surfaces under a heavy untagged-majority corpus.", "required": false},
                     {"name": "explain", "description": "Round 89: append a compact numeric score breakdown (record_score / best_chunk_rrf_score / kind_boost / fts_rank / vec_rank / rrf_k) to each bullet. Default off — keeps prompt token cost bounded.", "required": false}
                 ]
             }
@@ -4261,6 +4276,107 @@ mod tests {
         assert!(
             args.iter().any(|a| a["name"] == "explain"),
             "find_related must advertise `explain` arg: {args:?}"
+        );
+    }
+
+    // ─── Round-93 PR-78o: find_related user_tag filter ────────────
+
+    /// `user_tag` narrows `find_related` to records carrying the
+    /// named user tag. Without the filter, both records hit; with
+    /// the filter, only the tagged record surfaces. Pin the
+    /// normalisation: passing `Keep-Forever` matches a record
+    /// tagged `keep-forever`.
+    #[tokio::test]
+    async fn prompt_find_related_honors_user_tag_filter_with_normalisation() {
+        // Use distinct body content per record so we can verify
+        // which one surfaces in the prompt bullets — the
+        // make_record helper plain-passes content through to the
+        // bullet snippet via the search/pack path.
+        let r1 = make_record(
+            "claude-code",
+            "tagged-rec",
+            "alpha bright morning uniqueTaggedMarker",
+            1700000000,
+        );
+        let r2 = make_record(
+            "claude-code",
+            "untagged-rec",
+            "alpha bright morning uniqueUntaggedMarker",
+            1700000010,
+        );
+        let s = server_with_records(&[r1, r2]);
+        // Apply a user tag to the first record directly via the
+        // store. The MCP filter pushes the same normalisation
+        // through, so passing `Keep-Forever` must match.
+        s.store
+            .tag_record(
+                &anamnesis_core::model::RecordId::from_parts("claude-code", None, "tagged-rec"),
+                &["keep-forever".into()],
+                anamnesis_store::UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {"text": "alpha", "user_tag": "Keep-Forever", "limit": 10},
+                }),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("uniqueTaggedMarker"),
+            "tagged record should surface: {text}"
+        );
+        assert!(
+            !text.contains("uniqueUntaggedMarker"),
+            "untagged record must be filtered out: {text}"
+        );
+    }
+
+    /// Bogus `user_tag` (control character) is rejected with a
+    /// clear error referencing the parameter name — same shape
+    /// `search_memories.user_tag` uses.
+    #[tokio::test]
+    async fn prompt_find_related_user_tag_rejects_invalid_input() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {"text": "alpha", "user_tag": "bad\nnewline"},
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_some(), "must reject bad user_tag");
+        let msg = resp.error.unwrap().message;
+        assert!(
+            msg.contains("user_tag"),
+            "error must mention the parameter name; got {msg}"
+        );
+    }
+
+    /// `prompts/list` advertises the new `user_tag` arg so MCP
+    /// clients can introspect.
+    #[tokio::test]
+    async fn prompts_list_advertises_find_related_user_tag_arg() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("prompts/list", Value::Null)).await;
+        let prompts = resp.result.unwrap()["prompts"].as_array().unwrap().clone();
+        let find_related = prompts
+            .iter()
+            .find(|p| p["name"] == "find_related")
+            .expect("find_related must be in prompts/list");
+        let args = find_related["arguments"].as_array().unwrap();
+        assert!(
+            args.iter().any(|a| a["name"] == "user_tag"),
+            "find_related must advertise `user_tag` arg: {args:?}"
         );
     }
 
