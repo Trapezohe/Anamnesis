@@ -197,7 +197,10 @@ async fn search_explain_and_trace_coexist() {
         ))
         .await;
     let payload = extract_payload(&resp);
-    assert!(payload.get("trace").is_some(), "trace block must be present");
+    assert!(
+        payload.get("trace").is_some(),
+        "trace block must be present"
+    );
     assert!(
         payload["results"][0].get("explain").is_some(),
         "explain block must be present on the first result"

@@ -2114,7 +2114,13 @@ fn search_default_json_has_no_explain_field() {
 
     let out = cli()
         .env("ANAMNESIS_DATA_DIR", dir.path())
-        .args(["search", "uniqueExplainMarker", "--mode", "fulltext", "--json"])
+        .args([
+            "search",
+            "uniqueExplainMarker",
+            "--mode",
+            "fulltext",
+            "--json",
+        ])
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
