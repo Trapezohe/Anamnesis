@@ -396,6 +396,13 @@ pub struct SourceWithCounts {
     pub record_count: u64,
     /// Number of chunks across all records for this source.
     pub chunk_count: u64,
+    /// Round 82 (PR-78d): number of **distinct records** in this
+    /// source that have ≥1 entry in `user_record_tags` — NOT the
+    /// raw tag-row count, and NOT the adapter-derived `records.tags`.
+    /// Lets `source list` / `list_sources` answer "where do my
+    /// curated `keep-forever` records actually live?" without a
+    /// second round-trip.
+    pub tagged_record_count: u64,
 }
 
 /// Maximum `limit` accepted by `list_record_ids_paged` and the MCP
@@ -674,18 +681,35 @@ impl Store {
     /// default instance. Grouping on `adapter` alone would silently
     /// merge multiple instances of the same adapter into one row.
     pub fn list_sources_with_counts(&self) -> Result<Vec<SourceWithCounts>> {
+        // Round 82: counts are computed via **independent scalar
+        // subqueries**, NOT a chain of LEFT JOINs. The R78
+        // `user_record_tags` overlay would otherwise amplify
+        // `chunk_count` — a record with 3 chunks and 4 tags
+        // appearing as 12 chunks in the GROUP BY. Each subquery
+        // counts its own table along the `(adapter, instance)`
+        // axis with no cross-talk. Indexes on
+        // `records(adapter, instance)`, `record_chunks(record_id)`,
+        // and the `user_record_tags(record_id, tag)` PK keep this
+        // O(log N) per source.
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT s.adapter, s.instance, s.location, s.config_json, \
                     s.added_at, s.last_import_at, \
-                    COUNT(DISTINCT r.id) AS record_count, \
-                    COUNT(rc.id)         AS chunk_count \
+                    (SELECT COUNT(*) \
+                       FROM records r \
+                      WHERE r.adapter = s.adapter \
+                        AND r.instance = s.instance) AS record_count, \
+                    (SELECT COUNT(*) \
+                       FROM record_chunks rc \
+                       JOIN records r ON r.id = rc.record_id \
+                      WHERE r.adapter = s.adapter \
+                        AND r.instance = s.instance) AS chunk_count, \
+                    (SELECT COUNT(DISTINCT urt.record_id) \
+                       FROM user_record_tags urt \
+                       JOIN records r ON r.id = urt.record_id \
+                      WHERE r.adapter = s.adapter \
+                        AND r.instance = s.instance) AS tagged_record_count \
              FROM sources s \
-             LEFT JOIN records r \
-                    ON r.adapter = s.adapter AND r.instance = s.instance \
-             LEFT JOIN record_chunks rc \
-                    ON rc.record_id = r.id \
-             GROUP BY s.adapter, s.instance \
              ORDER BY s.adapter, s.instance",
         )?;
         let rows = stmt
@@ -701,6 +725,7 @@ impl Store {
                     },
                     record_count: r.get::<_, i64>(6)? as u64,
                     chunk_count: r.get::<_, i64>(7)? as u64,
+                    tagged_record_count: r.get::<_, i64>(8)? as u64,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3497,6 +3522,154 @@ mod tests {
         assert_eq!(local.record_count, 2);
         let cloud = rows.iter().find(|r| r.source.instance == "cloud").unwrap();
         assert_eq!(cloud.record_count, 0);
+    }
+
+    // ─── Round-82 PR-78d: tagged_record_count on list_sources_with_counts ─
+
+    /// Newly-registered, never-imported source must report
+    /// `tagged_record_count = 0`. Matches the existing
+    /// "never-imported source still appears" contract from R9.
+    #[test]
+    fn list_sources_with_counts_tagged_record_count_zero_for_untagged_source() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", None, Some("/tmp/missing.db"), None)
+            .unwrap();
+        // Seed a record but tag nothing on it.
+        let r = make_record("mem0", "n1", "x", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+
+        let rows = store.list_sources_with_counts().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_count, 1);
+        assert_eq!(
+            rows[0].tagged_record_count, 0,
+            "record exists but has no user tags"
+        );
+    }
+
+    /// **Load-bearing**: this is the JOIN-amplification regression
+    /// test. One record with 3 chunks and 4 distinct user tags
+    /// must report `chunk_count = 3` and `tagged_record_count = 1`
+    /// — NOT `chunk_count = 12` (chunks × tags) and NOT
+    /// `tagged_record_count = 4` (tag rows, not records).
+    #[test]
+    fn list_sources_with_counts_tag_count_is_records_not_tag_rows() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", None, Some("/c"), None)
+            .unwrap();
+        // Three chunks on a single record.
+        let r = make_record(
+            "claude-code",
+            "multi-chunk",
+            // Force the chunker to emit ≥3 chunks by passing a
+            // chunky body. The default chunker splits on size,
+            // so a ~3KB body comfortably yields multiple chunks.
+            &"alpha beta gamma delta epsilon zeta eta theta. ".repeat(120),
+            Kind::Fact,
+        );
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        assert!(
+            c.len() >= 3,
+            "fixture must produce ≥3 chunks for the test to be meaningful"
+        );
+        store.upsert_record(&r, &c, None).unwrap();
+        let chunks_before = c.len() as u64;
+        store
+            .tag_record(
+                &r.id,
+                &["a".into(), "b".into(), "c".into(), "d".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let rows = store.list_sources_with_counts().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.record_count, 1);
+        assert_eq!(
+            row.chunk_count, chunks_before,
+            "chunks must NOT be multiplied by user-tag count — \
+             JOIN amplification regression guard"
+        );
+        assert_eq!(
+            row.tagged_record_count, 1,
+            "field counts distinct *records* with ≥1 tag, not tag rows"
+        );
+    }
+
+    /// `tagged_record_count` is partitioned by `(adapter, instance)`
+    /// the same way `record_count` is. Tags on records under one
+    /// instance must not leak into another instance's row.
+    #[test]
+    fn list_sources_with_counts_tagged_record_count_partitioned_by_instance() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", Some("self-hosted"), Some("/local"), None)
+            .unwrap();
+        store
+            .register_source("mem0", Some("cloud"), Some("https://x"), None)
+            .unwrap();
+
+        // self-hosted: 1 tagged record.
+        let mut r = make_record("mem0", "h1", "x", Kind::Fact);
+        r.source.instance = Some("self-hosted".into());
+        r.id = RecordId::from_parts("mem0", Some("self-hosted"), "h1");
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        store
+            .tag_record(&r.id, &["keep".into()], UserTagOperation::Add)
+            .unwrap();
+
+        // cloud: 1 untagged record.
+        let mut r2 = make_record("mem0", "c1", "y", Kind::Fact);
+        r2.source.instance = Some("cloud".into());
+        r2.id = RecordId::from_parts("mem0", Some("cloud"), "c1");
+        let c2 = Chunker::default().chunk(&r2.id, &r2.content);
+        store.upsert_record(&r2, &c2, None).unwrap();
+
+        let rows = store.list_sources_with_counts().unwrap();
+        assert_eq!(rows.len(), 2);
+        let local = rows
+            .iter()
+            .find(|r| r.source.instance == "self-hosted")
+            .unwrap();
+        let cloud = rows.iter().find(|r| r.source.instance == "cloud").unwrap();
+        assert_eq!(local.tagged_record_count, 1);
+        assert_eq!(
+            cloud.tagged_record_count, 0,
+            "tag on the self-hosted record must NOT show up under cloud"
+        );
+    }
+
+    /// Forgetting a tagged record removes both the live row and
+    /// (via FK cascade) its `user_record_tags` entries — so the
+    /// per-source `tagged_record_count` drops by 1.
+    #[test]
+    fn list_sources_with_counts_tagged_record_count_drops_after_forget() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", None, Some("/c"), None)
+            .unwrap();
+        let r = make_record("claude-code", "k1", "x", Kind::Fact);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        store
+            .tag_record(&r.id, &["k".into()], UserTagOperation::Add)
+            .unwrap();
+        assert_eq!(
+            store.list_sources_with_counts().unwrap()[0].tagged_record_count,
+            1
+        );
+
+        store.forget_record(&r.id, None).unwrap();
+        assert_eq!(
+            store.list_sources_with_counts().unwrap()[0].tagged_record_count,
+            0,
+            "FK cascade on forget must clear the user_record_tags entry"
+        );
     }
 
     #[test]

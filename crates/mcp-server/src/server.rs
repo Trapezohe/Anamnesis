@@ -708,6 +708,11 @@ impl AnamnesisServer {
                 "last_import_at": r.source.last_import_at,
                 "record_count": r.record_count,
                 "chunk_count": r.chunk_count,
+                // Round-82 PR-78d: distinct-record count for the
+                // user-tag overlay. Lets an MCP agent answer
+                // "where do my keep-forever records live" without
+                // a second call. NOT the number of tag rows.
+                "tagged_record_count": r.tagged_record_count,
             })).collect::<Vec<_>>(),
             "active_model": store.active_model().ok().flatten(),
             "stats": {
@@ -2029,7 +2034,9 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "list_sources",
-                "description": "List registered sources + active model + counters.",
+                "description": "List registered sources + active model + counters. Each source carries \
+                                `record_count`, `chunk_count`, `tagged_record_count` (R82: distinct \
+                                records with ≥1 user_tag), `last_import_at`, and `location`.",
                 "inputSchema": {"type": "object", "properties": {}}
             },
             {
@@ -2710,7 +2717,8 @@ mod tests {
         assert_eq!(sources.len(), 1);
         let source = &sources[0];
 
-        // All seven required wire-format keys.
+        // All required wire-format keys (Round 82 added
+        // `tagged_record_count`).
         for key in [
             "adapter",
             "instance",
@@ -2719,12 +2727,17 @@ mod tests {
             "last_import_at",
             "record_count",
             "chunk_count",
+            "tagged_record_count",
         ] {
             assert!(
                 source.get(key).is_some(),
                 "missing wire field {key:?} in list_sources response"
             );
         }
+        assert_eq!(
+            source["tagged_record_count"], 0,
+            "no tag_record call yet → 0 tagged records"
+        );
 
         // Specific shapes.
         assert_eq!(source["adapter"], "claude-code");
@@ -2759,6 +2772,69 @@ mod tests {
 
         // Stats block still present + correct (back-compat).
         assert_eq!(structured["stats"]["records"], 1);
+    }
+
+    /// Round 82 PR-78d: `list_sources` reports
+    /// `tagged_record_count` per `(adapter, instance)` once a
+    /// `tag_record` call has landed. Counts distinct records,
+    /// not tag rows.
+    #[tokio::test]
+    async fn list_sources_tagged_record_count_reflects_tag_record_writes() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("claude-code", None, Some("/tmp/x"), None)
+            .unwrap();
+        // Seed two records under the same source; tag only one.
+        for n in ["a", "b"] {
+            let r = AnamnesisRecord {
+                id: RecordId::from_parts("claude-code", None, n),
+                source: SourceDescriptor {
+                    adapter: "claude-code".into(),
+                    instance: None,
+                    version: "0.0.1".into(),
+                },
+                content: format!("body for {n}"),
+                embedding: None,
+                scope: Scope::User,
+                kind: Kind::Fact,
+                created_at: chrono::Utc.timestamp_opt(1700000000, 0).unwrap(),
+                updated_at: None,
+                tags: vec![],
+                metadata: Default::default(),
+                provenance: Provenance {
+                    native_id: n.into(),
+                    native_path: None,
+                    captured_at: chrono::Utc.timestamp_opt(1700000000, 0).unwrap(),
+                    raw_hash: format!("h-{n}"),
+                    derived_from: None,
+                },
+                schema_version: anamnesis_core::SCHEMA_VERSION,
+            };
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &chunks, None).unwrap();
+        }
+        let id_a = RecordId::from_parts("claude-code", None, "a");
+        // Add TWO tags to a single record — `tagged_record_count`
+        // must report `1` (records), not `2` (tag rows).
+        store
+            .tag_record(
+                &id_a,
+                &["keep".into(), "todo".into()],
+                anamnesis_store::UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req("tools/call", json!({"name": "list_sources"})))
+            .await;
+        let structured = &resp.result.unwrap()["structuredContent"];
+        let source = &structured["sources"][0];
+        assert_eq!(source["record_count"], 2);
+        assert_eq!(
+            source["tagged_record_count"], 1,
+            "two tags on one record = 1 tagged record, NOT 2"
+        );
     }
 
     #[tokio::test]
