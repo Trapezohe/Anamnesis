@@ -408,6 +408,74 @@ fn unforget_json_payload_makes_resurrection_semantics_explicit() {
     assert_eq!(v["requires_reimport"], true);
 }
 
+// ─── Round-95 PR-78q: unforget --dry-run ───────────────────────────
+
+/// `--dry-run` reports the tombstone without removing it. The
+/// real `unforget` would write 1 audit entry; dry-run writes 0.
+#[test]
+fn unforget_dry_run_reports_tombstone_without_mutating() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid])
+        .assert()
+        .success();
+
+    let audit_path = data.path().join("audit.log");
+    let audit_before = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &rid, "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    let audit_after = std::fs::metadata(&audit_path).ok().map(|m| m.len());
+    assert_eq!(
+        audit_before, audit_after,
+        "dry-run must not append to audit.log"
+    );
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["status"], "would-unforget");
+    assert_eq!(v["record_id"], rid);
+    assert_eq!(v["record_resurrected"], false);
+    assert_eq!(v["requires_reimport"], true);
+    assert_eq!(v["would_delete"]["record_tombstones"], 1);
+    assert_eq!(v["would_insert"]["audit_log_entries"], 1);
+
+    // Tombstone still present.
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["count"], 1, "dry-run must not delete the tombstone");
+}
+
+/// `--dry-run` on an unknown id exits non-zero — typo loud.
+#[test]
+fn unforget_dry_run_unknown_id_exits_nonzero() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", "phantom-id", "--dry-run"])
+        .assert()
+        .failure();
+}
+
 #[test]
 fn list_forgotten_empty_store_says_so() {
     let home = tmp_dir();
