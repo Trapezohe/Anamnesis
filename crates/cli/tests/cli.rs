@@ -2063,6 +2063,137 @@ fn doctor_generic_mcp_missing_token_env_surfaces_clean_error() {
         );
 }
 
+// ─── Round-91 PR-78m: audit tail --csv ─────────────────────────────
+
+/// `--csv` emits a header plus one row per matched audit entry,
+/// reusing the same redacted summary fields as the human
+/// renderer. Even when `--include-sensitive` doesn't apply (it
+/// doesn't on `audit tail`), the CSV must never carry `reason`
+/// or `query`.
+#[test]
+fn audit_tail_csv_returns_redacted_summary_rows() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "csv-target"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "csv body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "csv-target".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-csv".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    drop(store);
+
+    // Forget writes an audit entry with a `reason` field we
+    // must NOT see in CSV output.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["forget", &r.id.0, "--reason", "secret-leak-canary"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--action", "forget", "--csv"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.starts_with("line_no,timestamp,action,via,outcome\n"),
+        "header must come first: {stdout:?}"
+    );
+    // CLI forget doesn't stamp `via` — only the MCP variant
+    // does. The row's `via` column is therefore empty (`,,`).
+    // What matters is the row exists, ends with `,forgotten`,
+    // and never smuggles in the secret reason.
+    let data_line = stdout
+        .lines()
+        .find(|l| l.contains(",forget,"))
+        .unwrap_or_else(|| panic!("no forget row in CSV:\n{stdout}"));
+    assert!(
+        data_line.ends_with(",forgotten") || data_line.ends_with(",\"forgotten\""),
+        "data row must end with the redacted outcome; got {data_line}"
+    );
+    assert!(
+        !stdout.contains("secret-leak-canary"),
+        "CSV must not leak the audit reason field: {stdout}"
+    );
+}
+
+/// `--csv` and `--json` are mutually exclusive at the clap layer
+/// — both formats describe the whole result; the operator must
+/// pick one. Catches a user pasting both flags without realising.
+#[test]
+fn audit_tail_csv_and_json_are_mutually_exclusive() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--csv", "--json"])
+        .assert()
+        .failure();
+}
+
+/// Empty audit log + `--csv` still emits the header row so a
+/// script can read column names regardless of whether there are
+/// any data rows. Catches a regression where an empty result
+/// short-circuits to prose.
+#[test]
+fn audit_tail_csv_empty_log_emits_header_only() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--csv"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.trim(),
+        "line_no,timestamp,action,via,outcome",
+        "empty result must still emit header: {stdout:?}"
+    );
+}
+
 // ─── Round-88 PR-78j: source list --json ───────────────────────────
 
 /// Empty registry: `source list --json` returns the structured

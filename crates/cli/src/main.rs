@@ -701,6 +701,13 @@ enum AuditCmd {
         /// queries or forget reasons into the terminal.
         #[arg(long)]
         json: bool,
+        /// Round 91: emit CSV (`line_no,timestamp,action,via,outcome`)
+        /// instead of the human table. Same redacted summary
+        /// shape as the human output — never includes `detail` /
+        /// `reason` / `query`. Mutually exclusive with `--json`
+        /// (use `--json` for the structured form).
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
     },
 }
 
@@ -4667,7 +4674,15 @@ fn cmd_audit(data_dir: &std::path::Path, sub: AuditCmd) -> Result<()> {
             action,
             since,
             json,
-        } => cmd_audit_tail(data_dir, limit, action.as_deref(), since.as_deref(), json),
+            csv,
+        } => cmd_audit_tail(
+            data_dir,
+            limit,
+            action.as_deref(),
+            since.as_deref(),
+            json,
+            csv,
+        ),
     }
 }
 
@@ -4677,12 +4692,14 @@ fn cmd_audit(data_dir: &std::path::Path, sub: AuditCmd) -> Result<()> {
 /// surface; --json carries full `detail`, the human renderer is
 /// summary-only so a casual tail doesn't dump search queries or
 /// forget reasons.
+#[allow(clippy::too_many_arguments)]
 fn cmd_audit_tail(
     data_dir: &std::path::Path,
     limit: usize,
     action: Option<&str>,
     since: Option<&str>,
     json: bool,
+    csv: bool,
 ) -> Result<()> {
     let since_dt: Option<chrono::DateTime<chrono::Utc>> = match since {
         Some(spec) => {
@@ -4719,6 +4736,23 @@ fn cmd_audit_tail(
             })).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if csv {
+        // Round 91: CSV uses the **same redacted summary fields**
+        // as the human renderer — never `detail`, `reason`, or
+        // `query`. Empty result still emits the header so
+        // downstream scripts can branch uniformly.
+        println!("line_no,timestamp,action,via,outcome");
+        for r in &rows {
+            let (via, outcome) = audit_tail_summary(r);
+            println!(
+                "{line_no},{ts},{action},{via},{outcome}",
+                line_no = r.line_no,
+                ts = csv_field(&r.entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                action = csv_field(&r.entry.action),
+                via = csv_field(&via),
+                outcome = csv_field(&outcome),
+            );
+        }
     } else if rows.is_empty() {
         if action.is_some() || since.is_some() {
             println!("no audit entries matched (filter applied)");
@@ -4731,27 +4765,7 @@ fn cmd_audit_tail(
             "line", "timestamp", "action", "via", "outcome"
         );
         for r in &rows {
-            let via = r
-                .entry
-                .detail
-                .get("via")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // Outcome / status / changed — small structured
-            // surface that's safe to print without revealing
-            // free-form `reason` or `query`. Any of the three may
-            // be set depending on the action.
-            let outcome = r
-                .entry
-                .detail
-                .get("outcome")
-                .or_else(|| r.entry.detail.get("status"))
-                .or_else(|| r.entry.detail.get("changed"))
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default();
+            let (via, outcome) = audit_tail_summary(r);
             println!(
                 "{:>5}  {:<25}  {:<18}  {:<6}  {}",
                 r.line_no,
@@ -4768,6 +4782,33 @@ fn cmd_audit_tail(
         );
     }
     Ok(())
+}
+
+/// Round 91 (PR-78m): shared `(via, outcome)` extraction for the
+/// human and CSV `audit tail` renderers. Pulls only the
+/// **redacted summary** fields — `via` and one of
+/// `outcome`/`status`/`changed` — so neither surface accidentally
+/// leaks `reason` / `query` / `detail`.
+fn audit_tail_summary(r: &anamnesis_core::AuditTailRow) -> (String, String) {
+    let via = r
+        .entry
+        .detail
+        .get("via")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let outcome = r
+        .entry
+        .detail
+        .get("outcome")
+        .or_else(|| r.entry.detail.get("status"))
+        .or_else(|| r.entry.detail.get("changed"))
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    (via, outcome)
 }
 
 fn audit_list(entries: &[serde_json::Value], limit: usize, json: bool) -> Result<()> {
