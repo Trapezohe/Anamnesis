@@ -654,6 +654,23 @@ pub struct ListForgottenFilter {
     pub limit: u32,
 }
 
+/// Round 90 (PR-78l): one `(adapter, instance)` bucket from
+/// `Store::count_forgotten_by_source`. Used by
+/// `list_forgotten --include-counts` to give operators a
+/// total + per-source breakdown without having to page through
+/// every tombstone row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgottenSourceCount {
+    /// Adapter id (e.g. `"claude-code"`).
+    pub adapter: String,
+    /// Instance discriminator. Empty string for the default
+    /// instance; the CLI / MCP wire formats serialise that as
+    /// JSON `null` to match the rest of the surface.
+    pub instance: String,
+    /// Number of tombstones in this `(adapter, instance)` bucket.
+    pub forgotten_count: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source registry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1499,6 +1516,55 @@ impl Store {
                 mapped
             }
         };
+        Ok(rows)
+    }
+
+    /// Round 90 (PR-78l): tombstone counts grouped by
+    /// `(adapter, instance)`. Same `source` / `instance` filter as
+    /// `list_forgotten` — the operator running
+    /// `list-forgotten --source mem0 --include-counts` sees the
+    /// total + breakdown across mem0 instances, not the entire
+    /// store. `limit` is **ignored** here: counts always reflect
+    /// the full matching set, not just the current page.
+    ///
+    /// Rows are ordered newest-tombstone first within the group
+    /// via the existing `idx_record_tombstones_source` index
+    /// (`(adapter, instance, forgotten_at DESC)`, migration
+    /// 0007) so the helper stays O(log N + groups) even on a
+    /// noisy source.
+    pub fn count_forgotten_by_source(
+        &self,
+        filter: &ListForgottenFilter,
+    ) -> Result<Vec<ForgottenSourceCount>> {
+        let conn = self.conn.lock();
+        let mut sql = String::from(
+            "SELECT adapter, instance, COUNT(*) AS n \
+             FROM record_tombstones \
+             WHERE 1=1",
+        );
+        let mut bound: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(s) = &filter.source {
+            sql.push_str(" AND adapter = ?");
+            bound.push(rusqlite::types::Value::Text(s.clone()));
+        }
+        if let Some(i) = &filter.instance {
+            sql.push_str(" AND instance = ?");
+            bound.push(rusqlite::types::Value::Text(i.clone()));
+        }
+        sql.push_str(
+            " GROUP BY adapter, instance \
+             ORDER BY n DESC, adapter ASC, instance ASC",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+                Ok(ForgottenSourceCount {
+                    adapter: r.get(0)?,
+                    instance: r.get(1)?,
+                    forgotten_count: r.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -6021,6 +6087,55 @@ mod tests {
         let rows = store.list_forgotten(&filter).unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|r| r.adapter == "mem0"));
+    }
+
+    // ─── Round-90 PR-78l: count_forgotten_by_source ─────────────────
+
+    /// Tombstone counts group by `(adapter, instance)` and
+    /// respect the same source/instance filter as `list_forgotten`.
+    /// Counts reflect the **full** matching set, not the page —
+    /// that's the whole point: an operator on page 1 of 100
+    /// can still see "there are 137 tombstones total."
+    #[test]
+    fn count_forgotten_by_source_aggregates_per_adapter_instance() {
+        let store = Store::open_in_memory().unwrap();
+        seed_and_forget(&store, "claude-code", 5);
+        seed_and_forget(&store, "mem0", 2);
+
+        let all = store
+            .count_forgotten_by_source(&ListForgottenFilter::default())
+            .unwrap();
+        let cc = all.iter().find(|b| b.adapter == "claude-code").unwrap();
+        let mem = all.iter().find(|b| b.adapter == "mem0").unwrap();
+        assert_eq!(cc.forgotten_count, 5);
+        assert_eq!(mem.forgotten_count, 2);
+        // Order: count DESC, then adapter ASC — claude-code (5) before mem0 (2).
+        assert_eq!(all[0].adapter, "claude-code");
+        assert_eq!(all[1].adapter, "mem0");
+
+        // source filter respected.
+        let scoped = store
+            .count_forgotten_by_source(&ListForgottenFilter {
+                source: Some("mem0".into()),
+                instance: None,
+                limit: 0,
+            })
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].adapter, "mem0");
+        assert_eq!(scoped[0].forgotten_count, 2);
+    }
+
+    /// Empty tombstone table returns an empty Vec — not an
+    /// error, not a `Some(zero bucket)`. CLI/MCP wire shapes
+    /// turn this into `{"total": 0, "by_source": []}`.
+    #[test]
+    fn count_forgotten_by_source_returns_empty_when_no_tombstones() {
+        let store = Store::open_in_memory().unwrap();
+        let out = store
+            .count_forgotten_by_source(&ListForgottenFilter::default())
+            .unwrap();
+        assert!(out.is_empty());
     }
 
     /// `limit = 0` is a guard, not an empty-result short-circuit —

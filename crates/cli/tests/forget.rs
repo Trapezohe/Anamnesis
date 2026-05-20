@@ -423,6 +423,78 @@ fn list_forgotten_empty_store_says_so() {
         .stdout(contains("no forgotten records"));
 }
 
+// ─── Round-90 PR-78l: list-forgotten --include-counts ───────────────
+
+/// Default `list-forgotten --json` has no `counts` field —
+/// back-compat with every existing R74/R75 consumer.
+#[test]
+fn list_forgotten_default_json_has_no_counts_block() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid])
+        .assert()
+        .success();
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["count"], 1);
+    assert!(
+        v.get("counts").is_none(),
+        "default list-forgotten must not carry a counts block; got {v}"
+    );
+}
+
+/// `--include-counts` attaches `counts.total` + `counts.by_source[]`
+/// — operators see "137 tombstones, 120 claude-code + 17 mem0" in
+/// one call without paging. Counts respect the same source/instance
+/// filter as the row list but reflect the full matching set.
+#[test]
+fn list_forgotten_include_counts_attaches_total_and_by_source() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid, "--reason", "preview"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json", "--include-counts"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let counts = &v["counts"];
+    assert_eq!(counts["total"], 1);
+    let by_source = counts["by_source"].as_array().unwrap();
+    assert_eq!(by_source.len(), 1);
+    assert_eq!(by_source[0]["adapter"], "claude-code");
+    assert!(by_source[0]["instance"].is_null());
+    assert_eq!(by_source[0]["forgotten_count"], 1);
+    // Sensitive fields stay out of counts even when sensitive
+    // mode isn't requested.
+    let counts_str = serde_json::to_string(counts).unwrap();
+    assert!(
+        !counts_str.contains("preview"),
+        "counts block must not leak forgot reason"
+    );
+}
+
 // ─── Round-83 PR-78e: forget --dry-run ──────────────────────────────
 
 /// `--dry-run` reports the cascade without mutating: the record
