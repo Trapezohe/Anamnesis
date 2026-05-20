@@ -1359,10 +1359,31 @@ impl AnamnesisServer {
             .get("include_sensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 80: scope duplicates to groups containing
+        // ≥1 record from a given source/instance. Empty
+        // strings normalised to None so the caller can pass
+        // `""` without accidentally filtering on the empty
+        // instance (which is a real value for single-instance
+        // adapters).
+        let source = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let instance = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
 
+        let filter = anamnesis_store::DuplicateRawHashFilter {
+            source: source.clone(),
+            instance: instance.clone(),
+            limit,
+        };
         let groups = self
             .store
-            .list_duplicate_raw_hashes(limit)
+            .list_duplicate_raw_hashes_filtered(&filter)
             .map_err(|e| format!("dedupe: {e}"))?;
         let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
         let payload_groups: Vec<Value> = groups
@@ -1396,6 +1417,10 @@ impl AnamnesisServer {
             "count":              groups.len(),
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
+            "filter": {
+                "source":   source,
+                "instance": instance,
+            },
             "groups":             payload_groups,
         }))
     }
@@ -2182,12 +2207,23 @@ fn tools_list_payload_all() -> Value {
                                 duplicates). Read-only diagnostic, NOT admin-gated — the action \
                                 half is `forget_record` (which is admin-gated). Default response \
                                 is redacted: `raw_hash` and `native_path` are omitted unless \
-                                `include_sensitive=true`. Limit clamped to [1, 100]. Only catches \
-                                byte-identical duplicates; semantic / near-duplicate detection is \
-                                out of scope.",
+                                `include_sensitive=true`. Limit clamped to [1, 100]. Optional \
+                                `source` / `instance` scope the report to groups containing ≥1 \
+                                matching record; the full sibling set is still returned so the \
+                                operator sees which non-matching records share the same hash. \
+                                Only catches byte-identical duplicates; semantic / near-duplicate \
+                                detection is out of scope.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Adapter id (e.g. `mem0`). Filters to duplicate groups that include ≥1 record from this source."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Instance discriminator. Only meaningful when `source` is also set."
+                        },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
