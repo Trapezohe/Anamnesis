@@ -87,6 +87,38 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 89 (PR-78k): compact text rendering of
+/// `RecordScoreExplain` for the `find_related { explain: true }`
+/// prompt. Same numeric fields as `render_score_explain` but
+/// flattened into a single line — JSON inside a prompt would
+/// burn LLM context for no readability gain.
+///
+/// `best_chunk_stages = None` (e.g. test fixtures that bypass
+/// RRF) collapses to just the record-level totals.
+fn format_score_explain_for_prompt(e: &anamnesis_search::RecordScoreExplain) -> String {
+    let mut parts = vec![
+        format!("record_score={:.4}", e.record_score),
+        format!("best_chunk_rrf_score={:.4}", e.best_chunk_rrf_score),
+        format!("kind_boost={:.4}", e.kind_boost),
+    ];
+    if let Some(stages) = &e.best_chunk_stages {
+        if let Some(fts) = &stages.fts {
+            parts.push(format!(
+                "fts_rank={} fts_contribution={:.4}",
+                fts.rank, fts.rrf_contribution
+            ));
+        }
+        if let Some(vec) = &stages.vector {
+            parts.push(format!(
+                "vec_rank={} vec_contribution={:.4}",
+                vec.rank, vec.rrf_contribution
+            ));
+        }
+        parts.push(format!("rrf_k={:.0}", stages.rrf_k));
+    }
+    format!("explain: {}", parts.join(", "))
+}
+
 /// Round 87 (PR-78i): render `RecordScoreExplain` as the
 /// `search_memories({ explain: true })` per-result block. Same
 /// shape as the CLI `--explain` payload — they share the
@@ -2106,6 +2138,16 @@ impl AnamnesisServer {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32)
             .unwrap_or(5);
+        // Round 89 (PR-78k): opt-in compact score breakdown
+        // appended to each bullet. Mirrors R87's
+        // `search_memories({ explain: true })` shape but
+        // rendered as a short numeric line — JSON inside a
+        // prompt would burn LLM context for no readability
+        // gain.
+        let explain_requested = args
+            .get("explain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Round-65: optional filter args. SearchFilter has been complete
         // on the store side since round-22 (api.rs::SearchFilter); the
@@ -2170,6 +2212,16 @@ impl AnamnesisServer {
                 adapter = p.record.source.adapter,
                 score = p.score,
             ));
+            // Round 89: opt-in numeric breakdown on the next
+            // indented line. Compact text — `explain: ...`,
+            // not JSON — so the LLM sees the structure but the
+            // token cost stays bounded.
+            if explain_requested {
+                bullets.push_str(&format!(
+                    "  {}\n",
+                    format_score_explain_for_prompt(&p.score_explain())
+                ));
+            }
         }
         if bullets.is_empty() {
             bullets.push_str("(no related memories found)\n");
@@ -2220,7 +2272,8 @@ fn prompts_list_payload() -> Value {
                     {"name": "source", "description": "Restrict to one adapter id, e.g. `claude-code`, `codex`, `mem0` (default: all sources)", "required": false},
                     {"name": "instance", "description": "Restrict to one instance discriminator (only meaningful when `source` is also set)", "required": false},
                     {"name": "kind", "description": "Restrict to one Kind: fact | preference | feedback | reference | episode | skill | unknown", "required": false},
-                    {"name": "scope", "description": "Restrict to one Scope: user | project | session | ephemeral", "required": false}
+                    {"name": "scope", "description": "Restrict to one Scope: user | project | session | ephemeral", "required": false},
+                    {"name": "explain", "description": "Round 89: append a compact numeric score breakdown (record_score / best_chunk_rrf_score / kind_boost / fts_rank / vec_rank / rrf_k) to each bullet. Default off — keeps prompt token cost bounded.", "required": false}
                 ]
             }
         ]
@@ -4002,6 +4055,80 @@ mod tests {
         assert!(
             !text.contains("from mem0"),
             "mem0 memory must be filtered out: {text}"
+        );
+    }
+
+    // ─── Round-89 PR-78k: find_related explain ────────────────────
+
+    /// Default `find_related` (no `explain` arg) does NOT carry
+    /// the numeric breakdown — back-compat with every existing
+    /// MCP client + every prompt agent that's already wired.
+    #[tokio::test]
+    async fn prompt_find_related_default_has_no_explain_block() {
+        let r = make_record("claude-code", "x", "alpha bright morning", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "find_related", "arguments": {"text": "alpha"}}),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !text.contains("explain:"),
+            "default find_related must not emit explain breakdown; got {text}"
+        );
+    }
+
+    /// `explain: true` appends a compact text breakdown to each
+    /// bullet. Asserts the line contains `record_score=` and
+    /// `fts_rank=` (the FTS-only test fixture has no vector stage).
+    #[tokio::test]
+    async fn prompt_find_related_explain_emits_compact_breakdown() {
+        let r = make_record("claude-code", "x", "alpha bright morning", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {"text": "alpha", "explain": true},
+                }),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("explain:"),
+            "explain bullet must be present; got {text}"
+        );
+        assert!(text.contains("record_score="));
+        assert!(text.contains("best_chunk_rrf_score="));
+        assert!(text.contains("kind_boost="));
+        assert!(text.contains("fts_rank="));
+        assert!(text.contains("rrf_k="));
+    }
+
+    /// `prompts/list` advertises the new `explain` argument so
+    /// MCP clients can introspect.
+    #[tokio::test]
+    async fn prompts_list_advertises_find_related_explain_arg() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("prompts/list", Value::Null)).await;
+        let prompts = resp.result.unwrap()["prompts"].as_array().unwrap().clone();
+        let find_related = prompts
+            .iter()
+            .find(|p| p["name"] == "find_related")
+            .expect("find_related must be in prompts/list");
+        let args = find_related["arguments"].as_array().unwrap();
+        assert!(
+            args.iter().any(|a| a["name"] == "explain"),
+            "find_related must advertise `explain` arg: {args:?}"
         );
     }
 
