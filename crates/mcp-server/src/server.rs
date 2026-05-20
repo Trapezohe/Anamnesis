@@ -466,6 +466,17 @@ impl AnamnesisServer {
         // Round-71: opt-in per-stage breakdown. Default off — when
         // omitted the response shape is byte-identical to pre-R71.
         let trace_requested = args.get("trace").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Round 79 (PR-78b): `--user-tag` filter on the read path.
+        // Normalised through the shared `normalize_user_tag_name`
+        // so `Keep` written by `tag_record` matches `keep` from
+        // the search wire.
+        let user_tag = match args.get("user_tag").and_then(|v| v.as_str()) {
+            Some(raw) => Some(
+                anamnesis_store::normalize_user_tag_name(raw)
+                    .map_err(|e| format!("user_tag: {e}"))?,
+            ),
+            None => None,
+        };
 
         // PR-C: push every filter into the SQL recall stage so a
         // minority-source query (e.g. `source = "mem0"` against a
@@ -478,6 +489,7 @@ impl AnamnesisServer {
             scope,
             time_from,
             time_to,
+            user_tag,
         };
 
         let store = &self.store;
@@ -1966,6 +1978,14 @@ fn tools_list_payload_all() -> Value {
                                             text, snippets, or any record / chunk identifiers — strictly numeric \
                                             diagnostic shape. Default off; omitting it keeps the response wire-identical \
                                             to pre-Round-71."
+                        },
+                        "user_tag": {
+                            "type": "string",
+                            "description": "Restrict to records carrying this user tag (overlay table from \
+                                            Round 78). Filter pushes down into FTS, BLOB-vec fallback, and \
+                                            sqlite-vec at the SQL recall stage, so a single tagged record \
+                                            surfaces even under a heavy untagged-majority corpus. Tag is \
+                                            normalised (`trim().to_lowercase()`) to match `tag_record` writes."
                         }
                     },
                     "required": ["query"]

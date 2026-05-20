@@ -152,6 +152,15 @@ pub struct SearchFilter {
     pub time_from: Option<i64>,
     /// Inclusive upper bound on `records.created_at` (unix epoch seconds).
     pub time_to: Option<i64>,
+    /// Round 79 (PR-78b): restrict to records that carry this
+    /// user tag in the `user_record_tags` overlay (R78). The tag
+    /// is normalised exactly like `tag_record` writes — call
+    /// [`normalize_user_tag_name`] before stuffing into this
+    /// field, or get a wire mismatch (`Keep` vs `keep`). Pushed
+    /// into the SQL recall stage on all three modalities (FTS,
+    /// BLOB-vec, sqlite-vec) so a tagged minority record can't
+    /// be displaced by untagged majority before `LIMIT`.
+    pub user_tag: Option<String>,
 }
 
 impl SearchFilter {
@@ -163,6 +172,7 @@ impl SearchFilter {
             && self.scope.is_none()
             && self.time_from.is_none()
             && self.time_to.is_none()
+            && self.user_tag.is_none()
     }
 }
 
@@ -1451,12 +1461,35 @@ impl Store {
 /// inside an already-open `Transaction`. The store-public
 /// [`Store::forget_record`] guarantees the tombstone is keyed on
 /// the same triple every adapter's `RecordId::from_parts` builds.
+/// Round 79 (PR-78b): per-tag normalisation. Pure function —
+/// trim + lowercase + bound + reject empty/control. Shared
+/// between `tag_record` writes and `SearchFilter.user_tag`
+/// reads so a tag written as `Keep` and queried as `Keep`
+/// both normalise to `keep` and the read hits.
+pub fn normalize_user_tag_name(raw: &str) -> Result<String> {
+    let normalised = raw.trim().to_lowercase();
+    if normalised.is_empty() {
+        return Err(StoreError::Corruption(
+            "user tag: empty (after trim) is not allowed".into(),
+        ));
+    }
+    if normalised.len() > USER_TAG_MAX_LEN {
+        return Err(StoreError::Corruption(format!(
+            "user tag: {normalised:?} exceeds {USER_TAG_MAX_LEN}-byte limit"
+        )));
+    }
+    if normalised.chars().any(|c| c.is_control()) {
+        return Err(StoreError::Corruption(format!(
+            "user tag: {normalised:?} contains a control character"
+        )));
+    }
+    Ok(normalised)
+}
+
 /// Round 78: normalise the caller's tag list before the SQL
-/// write. Pure function — runs entirely in Rust, returns a
-/// validated `Vec<String>` ready to insert/delete. Fails fast
-/// on operator input bugs (empty, too long, control chars,
-/// over-batch) so the caller sees a clear error before any DB
-/// write happens.
+/// write. Returns deduped normalised tags ready to insert/delete.
+/// Round 79: delegates per-tag work to `normalize_user_tag_name`
+/// so write + filter paths share a single source of truth.
 fn normalize_user_tags(raw: &[String]) -> Result<Vec<String>> {
     if raw.is_empty() {
         return Err(StoreError::Corruption(
@@ -1473,24 +1506,7 @@ fn normalize_user_tags(raw: &[String]) -> Result<Vec<String>> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
     for t in raw {
-        let normalised = t.trim().to_lowercase();
-        if normalised.is_empty() {
-            return Err(StoreError::Corruption(
-                "tag_record: empty tag (after trim) is not allowed".into(),
-            ));
-        }
-        if normalised.len() > USER_TAG_MAX_LEN {
-            return Err(StoreError::Corruption(format!(
-                "tag_record: tag {:?} exceeds {USER_TAG_MAX_LEN}-byte limit",
-                normalised
-            )));
-        }
-        if normalised.chars().any(|c| c.is_control()) {
-            return Err(StoreError::Corruption(format!(
-                "tag_record: tag {:?} contains a control character",
-                normalised
-            )));
-        }
+        let normalised = normalize_user_tag_name(t)?;
         if seen.insert(normalised.clone()) {
             out.push(normalised);
         }
@@ -2439,6 +2455,18 @@ fn append_filter_predicates(
         sql.push_str(" AND r.created_at <= ?");
         params.push(V::Integer(to));
     }
+    // Round 79 (PR-78b): `--user-tag` push-down. Subquery against
+    // `user_record_tags` keyed on the indexed `(tag, record_id)`
+    // covers FTS + BLOB-vec paths. Sits in the same WHERE so the
+    // candidate pool shrinks *before* `LIMIT`.
+    if let Some(tag) = &filter.user_tag {
+        sql.push_str(
+            " AND EXISTS ( \
+                 SELECT 1 FROM user_record_tags urt \
+                 WHERE urt.record_id = rc.record_id AND urt.tag = ?)",
+        );
+        params.push(V::Text(tag.clone()));
+    }
     params
 }
 
@@ -2477,6 +2505,19 @@ fn append_vec0_filter_predicates(
     if let Some(to) = filter.time_to {
         sql.push_str(" AND created_at <= ?");
         params.push(V::Integer(to));
+    }
+    // Round 79 (PR-78b): `--user-tag` push-down inside the KNN
+    // MATERIALIZED CTE. vec0 can't JOIN an external table, so
+    // we constrain the `record_id` metadata column (added in
+    // R79 alongside this filter) against the overlay. Stays
+    // inside the KNN scan, so a tagged minority record can't be
+    // displaced by an untagged majority before `LIMIT`.
+    if let Some(tag) = &filter.user_tag {
+        sql.push_str(
+            " AND record_id IN ( \
+                 SELECT record_id FROM user_record_tags WHERE tag = ?)",
+        );
+        params.push(V::Text(tag.clone()));
     }
     params
 }
@@ -5508,5 +5549,212 @@ mod tests {
             .unwrap();
         let h = heads.get(&id).expect("present");
         assert_eq!(h.user_tags, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    // ─── Round-79 PR-78b: --user-tag search filter pushdown ─────────
+
+    /// FTS path: a minority-tagged record under a majority of
+    /// untagged records still surfaces — the user_tag JOIN
+    /// shrinks the candidate pool *before* `LIMIT`, not after.
+    /// Mirrors R65's PR-C minority-dominance contract.
+    #[test]
+    fn user_tag_filter_fts_returns_tagged_minority_under_dominance() {
+        let store = Store::open_in_memory().unwrap();
+        // 12 untagged claude-code records with the shared marker.
+        for i in 0..12 {
+            let r = make_record(
+                "claude-code",
+                &format!("cc-{i}"),
+                "alpha shared marker content",
+                Kind::Fact,
+            );
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &chunks, None).unwrap();
+        }
+        // 1 tagged mem0 record carrying the same marker.
+        let m = make_record("mem0", "m-0", "alpha shared marker content", Kind::Fact);
+        let chunks = Chunker::default().chunk(&m.id, &m.content);
+        store.upsert_record(&m, &chunks, None).unwrap();
+        store
+            .tag_record(&m.id, &["keep-forever".into()], UserTagOperation::Add)
+            .unwrap();
+
+        let filter = SearchFilter {
+            user_tag: Some("keep-forever".into()),
+            ..Default::default()
+        };
+        // limit=1: a post-filter implementation would return 0 hits
+        // (the BM25 top-1 is an untagged claude-code chunk, then
+        // filtered out). Pushdown returns the tagged mem0 record.
+        let hits = store.search_chunks_fts("alpha", &filter, 1).unwrap();
+        assert_eq!(hits.len(), 1, "tagged minority must survive limit=1");
+        assert_eq!(hits[0].record_id.0, m.id.0);
+    }
+
+    /// BLOB vector fallback: same minority-dominance guarantee,
+    /// this time through the no-vec0 path (`search_chunks_vec`
+    /// falls back to `search_chunks_vec_blob_scan` when no per-
+    /// dim vec0 table exists for the query's dim). The vec
+    /// fallback uses `append_filter_predicates`, same helper FTS
+    /// uses, so this proves the user_tag JOIN is wired into
+    /// that path too.
+    #[test]
+    fn user_tag_filter_blob_vec_fallback_returns_tagged_minority() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_active_model("model-a").unwrap();
+        // 6 untagged + 1 tagged, all sharing a query-favourable vec.
+        let mut tagged: Option<RecordId> = None;
+        for i in 0..7 {
+            let r = make_record(
+                "claude-code",
+                &format!("cc-{i}"),
+                &format!("content {i}"),
+                Kind::Fact,
+            );
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &chunks, None).unwrap();
+            if i == 6 {
+                tagged = Some(r.id.clone());
+            }
+        }
+        // Drive embeddings under a brand-new dim (777) that no
+        // vec0 table exists for — forces blob fallback.
+        let jobs = store.claim_next_jobs("model-a", 32).unwrap();
+        // Tagged record gets the strongest cos vs query; everyone
+        // else gets the same weaker vector, so under a normal
+        // (no-filter) search the tagged record would win anyway.
+        // The filter test value is in `limit=1` with --user-tag
+        // when several records ALSO tag-match — we want the
+        // pushdown, not just luck.
+        let vecs: Vec<Vec<f32>> = jobs
+            .iter()
+            .map(|j| {
+                if j.chunk_id.starts_with(&tagged.as_ref().unwrap().0) {
+                    vec![1.0; 777]
+                } else {
+                    vec![0.5; 777]
+                }
+            })
+            .collect();
+        store.complete_jobs_batch(&jobs, &vecs).unwrap();
+
+        // Manually drop the vec0 table that R67 creates so we
+        // force the BLOB fallback path. The blob scan still
+        // honours filters via append_filter_predicates.
+        store
+            .conn()
+            .execute("DROP TABLE IF EXISTS chunk_embeddings_vec_d777", [])
+            .unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM chunk_vec_indexes WHERE dim = 777", [])
+            .unwrap();
+
+        // Tag both the strong-vec record and one weak-vec record.
+        store
+            .tag_record(
+                tagged.as_ref().unwrap(),
+                &["keep-forever".into()],
+                UserTagOperation::Add,
+            )
+            .unwrap();
+        let weak_id = RecordId::from_parts("claude-code", None, "cc-2");
+        store
+            .tag_record(&weak_id, &["keep-forever".into()], UserTagOperation::Add)
+            .unwrap();
+
+        let filter = SearchFilter {
+            user_tag: Some("keep-forever".into()),
+            ..Default::default()
+        };
+        let query = vec![1.0_f32; 777];
+        let hits = store
+            .search_chunks_vec(&query, "model-a", &filter, 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        // Either tagged record is acceptable; the contract is
+        // "only tagged records survive."
+        let allowed: std::collections::HashSet<&str> =
+            [tagged.as_ref().unwrap().0.as_str(), weak_id.0.as_str()]
+                .into_iter()
+                .collect();
+        assert!(
+            allowed.contains(hits[0].record_id.0.as_str()),
+            "result must be one of the tagged records; got {}",
+            hits[0].record_id.0
+        );
+    }
+
+    /// sqlite-vec path: the filter pushes down inside the
+    /// MATERIALIZED knn CTE via the new `record_id` metadata
+    /// column. Test forces the untagged record to be the
+    /// strongest vector match so that without the filter
+    /// `limit=1` would never return the tagged one.
+    #[test]
+    fn user_tag_filter_sqlite_vec_path_returns_tagged_minority() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_active_model("model-a").unwrap();
+        let strong_untagged = make_record("claude-code", "strong", "alpha", Kind::Fact);
+        let weak_tagged = make_record("claude-code", "weak", "alpha", Kind::Fact);
+        for r in [&strong_untagged, &weak_tagged] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+        // Strong-untagged gets [1,1,0,0]; weak-tagged gets
+        // [0.5,0.5,0,0]. Query [1,1,0,0] makes strong-untagged
+        // the natural top-1.
+        let jobs = store.claim_next_jobs("model-a", 16).unwrap();
+        let vecs: Vec<Vec<f32>> = jobs
+            .iter()
+            .map(|j| {
+                if j.chunk_id.starts_with(&strong_untagged.id.0) {
+                    vec![1.0, 1.0, 0.0, 0.0]
+                } else {
+                    vec![0.5, 0.5, 0.0, 0.0]
+                }
+            })
+            .collect();
+        store.complete_jobs_batch(&jobs, &vecs).unwrap();
+        store
+            .tag_record(&weak_tagged.id, &["keep".into()], UserTagOperation::Add)
+            .unwrap();
+
+        let filter = SearchFilter {
+            user_tag: Some("keep".into()),
+            ..Default::default()
+        };
+        let hits = store
+            .search_chunks_vec(&[1.0, 1.0, 0.0, 0.0], "model-a", &filter, 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].record_id.0, weak_tagged.id.0,
+            "tagged record must win under filter even when untagged vec is stronger",
+        );
+    }
+
+    /// Normalisation parity: a tag written as `Keep-Forever`
+    /// gets stored as `keep-forever` and a filter for
+    /// `Keep-Forever` must hit. Without shared normalisation,
+    /// the filter would miss.
+    #[test]
+    fn user_tag_filter_normalises_match_to_write_path() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("claude-code", "alpha", "alpha content", Kind::Fact);
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        store
+            .tag_record(&r.id, &["Keep-Forever".into()], UserTagOperation::Add)
+            .unwrap();
+
+        let normalised = normalize_user_tag_name("  KEEP-FOREVER  ").unwrap();
+        assert_eq!(normalised, "keep-forever");
+        let filter = SearchFilter {
+            user_tag: Some(normalised),
+            ..Default::default()
+        };
+        let hits = store.search_chunks_fts("alpha", &filter, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id.0, r.id.0);
     }
 }

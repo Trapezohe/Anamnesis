@@ -213,3 +213,119 @@ async fn tag_record_remove_drops_tag() {
     assert_eq!(payload["changed"], 1);
     assert_eq!(payload["user_tags"], json!([]));
 }
+
+// ─── Round-79 PR-78b: search_memories(user_tag = ...) ──────────────
+
+#[tokio::test]
+async fn search_memories_user_tag_arg_is_advertised_in_tools_list() {
+    let (bundle, _id) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "search_memories")
+        .unwrap()
+        .clone();
+    let props = search["inputSchema"]["properties"]
+        .as_object()
+        .expect("inputSchema.properties");
+    assert!(
+        props.contains_key("user_tag"),
+        "search_memories must advertise user_tag arg; got {:?}",
+        props.keys().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn search_memories_user_tag_filters_to_tagged_records_only() {
+    let (bundle, id) = build_bundle(true);
+    // Seed a second, untagged record with the same FTS marker so
+    // "content to tag" matches both pre-filter; only the tagged
+    // one should survive `user_tag = "..."`.
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use chrono::Utc;
+    let store = Store::open(bundle._data_dir.path().join("anamnesis.sqlite")).unwrap();
+    let extra = AnamnesisRecord {
+        id: RecordId::from_parts("mem0", None, "untagged"),
+        source: SourceDescriptor {
+            adapter: "mem0".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "content to tag".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "untagged".into(),
+            native_path: Some("/tmp/untagged.md".into()),
+            captured_at: Utc::now(),
+            raw_hash: "h-untagged".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let chunks = Chunker::default().chunk(&extra.id, &extra.content);
+    store.upsert_record(&extra, &chunks, None).unwrap();
+    drop(store);
+
+    // Tag the original `tag-r78` record only.
+    let _ = bundle
+        .server
+        .handle(tool_call(
+            "tag_record",
+            json!({"record_id": id.0, "tags": ["keep"]}),
+        ))
+        .await;
+
+    // user_tag = "keep" must return ONLY the tagged record.
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "search_memories",
+            json!({
+                "query": "content",
+                "mode": "fulltext",
+                "limit": 5,
+                "user_tag": "Keep",  // case-insensitive
+            }),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let results = payload["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "only tagged record must survive");
+    assert_eq!(results[0]["record_id"], id.0);
+    assert_eq!(results[0]["user_tags"], json!(["keep"]));
+}
+
+#[tokio::test]
+async fn search_memories_user_tag_unknown_returns_empty() {
+    let (bundle, _id) = build_bundle(false);
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "search_memories",
+            json!({
+                "query": "content",
+                "mode": "fulltext",
+                "limit": 5,
+                "user_tag": "never-applied",
+            }),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["results"].as_array().unwrap().len(), 0);
+}
