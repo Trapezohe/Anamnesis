@@ -223,8 +223,14 @@ enum Command {
     /// product decision and explicitly out of scope.
     Dedupe {
         /// Scope to duplicate groups that include ≥1 record from
-        /// this adapter (e.g. `mem0`, `claude-code`). The full
-        /// sibling set is still returned so you can see which
+        /// this adapter (e.g. `mem0`, `claude-code`). Round 104:
+        /// also accepts a comma-separated OR list
+        /// (`--source mem0,claude-code`) — groups whose members
+        /// include at least one record from any listed adapter
+        /// stay eligible. Tokens are trimmed and empty tokens
+        /// dropped, so `--source mem0, , claude-code` is the
+        /// same as `--source mem0,claude-code`. The full sibling
+        /// set is still returned so you can see which
         /// non-matching records share the same `raw_hash`.
         #[arg(long)]
         source: Option<String>,

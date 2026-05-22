@@ -347,6 +347,144 @@ fn dedupe_include_counts_reflects_full_set_ignoring_limit() {
     assert!(mem["instance"].is_null());
 }
 
+// ─── Round-104 PR-78z: dedupe --source multi-value OR ─────────────
+
+/// Build a 3-group fixture with adapter-distinct groups so the
+/// OR filter is unambiguous: `h-mem` (mem0), `h-cc`
+/// (claude-code), `h-cx` (codex). `--source mem0,claude-code`
+/// must return groups 1 and 2 and drop group 3.
+fn seed_three_groups(data_dir: &std::path::Path) {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let db = data_dir.join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let make = |adapter: &str, native: &str, hash: &str| AnamnesisRecord {
+        id: RecordId::from_parts(adapter, None, native),
+        source: SourceDescriptor {
+            adapter: adapter.into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: format!("{adapter}|{native} content"),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/{adapter}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: hash.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        make("mem0", "m1", "h-mem"),
+        make("mem0", "m2", "h-mem"),
+        make("claude-code", "c1", "h-cc"),
+        make("claude-code", "c2", "h-cc"),
+        make("codex", "x1", "h-cx"),
+        make("codex", "x2", "h-cx"),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+}
+
+/// `--source mem0,claude-code` is the OR filter: both
+/// adapter-specific groups survive, the codex group drops.
+/// `filter.source` echoes the raw input string (R97/R80 wire
+/// shape unchanged) so downstream scripts still see what the
+/// operator typed. The new multi-value capability lives in the
+/// store's filter logic, not in the JSON wire format.
+#[test]
+fn dedupe_source_multi_value_or_narrows_to_listed_adapters() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_three_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "dedupe",
+            "--source",
+            "mem0, , claude-code",
+            "--json",
+            "--include-sensitive",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["count"], 2, "codex group must drop: {stdout}");
+    let hashes: std::collections::BTreeSet<String> = v["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["raw_hash"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        hashes.contains("h-mem"),
+        "mem0 group must survive: {hashes:?}"
+    );
+    assert!(
+        hashes.contains("h-cc"),
+        "claude-code group must survive: {hashes:?}"
+    );
+    assert!(
+        !hashes.contains("h-cx"),
+        "codex group must drop under multi-value OR: {hashes:?}"
+    );
+    // `filter.source` keeps the raw operator-supplied string —
+    // R97 wire shape, no break.
+    assert_eq!(v["filter"]["source"], "mem0, , claude-code");
+}
+
+/// `--include-counts` honours the same multi-source eligibility:
+/// `total_groups` reflects the eligible-only set, and `by_source[]`
+/// reports records only from surviving groups.
+#[test]
+fn dedupe_source_multi_value_or_counts_respect_filter() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_three_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "dedupe",
+            "--source",
+            "mem0,claude-code",
+            "--json",
+            "--include-counts",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counts"]["total_groups"], 2);
+    assert_eq!(v["counts"]["total_records"], 4);
+    let by_source = v["counts"]["by_source"].as_array().unwrap();
+    let adapters: std::collections::BTreeSet<&str> = by_source
+        .iter()
+        .map(|b| b["adapter"].as_str().unwrap())
+        .collect();
+    assert!(adapters.contains("mem0"));
+    assert!(adapters.contains("claude-code"));
+    assert!(
+        !adapters.contains("codex"),
+        "codex must be excluded from by_source under filter: {adapters:?}"
+    );
+}
+
 /// Counts block carries only numerics — no `raw_hash`, no
 /// `native_path`, no `native_id`. Stays inside the existing
 /// dedupe redaction boundary.
