@@ -33,7 +33,7 @@ pub use error::{Error, Result};
 pub use model::{
     AnamnesisRecord, Embedding, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
 };
-pub use query::{Query, SearchMode, TimeRange};
+pub use query::{parse_csv_filter, Query, SearchMode, TimeRange};
 
 /// Alias matching the `docs/BLUEPRINT.md §3.3` 5-layer model. `RawArtifact`
 /// is the reader-layer output; structurally identical to `RawRecord`.

@@ -2146,6 +2146,60 @@ fn source_list_source_plus_instance_filter_narrows_to_one_row() {
     assert_eq!(sources[0]["instance"], "prod");
 }
 
+/// Round 103: `--source a,b` is the OR filter — both adapters'
+/// rows survive, the third adapter drops. Symmetric with R102
+/// `audit tail --action forget,search`. Whitespace around
+/// tokens is normalised by core's shared `parse_csv_filter`.
+#[test]
+fn source_list_source_multi_value_or_narrows_json_to_matching_adapters() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/m"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "codex", "--path", "/tmp/cx"])
+        .assert()
+        .success();
+
+    // Multi-value OR keeps mem0 + claude-code; codex must drop.
+    // Whitespace + empty token is normalised by parse_csv_filter.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "list",
+            "--source",
+            "mem0, , claude-code",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = v["sources"].as_array().unwrap();
+    let adapters: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["adapter"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        adapters,
+        ["mem0", "claude-code"].into_iter().collect(),
+        "expected only the two matching adapters; got {sources:?}"
+    );
+}
+
 /// Human output: filter that matches nothing prints
 /// "no sources matched filter" (NOT the empty-registry
 /// "no sources registered" prose), so the operator can
