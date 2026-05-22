@@ -3087,7 +3087,7 @@ fn tools_list_payload_all() -> Value {
                     "properties": {
                         "source": {
                             "type": "string",
-                            "description": "Adapter id (e.g. `mem0`). Filters to duplicate groups that include ≥1 record from this source."
+                            "description": "Restrict duplicate groups to those containing ≥1 record from a given adapter. Single value (`\"mem0\"`) is exact match (R80); comma-separated list (`\"mem0,claude-code\"`) is OR (R104) — groups whose members include at least one record from any listed adapter stay eligible. Tokens trimmed and empty tokens dropped. Omit (or empty string) for all sources."
                         },
                         "instance": {
                             "type": "string",

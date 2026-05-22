@@ -628,9 +628,18 @@ pub struct DuplicateRawHashGroup {
 /// `limit` is clamped to
 /// `[1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT]` by the store,
 /// same as the unfiltered API.
+///
+/// Round 104 (PR-78z): `source` now accepts a single adapter
+/// id (`"mem0"`) **or** a comma-separated OR list
+/// (`"mem0,claude-code"`). Parsing is delegated to
+/// [`anamnesis_core::parse_csv_filter`] inside the helpers, so
+/// the external shape stays `Option<String>` (no API break).
+/// `None` and `Some("")` continue to mean "no source filter".
 #[derive(Debug, Clone, Default)]
 pub struct DuplicateRawHashFilter {
-    /// Adapter id (e.g. `"mem0"`). `None` matches any adapter.
+    /// Adapter id (e.g. `"mem0"`) or comma-separated OR list
+    /// (`"mem0,claude-code"`) — see the struct doc. `None` or
+    /// empty string matches any adapter.
     pub source: Option<String>,
     /// Instance discriminator. Only meaningful when `source` is
     /// also set. `None` matches any instance.
@@ -1782,17 +1791,30 @@ impl Store {
         // record set (so a group with 1 mem0 + 5 claude-code is
         // still a duplicate group, not collapsed to a singleton
         // by the filter).
+        // Round 104 (PR-78z): `filter.source` is parsed through
+        // core's shared `parse_csv_filter` so a single adapter
+        // (`"mem0"`) and a comma-separated OR list
+        // (`"mem0,claude-code"`) both work. Empty parse = no
+        // source filter (back-compat with R80).
+        let sources = anamnesis_core::parse_csv_filter(filter.source.as_deref());
         let mut sql = String::from(
             "SELECT raw_hash, COUNT(*) AS n, MAX(created_at) AS newest \
              FROM records \
              WHERE raw_hash IN (",
         );
         let mut eligible_params: Vec<rusqlite::types::Value> = Vec::new();
-        if filter.source.is_some() || filter.instance.is_some() {
+        if !sources.is_empty() || filter.instance.is_some() {
             sql.push_str("SELECT raw_hash FROM records WHERE 1=1");
-            if let Some(s) = &filter.source {
-                sql.push_str(" AND adapter = ?");
-                eligible_params.push(rusqlite::types::Value::Text(s.clone()));
+            if !sources.is_empty() {
+                // `adapter IN (?, ?, ...)` — N placeholders
+                // matching the parsed token count.
+                let placeholders = std::iter::repeat_n("?", sources.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql.push_str(&format!(" AND adapter IN ({placeholders})"));
+                for s in &sources {
+                    eligible_params.push(rusqlite::types::Value::Text(s.clone()));
+                }
             }
             if let Some(i) = &filter.instance {
                 sql.push_str(" AND instance = ?");
@@ -1904,17 +1926,28 @@ impl Store {
         // optionally narrowed by source/instance. Same shape as
         // `list_duplicate_raw_hashes_filtered` but without the
         // LIMIT — counts must reflect the full matching set.
+        // Round 104 (PR-78z): same multi-source parser shared
+        // with `list_duplicate_raw_hashes_filtered`. Counts must
+        // honour the same eligibility rule as the list, so we
+        // emit `adapter IN (?, ?, ...)` when the parsed token
+        // list is non-empty.
+        let sources = anamnesis_core::parse_csv_filter(filter.source.as_deref());
         let mut sql = String::from(
             "SELECT raw_hash, COUNT(*) AS n \
              FROM records \
              WHERE raw_hash IN (",
         );
         let mut bound: Vec<rusqlite::types::Value> = Vec::new();
-        if filter.source.is_some() || filter.instance.is_some() {
+        if !sources.is_empty() || filter.instance.is_some() {
             sql.push_str("SELECT raw_hash FROM records WHERE 1=1");
-            if let Some(s) = &filter.source {
-                sql.push_str(" AND adapter = ?");
-                bound.push(rusqlite::types::Value::Text(s.clone()));
+            if !sources.is_empty() {
+                let placeholders = std::iter::repeat_n("?", sources.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql.push_str(&format!(" AND adapter IN ({placeholders})"));
+                for s in &sources {
+                    bound.push(rusqlite::types::Value::Text(s.clone()));
+                }
             }
             if let Some(i) = &filter.instance {
                 sql.push_str(" AND instance = ?");
@@ -6816,6 +6849,109 @@ mod tests {
         assert_eq!(groups[0].raw_hash, "h-P");
         // Full sibling set still returned, secondary included.
         assert_eq!(groups[0].records.len(), 2);
+    }
+
+    // ─── Round-104 PR-78z: dedupe source multi-value OR ──────────────
+
+    /// `source = "mem0,claude-code"` is the OR filter: groups
+    /// whose members include at least one record from any
+    /// listed adapter survive. Groups whose members live
+    /// entirely outside the OR-set drop. Whitespace and empty
+    /// tokens normalise via core's `parse_csv_filter`.
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_multi_source_or_keeps_eligible_groups() {
+        let store = Store::open_in_memory().unwrap();
+        // 3 duplicate groups, each restricted to a single adapter.
+        for n in ["m1", "m2"] {
+            seed_with_raw_hash(&store, "mem0", n, "h-mem");
+        }
+        for n in ["c1", "c2"] {
+            seed_with_raw_hash(&store, "claude-code", n, "h-cc");
+        }
+        for n in ["x1", "x2"] {
+            seed_with_raw_hash(&store, "codex", n, "h-cx");
+        }
+
+        // mem0 + claude-code wins both; codex must drop.
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: Some("mem0, , claude-code".into()),
+                instance: None,
+                limit: 20,
+            })
+            .unwrap();
+        let hashes: std::collections::BTreeSet<_> =
+            groups.iter().map(|g| g.raw_hash.as_str()).collect();
+        assert_eq!(
+            hashes,
+            ["h-mem", "h-cc"].into_iter().collect(),
+            "expected only the two eligible groups; got {hashes:?}"
+        );
+    }
+
+    /// Multi-source OR also preserves mixed-group whole-sibling
+    /// semantics: if a group has 1 mem0 + 1 codex and we filter
+    /// to `mem0,claude-code`, the group survives (mem0
+    /// qualifies) AND the codex sibling is still returned in
+    /// the records[] list so the operator can decide which to
+    /// forget.
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_multi_source_or_keeps_whole_siblings() {
+        let store = Store::open_in_memory().unwrap();
+        seed_with_raw_hash(&store, "mem0", "m1", "h-mixed");
+        seed_with_raw_hash(&store, "codex", "x1", "h-mixed");
+
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: Some("mem0,claude-code".into()),
+                instance: None,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].records.len(), 2);
+        let adapters: std::collections::BTreeSet<_> = groups[0]
+            .records
+            .iter()
+            .map(|r| r.adapter.as_str())
+            .collect();
+        assert!(adapters.contains("mem0"));
+        assert!(adapters.contains("codex"), "non-matching sibling stays");
+    }
+
+    /// Aggregate counts honour the same multi-source eligibility
+    /// as the list helper — `by_source[]` reports every
+    /// surviving group's adapters, and `total_groups` /
+    /// `total_records` reflect the full multi-source-eligible
+    /// set (filter ignores `limit`).
+    #[test]
+    fn count_duplicate_raw_hashes_by_source_multi_source_or_aggregates_full_set() {
+        let store = Store::open_in_memory().unwrap();
+        for n in ["m1", "m2"] {
+            seed_with_raw_hash(&store, "mem0", n, "h-mem");
+        }
+        for n in ["c1", "c2"] {
+            seed_with_raw_hash(&store, "claude-code", n, "h-cc");
+        }
+        for n in ["x1", "x2"] {
+            seed_with_raw_hash(&store, "codex", n, "h-cx");
+        }
+
+        let counts = store
+            .count_duplicate_raw_hashes_by_source(&DuplicateRawHashFilter {
+                source: Some("mem0,claude-code".into()),
+                instance: None,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(counts.total_groups, 2, "h-mem + h-cc are eligible");
+        assert_eq!(counts.total_records, 4);
+        // codex group must not contribute to by_source.
+        assert!(
+            counts.by_source.iter().all(|b| b.adapter != "codex"),
+            "codex must be excluded from by_source: {:?}",
+            counts.by_source
+        );
     }
 
     /// Empty filter must behave identically to the legacy
