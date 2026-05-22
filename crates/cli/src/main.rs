@@ -328,14 +328,12 @@ enum Command {
         /// has_reason,has_native_path`) instead of the human
         /// table. Same redacted summary discipline as the
         /// default human/JSON output — never carries `reason`,
-        /// `native_path`, or `raw_hash` even if
-        /// `--include-sensitive` is set. Mutually exclusive
-        /// with `--json`, `--include-sensitive`, and
-        /// `--include-counts` (CSV is a flat redacted view by
-        /// design; mix them with `--json` if you need the
-        /// structured form). Mirrors R91's
+        /// `native_path`, or `raw_hash`. Mutually exclusive
+        /// with `--json` (use `--json` for the structured
+        /// form), `--include-sensitive`, and
+        /// `--include-counts`. Mirrors R91's
         /// `audit tail --csv`.
-        #[arg(long, conflicts_with_all = ["json", "include_sensitive", "include_counts"])]
+        #[arg(long, conflicts_with = "json")]
         csv: bool,
     },
 
@@ -3591,6 +3589,26 @@ fn cmd_list_forgotten(
     include_counts: bool,
     csv: bool,
 ) -> Result<()> {
+    // Round 105 (PR-78aa): `--csv` is mutually exclusive with
+    // `--include-sensitive` and `--include-counts`. The `--json`
+    // conflict is enforced by clap (single `conflicts_with`
+    // attribute — keeping the clap surface small avoids
+    // Windows-side stack-overflow we saw on the first cut).
+    // The remaining two get runtime-checked here so the CSV
+    // path never has to reason about leaking `reason` /
+    // `native_path` / `raw_hash` or attaching a counts block
+    // that won't fit in flat rows.
+    if csv && include_sensitive {
+        return Err(anyhow!(
+            "--csv and --include-sensitive are mutually exclusive — CSV is the redacted-summary form (never carries `reason` / `native_path` / `raw_hash`)."
+        ));
+    }
+    if csv && include_counts {
+        return Err(anyhow!(
+            "--csv and --include-counts are mutually exclusive — CSV is flat redacted rows. Drop --csv to get the counts block back."
+        ));
+    }
+
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::ListForgottenFilter {
         source: source.map(str::to_owned),
