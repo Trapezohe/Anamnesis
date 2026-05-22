@@ -718,9 +718,14 @@ enum AuditCmd {
         /// Maximum number of entries to return.
         #[arg(long = "limit", short = 'n', default_value_t = 20)]
         limit: usize,
-        /// Filter to entries with this exact `action` (e.g.
-        /// `forget`, `search`, `import`, `tag_record`). Omit for
-        /// all actions.
+        /// Filter to entries whose `action` matches. Pass a
+        /// single value (`--action forget`) for exact match, or
+        /// a comma-separated list (`--action forget,search`)
+        /// for an OR filter — both `forget` and `search` rows
+        /// come back, everything else is dropped. Tokens are
+        /// trimmed and empty tokens dropped, so `--action
+        /// forget,, search ,` and `--action forget,search` are
+        /// equivalent. Omit for all actions.
         #[arg(long)]
         action: Option<String>,
         /// Drop entries older than this relative lookback.
@@ -4911,10 +4916,18 @@ fn cmd_audit_tail(
         None => None,
     };
 
+    // Round 102 (PR-78x): comma-separated `--action` becomes a
+    // multi-value OR filter (`["forget", "search"]`). Parsing
+    // lives in `anamnesis_core::parse_audit_actions` so CLI +
+    // MCP share the split rule byte-for-byte. JSON keeps the
+    // existing `filter.action` raw string for back-compat with
+    // R84/R91 clients, plus an additive `filter.actions` array
+    // carrying the normalised tokens.
+    let actions = anamnesis_core::parse_audit_actions(action);
     let opts = anamnesis_core::AuditTailOptions {
         limit: Some(limit),
         since: since_dt,
-        action: action.map(str::to_owned),
+        actions: actions.clone(),
     };
     let audit = anamnesis_core::Audit::new(data_dir);
     let rows = audit
@@ -4927,8 +4940,9 @@ fn cmd_audit_tail(
             "count": rows.len(),
             "limit": effective_limit,
             "filter": {
-                "action": action,
-                "since":  since,
+                "action":  action,
+                "actions": actions,
+                "since":   since,
             },
             "entries": rows.iter().map(|r| serde_json::json!({
                 "line_no":   r.line_no,

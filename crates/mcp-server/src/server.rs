@@ -2014,10 +2014,18 @@ impl AnamnesisServer {
             );
         }
 
+        // Round 102 (PR-78x): comma-separated `action` becomes
+        // a multi-value OR filter (`["forget", "search"]`).
+        // Parsing lives in core's `parse_audit_actions` so CLI
+        // + MCP share the split rule byte-for-byte. Response
+        // keeps the existing `filter.action` raw string for
+        // back-compat with R84/R91 clients and adds an additive
+        // `filter.actions` array of normalised tokens.
+        let actions = anamnesis_core::parse_audit_actions(action.as_deref());
         let opts = anamnesis_core::AuditTailOptions {
             limit,
             since: since_dt,
-            action: action.clone(),
+            actions: actions.clone(),
         };
         let audit = anamnesis_core::Audit::new(&self.data_dir);
         let rows = audit
@@ -2041,8 +2049,9 @@ impl AnamnesisServer {
                 "format":          "csv",
                 "include_detail":  false,
                 "filter": {
-                    "action": action,
-                    "since":  since_spec,
+                    "action":  action,
+                    "actions": actions,
+                    "since":   since_spec,
                 },
                 "csv": csv,
             }));
@@ -2076,8 +2085,9 @@ impl AnamnesisServer {
             "limit":           effective_limit,
             "include_detail":  include_detail,
             "filter": {
-                "action": action,
-                "since":  since_spec,
+                "action":  action,
+                "actions": actions,
+                "since":   since_spec,
             },
             "entries": entries,
         }))
@@ -3162,7 +3172,7 @@ fn tools_list_payload_all() -> Value {
                         },
                         "action": {
                             "type": "string",
-                            "description": "Exact-match filter on `entry.action` (e.g. `forget`, `search`, `import`, `tag_record`). Omit for all actions."
+                            "description": "Filter on `entry.action`. Single value (`\"forget\"`) is exact match; comma-separated list (`\"forget,search\"`) is OR (R102) — both `forget` and `search` rows come back, everything else is dropped. Tokens are trimmed and empty tokens dropped. Omit (or empty string) for all actions. The response echoes both `filter.action` (raw input, back-compat) and `filter.actions` (normalised list)."
                         },
                         "since": {
                             "type": "string",

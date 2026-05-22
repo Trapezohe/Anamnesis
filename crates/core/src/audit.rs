@@ -31,9 +31,43 @@ pub struct AuditTailOptions {
     /// Optional lower bound on `entry.timestamp`. Entries strictly
     /// older than this are dropped before the limit applies.
     pub since: Option<DateTime<Utc>>,
-    /// Exact-match filter on `entry.action`. `None` returns all
-    /// actions.
-    pub action: Option<String>,
+    /// Round 102 (PR-78x): exact-match OR filter on
+    /// `entry.action`. An empty vec returns all actions (same as
+    /// the old `action: None`). A non-empty vec keeps an entry
+    /// iff `entry.action ∈ actions` — e.g. `["forget","search"]`
+    /// returns rows where `action == "forget"` OR `action ==
+    /// "search"`. CLI + MCP both surface this via a
+    /// comma-separated `--action`/`action` arg fed through
+    /// [`parse_audit_actions`] so the split rule lives in core,
+    /// not on two surfaces.
+    pub actions: Vec<String>,
+}
+
+/// Round 102 (PR-78x): shared splitter for CLI + MCP `audit
+/// tail` action filters. Takes the raw operator-supplied string
+/// (e.g. `Some("forget,search")`) and returns the normalised
+/// token list (`["forget", "search"]`) ready to drop into
+/// [`AuditTailOptions::actions`].
+///
+/// Rules:
+///   * `None` or `Some("")` → `vec![]` (no filter).
+///   * Split on `,`, trim each token, drop empties — so
+///     `"forget,, search ,"` becomes `["forget", "search"]`.
+///   * Tokens are case-sensitive exact matches (the audit log
+///     stores `"search"`, `"forget"`, etc. in lower-case).
+///   * Order is preserved but otherwise irrelevant — the filter
+///     is OR.
+///
+/// Living in core keeps CLI and MCP byte-identical: both
+/// surfaces feed their raw `--action` / `action` string in and
+/// build `AuditTailOptions { actions, .. }` from the result.
+pub fn parse_audit_actions(spec: Option<&str>) -> Vec<String> {
+    spec.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Round 84: one row of `Audit::tail` output. Carries the 1-based
@@ -154,10 +188,12 @@ impl Audit {
                     continue;
                 }
             }
-            if let Some(action) = &opts.action {
-                if &entry.action != action {
-                    continue;
-                }
+            // Round 102 (PR-78x): empty `actions` → no filter
+            // (back-compat with the old `action: None`). A
+            // non-empty list is exact-match OR — survive the
+            // first match.
+            if !opts.actions.is_empty() && !opts.actions.iter().any(|a| a == &entry.action) {
+                continue;
             }
             matched.push(AuditTailRow { line_no, entry });
         }
@@ -326,13 +362,95 @@ mod tests {
         let rows = audit
             .tail(&AuditTailOptions {
                 limit: Some(5),
-                action: Some("forget".into()),
+                actions: vec!["forget".into()],
                 ..Default::default()
             })
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entry.action, "forget");
         assert_eq!(rows[0].entry.detail["why"], "test");
+    }
+
+    // ─── Round-102 PR-78x: multi-action OR filter ────────────────────
+
+    /// Multi-action filter is exact-match OR — `["forget",
+    /// "tag_record"]` keeps both `forget` and `tag_record` rows
+    /// but drops the surrounding `search` noise. Runs *before*
+    /// the limit so a tight target window is never starved by a
+    /// dominant unrelated action.
+    #[test]
+    fn tail_filters_by_multi_action_or_before_limit() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        // 8 search rows sandwich 1 forget + 1 tag_record so the
+        // matched window is well inside the file.
+        for _ in 0..4 {
+            audit.record(AuditEntry::new("search", json!({})));
+        }
+        audit.record(AuditEntry::new("forget", json!({"id": "r1"})));
+        audit.record(AuditEntry::new("tag_record", json!({"id": "r1"})));
+        for _ in 0..4 {
+            audit.record(AuditEntry::new("search", json!({})));
+        }
+
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(5),
+                actions: vec!["forget".into(), "tag_record".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let actions: Vec<&str> = rows.iter().map(|r| r.entry.action.as_str()).collect();
+        assert_eq!(actions, vec!["forget", "tag_record"]);
+    }
+
+    /// Empty `actions` is back-compat with the old `action:
+    /// None` — no filter, every entry shows.
+    #[test]
+    fn tail_empty_actions_returns_every_entry() {
+        let dir = tmp_dir();
+        let audit = Audit::new(&dir);
+        audit.record(AuditEntry::new("search", json!({})));
+        audit.record(AuditEntry::new("forget", json!({})));
+        let rows = audit
+            .tail(&AuditTailOptions {
+                limit: Some(10),
+                actions: vec![],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// Shared `parse_audit_actions` is the single split rule
+    /// CLI + MCP feed their raw `--action`/`action` arg
+    /// through. `None`/`""` → empty (no filter); commas trim
+    /// whitespace and drop empty tokens; tokens stay
+    /// case-sensitive to match the audit log's lower-case
+    /// action names.
+    #[test]
+    fn parse_audit_actions_normalises_comma_separated_input() {
+        assert_eq!(parse_audit_actions(None), Vec::<String>::new());
+        assert_eq!(parse_audit_actions(Some("")), Vec::<String>::new());
+        assert_eq!(
+            parse_audit_actions(Some("forget")),
+            vec!["forget".to_string()]
+        );
+        assert_eq!(
+            parse_audit_actions(Some("forget,search")),
+            vec!["forget".to_string(), "search".to_string()]
+        );
+        assert_eq!(
+            parse_audit_actions(Some(" forget , , search ,")),
+            vec!["forget".to_string(), "search".to_string()],
+            "trims whitespace and drops empty tokens"
+        );
+        // Case-sensitive — `Forget` ≠ `forget` deliberately so
+        // a typo isn't silently widened.
+        assert_eq!(
+            parse_audit_actions(Some("Forget")),
+            vec!["Forget".to_string()]
+        );
     }
 
     /// `--since` drops entries strictly older than the given
