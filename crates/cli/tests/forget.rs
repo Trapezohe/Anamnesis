@@ -682,3 +682,115 @@ fn forget_dry_run_not_found_exits_nonzero() {
         .assert()
         .failure();
 }
+
+// ─── Round-106 PR-78ab: list-forgotten --csv ────────────────────────
+// Re-added after the R105 Windows stack-overflow fix landed in the
+// same PR. CSV is the redacted-summary form; mutually exclusive
+// with --json (clap) and --include-sensitive / --include-counts
+// (runtime check).
+
+/// Empty store still emits the fixed header so downstream
+/// scripts can branch uniformly. Mirrors R91 `audit tail --csv`.
+#[test]
+fn list_forgotten_csv_empty_emits_header_only() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "csv on empty store must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.trim(),
+        "record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path"
+    );
+}
+
+/// `--csv` emits the redacted summary row even when the
+/// tombstone carries a `reason`. Critical privacy contract:
+/// `reason`, `native_path`, and `raw_hash` NEVER appear in CSV.
+#[test]
+fn list_forgotten_csv_returns_redacted_summary_rows() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+    let rid = record_id_for_query(home.path(), data.path(), "forgetMeChannel");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &rid, "--reason", "secretCsvCanary106"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "header + 1 row: {stdout}");
+    assert_eq!(
+        lines[0],
+        "record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path"
+    );
+    assert!(
+        lines[1].contains(&rid),
+        "csv row must reference the forgotten id: {}",
+        lines[1]
+    );
+    assert!(
+        !stdout.contains("secretCsvCanary106"),
+        "csv must never leak `reason`: {stdout}"
+    );
+}
+
+/// `--csv --include-sensitive` is rejected at runtime — CSV is
+/// the redacted-summary form by design.
+#[test]
+fn list_forgotten_csv_and_include_sensitive_are_mutually_exclusive() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--csv", "--include-sensitive"])
+        .assert()
+        .failure();
+}
+
+/// `--csv --json` (clap-rejected) and `--csv --include-counts`
+/// (runtime-rejected). CSV is flat redacted rows — no nested
+/// counts block, no structured form.
+#[test]
+fn list_forgotten_csv_and_json_are_mutually_exclusive() {
+    let home = tmp_dir();
+    let data = tmp_dir();
+    seed_fixture(home.path());
+    init_and_import(home.path(), data.path());
+
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--csv", "--json"])
+        .assert()
+        .failure();
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--csv", "--include-counts"])
+        .assert()
+        .failure();
+}

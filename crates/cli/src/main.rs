@@ -323,6 +323,14 @@ enum Command {
         /// real shape of the tombstone table at a glance.
         #[arg(long)]
         include_counts: bool,
+        /// Round 106: emit redacted CSV (mirrors R91/R92
+        /// `audit tail --csv`). Mutually exclusive with --json
+        /// (clap) and with --include-sensitive /
+        /// --include-counts (runtime check). Re-enabled after
+        /// R106 fixed the Windows main-thread stack so CLI
+        /// args can grow again.
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
     },
 
     /// Forget a record permanently.
@@ -856,8 +864,37 @@ fn resolve_config_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     Ok(anamnesis_core::Config::default_path(&home))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Round 106 (PR-78ab): Windows debug builds default to a 1 MB
+/// thread stack, and the cumulative clap `Command` tree
+/// finally crossed that ceiling around R105 — `anamnesis init`
+/// crashed with `STATUS_STACK_OVERFLOW` (`code=-1073741571`)
+/// every subprocess. The fix is the standard Rust pattern:
+/// move the real work to a worker thread with an 8 MB stack
+/// and run the Tokio runtime inside it. The OS-default main
+/// thread does almost nothing beyond `Builder::spawn`, and the
+/// worker has more than enough headroom for clap parse +
+/// long-tail subcommand growth.
+///
+/// `main` itself stays sync — `#[tokio::main]` is removed so we
+/// own the runtime build (and pick where it lives in the stack
+/// graph). The pre-R106 body now lives in [`run`] verbatim.
+fn main() -> Result<()> {
+    let builder = std::thread::Builder::new()
+        .name("anamnesis-main".into())
+        .stack_size(8 * 1024 * 1024);
+    let handle = builder
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            rt.block_on(run())
+        })
+        .expect("spawn anamnesis-main thread");
+    handle.join().expect("join anamnesis-main thread")
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_level);
     let data_dir = resolve_data_dir(cli.data_dir)?;
@@ -1017,6 +1054,7 @@ async fn main() -> Result<()> {
             json,
             include_sensitive,
             include_counts,
+            csv,
         } => cmd_list_forgotten(
             &data_dir,
             source.as_deref(),
@@ -1025,6 +1063,7 @@ async fn main() -> Result<()> {
             json,
             include_sensitive,
             include_counts,
+            csv,
         ),
         Command::Forget {
             record_id,
@@ -3564,6 +3603,7 @@ fn render_dedupe_counts_json(c: &anamnesis_store::DuplicateRawHashCounts) -> ser
 ///
 /// Read-only — never writes to the store or audit log. Pure audit
 /// surface, distinct from the `forget` mutation.
+#[allow(clippy::too_many_arguments)]
 fn cmd_list_forgotten(
     data_dir: &std::path::Path,
     source: Option<&str>,
@@ -3572,7 +3612,27 @@ fn cmd_list_forgotten(
     json: bool,
     include_sensitive: bool,
     include_counts: bool,
+    csv: bool,
 ) -> Result<()> {
+    // Round 106 (PR-78ab): runtime guards for the conflicts
+    // clap can't enforce cheaply on Windows (using multiple
+    // clap `conflicts_with_all` entries was implicated in the
+    // R105 Windows stack-overflow, so we keep the clap surface
+    // small). `--csv --json` is rejected by clap; the other
+    // two combinations get checked here so the CSV path never
+    // has to reason about leaking `reason` / `native_path` /
+    // `raw_hash` or attaching nested counts.
+    if csv && include_sensitive {
+        return Err(anyhow!(
+            "--csv and --include-sensitive are mutually exclusive — CSV is the redacted-summary form (never carries `reason` / `native_path` / `raw_hash`)."
+        ));
+    }
+    if csv && include_counts {
+        return Err(anyhow!(
+            "--csv and --include-counts are mutually exclusive — CSV is flat redacted rows. Drop --csv to get the counts block back."
+        ));
+    }
+
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::ListForgottenFilter {
         source: source.map(str::to_owned),
@@ -3589,6 +3649,37 @@ fn cmd_list_forgotten(
     } else {
         None
     };
+
+    if csv {
+        // Round 106 (PR-78ab): CSV is the redacted-summary
+        // form, mirroring R91 `audit tail --csv` + R105 MCP
+        // `list_forgotten { csv: true }`. Fixed header so
+        // scripts can branch on column count; empty result
+        // still prints the header. `--include-sensitive` and
+        // `--include-counts` are runtime-rejected above so
+        // this branch never has to reason about leaking
+        // `reason` / `native_path` / `raw_hash`.
+        println!("record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path");
+        for r in &rows {
+            // forgotten_at is stored as unix-epoch i64; render
+            // ISO-8601 to match audit_tail's CSV format and
+            // stay human-readable.
+            let at_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.forgotten_at, 0)
+                .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| r.forgotten_at.to_string());
+            println!(
+                "{rid},{adapter},{instance},{native_id},{at},{has_reason},{has_native_path}",
+                rid = csv_field(&r.record_id.0),
+                adapter = csv_field(&r.adapter),
+                instance = csv_field(&r.instance),
+                native_id = csv_field(&r.native_id),
+                at = csv_field(&at_iso),
+                has_reason = r.reason.is_some(),
+                has_native_path = r.native_path.is_some(),
+            );
+        }
+        return Ok(());
+    }
 
     if json {
         let mut payload = serde_json::json!({
