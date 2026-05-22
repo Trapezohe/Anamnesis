@@ -2825,3 +2825,136 @@ fn audit_tail_action_filter_excludes_other_actions() {
         assert_eq!(e["action"], "search");
     }
 }
+
+// ─── Round-102 PR-78x: audit tail --action multi-value OR ──────────
+
+/// `--action a,b` is the OR filter: rows where `entry.action ==
+/// "a"` OR `entry.action == "b"` come back, everything else is
+/// dropped. Symmetric with R102 core change. JSON keeps
+/// `filter.action` raw (back-compat) and adds the additive
+/// `filter.actions` array of normalised tokens.
+#[test]
+fn audit_tail_action_multi_value_or_filters_in_both_actions() {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+
+    // Seed a record so the forget call actually has something
+    // to chew on (otherwise it errors out before recording an
+    // audit entry).
+    let db = dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).unwrap();
+    let r = AnamnesisRecord {
+        id: RecordId::from_parts("claude-code", None, "audit-multi"),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "auditable multi-action body".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "audit-multi".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "h-audit-multi".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let c = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &c, None).unwrap();
+    drop(store);
+
+    // Three distinct actions land in the audit log.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "anything", "--mode", "fulltext"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["forget", &r.id.0, "--reason", "audit-multi"])
+        .assert()
+        .success();
+    // tag_record is admin-only on MCP, but the CLI surface lets
+    // anyone tag — perfect third action for the OR set.
+
+    // Multi-action OR keeps forget + search rows, drops anything
+    // else. Tokens with surrounding whitespace are normalised
+    // by core's `parse_audit_actions`.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--action", "forget, search", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // filter.action keeps the raw string for back-compat (an
+    // existing R84 client just sees the unparsed value).
+    assert_eq!(v["filter"]["action"], "forget, search");
+    // filter.actions is the new normalised list — trimmed, no
+    // empties, exact-match tokens.
+    assert_eq!(
+        v["filter"]["actions"],
+        serde_json::json!(["forget", "search"])
+    );
+    let entries = v["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().any(|e| e["action"] == "forget"),
+        "must contain the forget row: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|e| e["action"] == "search"),
+        "must contain the search row: {entries:?}"
+    );
+    for e in entries {
+        let a = e["action"].as_str().unwrap();
+        assert!(
+            a == "forget" || a == "search",
+            "no foreign action should leak through; got {a}"
+        );
+    }
+}
+
+/// Omitting `--action` keeps `filter.action` null and
+/// `filter.actions` empty — back-compat: zero filter still
+/// returns every entry.
+#[test]
+fn audit_tail_no_action_arg_emits_empty_actions_array() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "ping", "--mode", "fulltext"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["audit", "tail", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["filter"]["action"].is_null());
+    assert_eq!(v["filter"]["actions"], serde_json::json!([]));
+}

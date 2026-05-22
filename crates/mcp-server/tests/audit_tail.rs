@@ -296,3 +296,119 @@ async fn audit_tail_csv_empty_log_emits_header_only() {
     let csv = payload["csv"].as_str().unwrap();
     assert_eq!(csv.trim(), "line_no,timestamp,action,via,outcome");
 }
+
+// ─── Round-102 PR-78x: audit_tail action multi-value OR ────────────
+
+/// Comma-separated `action` argument is an OR filter — `forget`
+/// + `tag_record` rows survive, `search` rows drop. Symmetric
+/// with the CLI's R102 `--action forget,search`. Response keeps
+/// `filter.action` raw (back-compat with R84 / R91 / R92
+/// clients) and adds the additive `filter.actions` array of
+/// normalised tokens.
+#[tokio::test]
+async fn audit_tail_action_multi_value_or_filters_matching_set() {
+    let bundle = build_bundle(true);
+    // 6 noise + 1 forget + 1 tag_record so the OR target sits
+    // squarely inside the file.
+    for _ in 0..3 {
+        bundle
+            .audit
+            .record(AuditEntry::new("search", json!({"via": "mcp"})));
+    }
+    bundle.audit.record(AuditEntry::new(
+        "forget",
+        json!({"via": "cli", "outcome": "forgotten"}),
+    ));
+    bundle.audit.record(AuditEntry::new(
+        "tag_record",
+        json!({"via": "mcp", "outcome": "tagged"}),
+    ));
+    for _ in 0..3 {
+        bundle
+            .audit
+            .record(AuditEntry::new("search", json!({"via": "mcp"})));
+    }
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "audit_tail",
+            json!({"action": "forget, tag_record"}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    // Raw `action` echoed for back-compat.
+    assert_eq!(payload["filter"]["action"], "forget, tag_record");
+    // Normalised `actions` is the new source of truth.
+    assert_eq!(
+        payload["filter"]["actions"],
+        json!(["forget", "tag_record"])
+    );
+    let entries = payload["entries"].as_array().unwrap();
+    let actions: Vec<&str> = entries
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, vec!["forget", "tag_record"]);
+}
+
+/// Multi-value OR is also honoured on the CSV path so scripts
+/// can `audit_tail` with `csv: true, action: "forget,search"`
+/// and get a flat header-plus-rows string of the union — same
+/// redaction discipline as the single-action CSV (R92).
+#[tokio::test]
+async fn audit_tail_csv_action_multi_value_or_filters_matching_set() {
+    let bundle = build_bundle(true);
+    bundle.audit.record(AuditEntry::new(
+        "forget",
+        json!({"via": "cli", "outcome": "forgotten", "reason": "csv-canary"}),
+    ));
+    bundle
+        .audit
+        .record(AuditEntry::new("search", json!({"via": "mcp"})));
+    bundle
+        .audit
+        .record(AuditEntry::new("import", json!({"via": "cli"})));
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "audit_tail",
+            json!({"action": "forget,search", "csv": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["filter"]["actions"], json!(["forget", "search"]));
+    assert_eq!(payload["count"], 2);
+    let csv = payload["csv"].as_str().unwrap();
+    assert!(csv.contains(",forget,cli,forgotten\n"));
+    assert!(csv.contains(",search,mcp,"));
+    assert!(!csv.contains(",import,"), "import row must be dropped");
+    assert!(
+        !csv.contains("csv-canary"),
+        "csv must not leak reason even on multi-action: {csv}"
+    );
+}
+
+/// Omitting `action` keeps `filter.action` null and
+/// `filter.actions` an empty array — back-compat: no filter
+/// returns every entry.
+#[tokio::test]
+async fn audit_tail_no_action_arg_emits_empty_actions_array() {
+    let bundle = build_bundle(true);
+    bundle
+        .audit
+        .record(AuditEntry::new("search", json!({"via": "mcp"})));
+
+    let resp = bundle
+        .server
+        .handle(tool_call("audit_tail", json!({})))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert!(payload["filter"]["action"].is_null());
+    assert_eq!(payload["filter"]["actions"], json!([]));
+    assert_eq!(payload["count"], 1);
+}
