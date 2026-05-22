@@ -87,6 +87,49 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 105 (PR-78aa): CSV-shape rules shared by every MCP
+/// CSV renderer (audit_tail in R92, list_forgotten in R105).
+/// Quote + double inner-quote when the field contains `,`,
+/// `"`, or `\n`; otherwise the raw value passes through.
+fn csv_escape(s: &str) -> String {
+    if s.chars().any(|c| c == ',' || c == '"' || c == '\n') {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Round 105 (PR-78aa): render `Store::list_forgotten` rows as
+/// the MCP CSV string. Same columns and redaction discipline
+/// as the CLI R105 helper —
+/// `record_id,adapter,instance,native_id,forgotten_at,
+/// has_reason,has_native_path` only, never `reason` /
+/// `native_path` / `raw_hash`. Empty rows still emit the
+/// header so scripts can branch uniformly. `forgotten_at` is
+/// rendered as ISO-8601 UTC to match audit_tail's CSV format.
+fn render_list_forgotten_csv(rows: &[anamnesis_store::ForgottenRecord]) -> String {
+    let mut out = String::from(
+        "record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path\n",
+    );
+    for r in rows {
+        let at_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.forgotten_at, 0)
+            .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| r.forgotten_at.to_string());
+        out.push_str(&format!(
+            "{rid},{adapter},{instance},{native_id},{at},{has_reason},{has_native_path}\n",
+            rid = csv_escape(&r.record_id.0),
+            adapter = csv_escape(&r.adapter),
+            instance = csv_escape(&r.instance),
+            native_id = csv_escape(&r.native_id),
+            at = csv_escape(&at_iso),
+            has_reason = r.reason.is_some(),
+            has_native_path = r.native_path.is_some(),
+        ));
+    }
+    out
+}
+
 /// Round 92 (PR-78n): render `Audit::tail` results as the
 /// MCP CSV string. Same columns and redaction discipline as the
 /// CLI helper in R91 — `line_no,timestamp,action,via,outcome`
@@ -95,14 +138,6 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
 /// escaping reuses the same simple rule (quote + double inner
 /// quotes when the field contains `,`, `"`, or `\n`).
 fn render_audit_tail_csv(rows: &[anamnesis_core::AuditTailRow]) -> String {
-    fn csv_escape(s: &str) -> String {
-        if s.chars().any(|c| c == ',' || c == '"' || c == '\n') {
-            let escaped = s.replace('"', "\"\"");
-            format!("\"{escaped}\"")
-        } else {
-            s.to_string()
-        }
-    }
     let mut out = String::from("line_no,timestamp,action,via,outcome\n");
     for r in rows {
         let via = r
@@ -1736,10 +1771,34 @@ impl AnamnesisServer {
             .get("include_counts")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 105 (PR-78aa): opt-in CSV form, mirroring R92's
+        // `audit_tail.csv`. CSV is the redacted-summary form;
+        // we refuse `csv + include_sensitive` and
+        // `csv + include_counts` because the operator intent is
+        // contradictory — CSV is flat redacted rows by design,
+        // so smuggling sensitive fields or attaching a counts
+        // block would either leak content or pretend the CSV
+        // carried more shape than it does.
+        let csv_requested = args.get("csv").and_then(|v| v.as_bool()).unwrap_or(false);
+        if csv_requested && include_sensitive {
+            return Err(
+                "list_forgotten: `csv: true` and `include_sensitive: true` are mutually exclusive \
+                 — CSV is the redacted-summary form (never carries `reason` / `native_path` / \
+                 `raw_hash`)."
+                    .to_string(),
+            );
+        }
+        if csv_requested && include_counts {
+            return Err(
+                "list_forgotten: `csv: true` and `include_counts: true` are mutually exclusive \
+                 — CSV is flat redacted rows. Drop `csv` to get the `counts` block back."
+                    .to_string(),
+            );
+        }
 
         let filter = anamnesis_store::ListForgottenFilter {
-            source,
-            instance,
+            source: source.clone(),
+            instance: instance.clone(),
             limit,
         };
         let rows = self
@@ -1757,6 +1816,27 @@ impl AnamnesisServer {
         };
 
         let effective_limit = limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT);
+
+        if csv_requested {
+            // CSV path returns a single flat string instead of
+            // `rows[]`. Header + redacted summary columns
+            // mirror the CLI R105 output exactly so a scripted
+            // consumer can switch between transports without
+            // reparsing.
+            let csv = render_list_forgotten_csv(&rows);
+            return Ok(json!({
+                "count":              rows.len(),
+                "limit":              effective_limit,
+                "format":             "csv",
+                "sensitive_included": false,
+                "filter":             {
+                    "source":   source,
+                    "instance": instance,
+                },
+                "csv":                csv,
+            }));
+        }
+
         let rows_payload: Vec<Value> = rows
             .iter()
             .map(|r| {
@@ -3066,6 +3146,11 @@ fn tools_list_payload_all() -> Value {
                             "type": "boolean",
                             "default": false,
                             "description": "Round 90: also return a `counts` block with `total` + `by_source[]` (per-`(adapter, instance)` tombstone totals). Counts respect the same source/instance filter as the row list but reflect the full matching set — not just the current page."
+                        },
+                        "csv": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 105: return a CSV string in `csv` (header `record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path`) instead of structured `rows[]`. Same redacted summary discipline as the CLI `list-forgotten --csv` — never carries `reason` / `native_path` / `raw_hash`. Mutually exclusive with `include_sensitive: true` and `include_counts: true` (CSV is flat redacted rows by design)."
                         }
                     }
                 }

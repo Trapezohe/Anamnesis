@@ -3564,7 +3564,6 @@ fn render_dedupe_counts_json(c: &anamnesis_store::DuplicateRawHashCounts) -> ser
 ///
 /// Read-only — never writes to the store or audit log. Pure audit
 /// surface, distinct from the `forget` mutation.
-#[allow(clippy::too_many_arguments)]
 fn cmd_list_forgotten(
     data_dir: &std::path::Path,
     source: Option<&str>,
