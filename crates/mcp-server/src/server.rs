@@ -2347,12 +2347,27 @@ impl AnamnesisServer {
             bullets.push_str("(no user-scope records yet)\n");
         }
 
+        // Round 101 (PR-78w): summary line symmetric with R100
+        // `find_related`. The store helper already filtered by
+        // `user_tag` at the SQL recall stage, so every row in
+        // `rows` is by definition a match — `matched_user_tag =
+        // bullet_count` when a tag is set. Keeps the LLM-facing
+        // shape identical to find_related so an agent reading
+        // either prompt sees the same structured prelude.
+        let bullet_count = rows.len();
+        let summary_line = match user_tag.as_deref() {
+            Some(tag) => format!(
+                "Summary: bullets={bullet_count}; user_tag=\"{tag}\"; matched_user_tag={bullet_count}\n\n"
+            ),
+            None => format!("Summary: bullets={bullet_count}\n\n"),
+        };
+
         let user_text = format!(
             "Below are the user's stable preferences and personal facts that we have on file. \
              Summarize them into 5–8 concise bullet points capturing what an AI assistant \
              should consistently keep in mind when collaborating with this user. Group related \
              items, preserve any explicit dos/don'ts, and surface contradictions if any.\n\n\
-             ---\n{bullets}",
+             ---\n{summary_line}{bullets}",
         );
 
         Ok(json!({
@@ -4410,6 +4425,103 @@ mod tests {
             args.iter().any(|a| a["name"] == "user_tag"),
             "must advertise user_tag: {args:?}"
         );
+    }
+
+    // ─── Round-101 PR-78w: summarize_my_preferences summary line ─
+
+    /// Default `summarize_my_preferences` prompt now carries a
+    /// `Summary: bullets=N` line above the bullets — symmetric
+    /// with R100's `find_related` summary so the LLM sees the
+    /// same structured prelude on both prompts.
+    #[tokio::test]
+    async fn prompt_summarize_preferences_includes_bullet_count_summary() {
+        let r1 = make_record("claude-code", "p1", "thorough error handling", 1700000000);
+        let r2 = make_record("mem0", "p2", "integration tests over mocks", 1700001000);
+        let s = server_with_records(&[r1, r2]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "summarize_my_preferences", "arguments": {"limit": 10}}),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("Summary: bullets=2"),
+            "summary line missing/wrong: {text}"
+        );
+        // No user_tag arg → no user_tag clause in the summary.
+        assert!(
+            !text.contains("user_tag="),
+            "user_tag absent should omit the tag clause: {text}"
+        );
+    }
+
+    /// When `user_tag` is set the summary reports the filter tag
+    /// and the matched count. Because the store helper already
+    /// filtered by tag at the SQL recall stage, `matched_user_tag
+    /// = bullets`.
+    #[tokio::test]
+    async fn prompt_summarize_preferences_summary_reports_user_tag_matches() {
+        let r1 = make_record(
+            "claude-code",
+            "pref-tagged",
+            "User prefers uniquePrefSummary",
+            1700000000,
+        );
+        let r2 = make_record(
+            "mem0",
+            "pref-untagged",
+            "User likes uniquePrefSummaryUntag",
+            1700001000,
+        );
+        let s = server_with_records(&[r1, r2]);
+        s.store
+            .tag_record(
+                &anamnesis_core::model::RecordId::from_parts("claude-code", None, "pref-tagged"),
+                &["keep-forever".into()],
+                anamnesis_store::UserTagOperation::Add,
+            )
+            .unwrap();
+
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "summarize_my_preferences",
+                    "arguments": {"limit": 10, "user_tag": "Keep-Forever"},
+                }),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("Summary: bullets=1"), "got {text}");
+        assert!(text.contains("user_tag=\"keep-forever\""), "got {text}");
+        assert!(text.contains("matched_user_tag=1"), "got {text}");
+    }
+
+    /// Empty result still emits `Summary: bullets=0` — same
+    /// structured-zero discipline as R100. The original
+    /// `(no user-scope records yet)` placeholder is preserved.
+    #[tokio::test]
+    async fn prompt_summarize_preferences_summary_reports_zero_when_no_records() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "summarize_my_preferences"}),
+            ))
+            .await;
+        let text = resp.result.unwrap()["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("Summary: bullets=0"), "got {text}");
+        assert!(text.contains("(no user-scope records yet)"));
     }
 
     #[tokio::test]
