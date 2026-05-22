@@ -192,3 +192,112 @@ async fn list_forgotten_tools_list_schema_advertises_include_counts() {
     );
     assert_eq!(props["include_counts"]["type"], "boolean");
 }
+
+// ─── Round-105 PR-78aa: list_forgotten csv (MCP parity with CLI) ───
+
+/// `csv: true` returns a flat `csv` string instead of `rows[]`.
+/// Header is fixed and matches CLI; rows redact `reason`,
+/// `native_path`, and `raw_hash`. Symmetric with R92 audit_tail
+/// CSV.
+#[tokio::test]
+async fn list_forgotten_csv_returns_string_with_header_and_redacted_rows() {
+    let (server, _dir, store) = build_bundle(true);
+    seed_and_forget(&store, "claude-code", "cv1", "secretMcpCsvCanary");
+
+    let resp = server
+        .handle(tool_call("list_forgotten", json!({"csv": true})))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["sensitive_included"], false);
+    // `rows` and `counts` are absent on the csv path.
+    assert!(payload.get("rows").is_none());
+    assert!(payload.get("counts").is_none());
+    let csv = payload["csv"].as_str().unwrap();
+    assert!(csv.starts_with(
+        "record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path\n"
+    ));
+    // claude-code instance is "" → CSV column is empty between
+    // adapter and native_id; has_reason flag is true.
+    assert!(csv.contains(",claude-code,,cv1,"), "csv body shape: {csv}");
+    assert!(
+        !csv.contains("secretMcpCsvCanary"),
+        "csv must not leak reason: {csv}"
+    );
+}
+
+/// `csv: true` + `include_sensitive: true` is contradictory —
+/// CSV is the redacted-summary form and sensitive smuggling
+/// would either leak content or pretend the CSV carried more.
+/// The handler returns a clear error.
+#[tokio::test]
+async fn list_forgotten_csv_conflicts_with_include_sensitive() {
+    let (server, _dir, _store) = build_bundle(true);
+    let resp = server
+        .handle(tool_call(
+            "list_forgotten",
+            json!({"csv": true, "include_sensitive": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "must error on the conflict");
+    let msg = resp.error.unwrap().message;
+    assert!(
+        msg.contains("mutually exclusive") || msg.contains("redacted-summary"),
+        "error must explain the conflict; got {msg}"
+    );
+}
+
+/// `csv: true` + `include_counts: true` is also contradictory:
+/// CSV is flat rows, no nested counts block.
+#[tokio::test]
+async fn list_forgotten_csv_conflicts_with_include_counts() {
+    let (server, _dir, _store) = build_bundle(true);
+    let resp = server
+        .handle(tool_call(
+            "list_forgotten",
+            json!({"csv": true, "include_counts": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "must error on the conflict");
+}
+
+/// Empty store + `csv: true` still emits header-only — same
+/// contract as the CLI so scripts can branch uniformly.
+#[tokio::test]
+async fn list_forgotten_csv_empty_emits_header_only() {
+    let (server, _dir, _store) = build_bundle(true);
+    let resp = server
+        .handle(tool_call("list_forgotten", json!({"csv": true})))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 0);
+    let csv = payload["csv"].as_str().unwrap();
+    assert_eq!(
+        csv.trim(),
+        "record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path"
+    );
+}
+
+/// Schema must advertise `csv` so MCP clients can discover the
+/// new capability via tools/list.
+#[tokio::test]
+async fn list_forgotten_tools_list_schema_advertises_csv() {
+    let (server, _dir, _store) = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let lf = tools
+        .iter()
+        .find(|t| t["name"] == "list_forgotten")
+        .expect("list_forgotten must be in admin tools/list");
+    let props = &lf["inputSchema"]["properties"];
+    assert_eq!(props["csv"]["type"], "boolean");
+}

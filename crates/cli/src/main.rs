@@ -323,6 +323,20 @@ enum Command {
         /// real shape of the tombstone table at a glance.
         #[arg(long)]
         include_counts: bool,
+        /// Round 105: emit CSV (header
+        /// `record_id,adapter,instance,native_id,forgotten_at,
+        /// has_reason,has_native_path`) instead of the human
+        /// table. Same redacted summary discipline as the
+        /// default human/JSON output — never carries `reason`,
+        /// `native_path`, or `raw_hash` even if
+        /// `--include-sensitive` is set. Mutually exclusive
+        /// with `--json`, `--include-sensitive`, and
+        /// `--include-counts` (CSV is a flat redacted view by
+        /// design; mix them with `--json` if you need the
+        /// structured form). Mirrors R91's
+        /// `audit tail --csv`.
+        #[arg(long, conflicts_with_all = ["json", "include_sensitive", "include_counts"])]
+        csv: bool,
     },
 
     /// Forget a record permanently.
@@ -1017,6 +1031,7 @@ async fn main() -> Result<()> {
             json,
             include_sensitive,
             include_counts,
+            csv,
         } => cmd_list_forgotten(
             &data_dir,
             source.as_deref(),
@@ -1025,6 +1040,7 @@ async fn main() -> Result<()> {
             json,
             include_sensitive,
             include_counts,
+            csv,
         ),
         Command::Forget {
             record_id,
@@ -3573,6 +3589,7 @@ fn cmd_list_forgotten(
     json: bool,
     include_sensitive: bool,
     include_counts: bool,
+    csv: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::ListForgottenFilter {
@@ -3590,6 +3607,39 @@ fn cmd_list_forgotten(
     } else {
         None
     };
+
+    if csv {
+        // Round 105 (PR-78aa): CSV is the redacted-summary
+        // form, mirroring R91's `audit tail --csv`. Fixed
+        // header so scripts can branch on column count; empty
+        // result still prints the header so downstream
+        // pipelines see consistent shape. `--include-sensitive`
+        // and `--include-counts` are clap-rejected as
+        // mutually-exclusive so the CSV path never has to
+        // think about leaking `reason` / `native_path` /
+        // `raw_hash`.
+        println!("record_id,adapter,instance,native_id,forgotten_at,has_reason,has_native_path");
+        for r in &rows {
+            // forgotten_at is unix-epoch i64 in the JSON
+            // shape; render it as the same ISO-8601 form
+            // audit_tail uses (R91) so CSV consumers see a
+            // human-readable timestamp.
+            let at_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.forgotten_at, 0)
+                .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| r.forgotten_at.to_string());
+            println!(
+                "{rid},{adapter},{instance},{native_id},{at},{has_reason},{has_native_path}",
+                rid = csv_field(&r.record_id.0),
+                adapter = csv_field(&r.adapter),
+                instance = csv_field(&r.instance),
+                native_id = csv_field(&r.native_id),
+                at = csv_field(&at_iso),
+                has_reason = r.reason.is_some(),
+                has_native_path = r.native_path.is_some(),
+            );
+        }
+        return Ok(());
+    }
 
     if json {
         let mut payload = serde_json::json!({
