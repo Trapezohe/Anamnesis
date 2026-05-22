@@ -1020,10 +1020,15 @@ impl AnamnesisServer {
         // top-level `stats` block still reflects the whole
         // store so existing R0 clients reading `stats.records`
         // see the same values they always have.
-        let source_filter = args
-            .get("source")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+        //
+        // Round 103 (PR-78y): `source` now also accepts a
+        // comma-separated OR list (`"mem0,claude-code"`) via
+        // core's shared `parse_csv_filter`, symmetric with R102
+        // audit-tail multi-value. Empty parse = no filter
+        // (back-compat with R96). `instance` stays single-value
+        // AND-combined with the adapter set.
+        let source_raw = args.get("source").and_then(|v| v.as_str());
+        let sources = anamnesis_core::parse_csv_filter(source_raw);
         let instance_filter = args
             .get("instance")
             .and_then(|v| v.as_str())
@@ -1040,10 +1045,7 @@ impl AnamnesisServer {
             .map_err(|e| format!("list: {e}"))?;
         let filtered: Vec<&anamnesis_store::SourceWithCounts> = rows
             .iter()
-            .filter(|r| match source_filter {
-                Some(s) => r.source.adapter == s,
-                None => true,
-            })
+            .filter(|r| sources.is_empty() || sources.iter().any(|s| s == &r.source.adapter))
             .filter(|r| match instance_filter {
                 Some(i) => r.source.instance == i,
                 None => true,
@@ -2830,13 +2832,14 @@ fn tools_list_payload_all() -> Value {
                                 records with ≥1 user_tag), `last_import_at`, and `location`. \
                                 Round 96: optional `source` / `instance` narrow the `sources[]` array; \
                                 the top-level `stats` block keeps reporting the whole store so existing \
-                                consumers reading `stats.records` are unaffected.",
+                                consumers reading `stats.records` are unaffected. Round 103: `source` \
+                                also accepts a comma-separated OR list — see the arg description.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "source": {
                             "type": "string",
-                            "description": "Round 96: restrict the sources array to one adapter id (e.g. `mem0`)."
+                            "description": "Restrict the sources array to one or more adapter ids. Single value (`\"mem0\"`) is exact match (R96); comma-separated list (`\"mem0,claude-code\"`) is OR (R103) — both adapters' rows come back, everything else drops. Tokens are trimmed and empty tokens dropped. Omit (or empty string) for all sources."
                         },
                         "instance": {
                             "type": "string",

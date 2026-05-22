@@ -49,25 +49,13 @@ pub struct AuditTailOptions {
 /// token list (`["forget", "search"]`) ready to drop into
 /// [`AuditTailOptions::actions`].
 ///
-/// Rules:
-///   * `None` or `Some("")` → `vec![]` (no filter).
-///   * Split on `,`, trim each token, drop empties — so
-///     `"forget,, search ,"` becomes `["forget", "search"]`.
-///   * Tokens are case-sensitive exact matches (the audit log
-///     stores `"search"`, `"forget"`, etc. in lower-case).
-///   * Order is preserved but otherwise irrelevant — the filter
-///     is OR.
-///
-/// Living in core keeps CLI and MCP byte-identical: both
-/// surfaces feed their raw `--action` / `action` string in and
-/// build `AuditTailOptions { actions, .. }` from the result.
+/// Round 103 (PR-78y): the splitter logic now lives in
+/// `crate::query::parse_csv_filter` so every CSV-style filter
+/// arg (audit actions, source ids, future surfaces) shares one
+/// rule. This wrapper kept for back-compat naming + so the
+/// audit module's call site stays self-documenting.
 pub fn parse_audit_actions(spec: Option<&str>) -> Vec<String> {
-    spec.unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_owned)
-        .collect()
+    crate::query::parse_csv_filter(spec)
 }
 
 /// Round 84: one row of `Audit::tail` output. Carries the 1-based

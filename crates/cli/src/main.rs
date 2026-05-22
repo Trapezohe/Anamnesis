@@ -622,6 +622,13 @@ enum SourceCmd {
         /// Round 99: restrict to one adapter id (`mem0`,
         /// `claude-code`, ...). Mirrors the MCP
         /// `list_sources { source }` filter from R96.
+        ///
+        /// Round 103: comma-separated list is also accepted
+        /// (`--source mem0,claude-code`) for an OR filter — both
+        /// adapters' rows come back, everything else drops.
+        /// Tokens are trimmed and empty tokens dropped, so
+        /// `--source mem0, , claude-code ,` and `--source
+        /// mem0,claude-code` are equivalent.
         #[arg(long)]
         source: Option<String>,
         /// Round 99: restrict to one instance discriminator.
@@ -1636,14 +1643,18 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             // where their curated `user_tags` actually live.
             // Round-99: optional `--source` / `--instance` filter
             // mirrors R96 MCP `list_sources { source, instance }`.
+            // Round-103: `--source` now also accepts comma-separated
+            // OR (`--source mem0,claude-code`) via core's shared
+            // `parse_csv_filter`, symmetric with R102 audit-tail
+            // multi-value. Empty parse = no filter (back-compat).
+            // `--instance` stays single-value AND-combined with the
+            // adapter set.
             let rows = store.list_sources_with_counts()?;
-            let filter_applied = source.is_some() || instance.is_some();
+            let sources = anamnesis_core::parse_csv_filter(source.as_deref());
+            let filter_applied = !sources.is_empty() || instance.is_some();
             let rows: Vec<_> = rows
                 .into_iter()
-                .filter(|r| match source.as_deref() {
-                    Some(s) => r.source.adapter == s,
-                    None => true,
-                })
+                .filter(|r| sources.is_empty() || sources.iter().any(|s| s == &r.source.adapter))
                 .filter(|r| match instance.as_deref() {
                     Some(i) => r.source.instance == i,
                     None => true,

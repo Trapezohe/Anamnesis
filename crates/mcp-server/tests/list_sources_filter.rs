@@ -162,4 +162,72 @@ async fn list_sources_tools_list_schema_advertises_filter_args() {
     let props = &ls["inputSchema"]["properties"];
     assert_eq!(props["source"]["type"], "string");
     assert_eq!(props["instance"]["type"], "string");
+    // Round 103: schema must advertise the comma-separated OR
+    // semantic so MCP clients discover the new capability.
+    let source_desc = props["source"]["description"].as_str().unwrap();
+    assert!(
+        source_desc.contains("comma-separated"),
+        "list_sources.source description must mention multi-value: {source_desc}"
+    );
+}
+
+// ─── Round-103 PR-78y: list_sources source multi-value OR ───────────
+
+/// Comma-separated `source` becomes an OR filter — both
+/// adapters' rows survive, the third drops. Symmetric with R102
+/// `audit_tail.action` multi-value. Top-level `stats` block
+/// still reflects the whole store (back-compat with R0+R96
+/// clients).
+#[tokio::test]
+async fn list_sources_source_multi_value_or_filters_matching_set() {
+    let (server, _dir, store) = build_bundle();
+    seed(&store, "claude-code", None, "a");
+    seed(&store, "mem0", Some("prod"), "b");
+    seed(&store, "codex", None, "c");
+
+    let resp = server
+        .handle(tool_call(
+            "list_sources",
+            json!({"source": "mem0, claude-code"}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let sources = payload["sources"].as_array().unwrap();
+    let adapters: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["adapter"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        adapters,
+        ["claude-code", "mem0"].into_iter().collect(),
+        "expected only the two matching adapters; got {sources:?}"
+    );
+    // stats unchanged — still reports whole-store totals.
+    assert_eq!(payload["stats"]["records"], 3);
+}
+
+/// Multi-value `source` combined with `instance` is AND of the
+/// adapter OR-set: row matches iff `adapter ∈ source-set` AND
+/// `instance == instance-arg`. `mem0:dev` survives because it's
+/// in both subsets; `mem0:prod` drops because of the instance
+/// mismatch; `claude-code` drops because (default) instance ≠
+/// `"dev"`.
+#[tokio::test]
+async fn list_sources_source_multi_value_with_instance_is_and_filter() {
+    let (server, _dir, store) = build_bundle();
+    seed(&store, "mem0", Some("prod"), "a");
+    seed(&store, "mem0", Some("dev"), "b");
+    seed(&store, "claude-code", None, "c");
+
+    let resp = server
+        .handle(tool_call(
+            "list_sources",
+            json!({"source": "mem0,claude-code", "instance": "dev"}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let sources = payload["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["adapter"], "mem0");
+    assert_eq!(sources[0]["instance"], "dev");
 }
