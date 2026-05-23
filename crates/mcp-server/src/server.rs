@@ -948,7 +948,60 @@ impl AnamnesisServer {
         //
         // `score` is kept as an alias for `rrf_score` so older agents
         // that pinned the previous field name don't break.
+        // Round 119 (PR-78an): top-level redacted summary —
+        // closes the MCP discovery-summary set on the actual
+        // recall surface. The query text is the most sensitive
+        // input on this tool, so the summary explicitly tags
+        // `query: redacted` and the renderer never reads
+        // `query` (only the parsed filters / flags / count).
+        // effective_mode is `SearchMode` enum without
+        // Display; render via Debug + lowercase (matches the
+        // existing `trace.effective_mode` JSON serialization).
+        let effective_mode = format!("{:?}", search_trace.effective_mode).to_lowercase();
+        let filter_source_clause = render_scalar_filter_clause("source", source.as_deref());
+        let filter_instance_clause =
+            render_scalar_filter_clause("instance", filter.instance.as_deref());
+        let filter_kind_clause = render_scalar_filter_clause("kind", filter.kind.as_deref());
+        let filter_scope_clause = render_scalar_filter_clause("scope", filter.scope.as_deref());
+        let user_tag_clause = render_scalar_filter_clause("user_tag", filter.user_tag.as_deref());
+        let since_state = if filter.time_from.is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        let until_state = if filter.time_to.is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        let trace_state = if trace_requested {
+            "included"
+        } else {
+            "omitted"
+        };
+        let explain_state = if explain_requested {
+            "included"
+        } else {
+            "omitted"
+        };
+        let summary = format!(
+            "{} result(s) returned; query: redacted; effective mode: {}; limit {}; {}; {}; {}; {}; {}; since: {}; until: {}; trace: {}; explain: {}.",
+            filtered.len(),
+            effective_mode,
+            limit,
+            filter_source_clause,
+            filter_instance_clause,
+            filter_kind_clause,
+            filter_scope_clause,
+            user_tag_clause,
+            since_state,
+            until_state,
+            trace_state,
+            explain_state,
+        );
+
         let mut payload = json!({
+            "summary": summary,
             "results": filtered.iter().map(|p| {
                 let best = p.matched_chunks.first();
                 let mut row = json!({
@@ -4242,6 +4295,118 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("platypusBanjoComet"));
+    }
+
+    /// Round 119 (PR-78an): `search_memories` JSON response
+    /// carries a top-level redacted `summary`. Must contain
+    /// result count, effective mode, limit, filter status,
+    /// trace/explain state, AND explicitly declare
+    /// `query: redacted` — never echo the query text or any
+    /// snippet/record_id/chunk_id/native_path.
+    #[tokio::test]
+    async fn search_memories_carries_top_level_redacted_summary() {
+        let r = make_record(
+            "claude-code",
+            "x",
+            "the marker phrase platypusBanjoCometCanary",
+            1700000000,
+        );
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "platypusBanjoCometCanary",
+                        "mode": "fulltext",
+                        "limit": 5,
+                    }
+                }),
+            ))
+            .await;
+        let payload = resp.result.unwrap()["structuredContent"].clone();
+        let summary = payload["summary"]
+            .as_str()
+            .expect("search_memories must carry top-level `summary`");
+
+        assert!(
+            summary.contains("1 result(s) returned"),
+            "summary must declare count: {summary}"
+        );
+        assert!(
+            summary.contains("query: redacted"),
+            "summary must declare query redaction explicitly: {summary}"
+        );
+        assert!(
+            summary.contains("effective mode: fulltext"),
+            "summary must report effective mode: {summary}"
+        );
+        assert!(
+            summary.contains("limit 5"),
+            "summary must report limit: {summary}"
+        );
+        assert!(
+            summary.contains("source filter: all sources"),
+            "no-source summary must say `all sources`: {summary}"
+        );
+        assert!(
+            summary.contains("trace: omitted"),
+            "default trace state must surface: {summary}"
+        );
+        assert!(
+            summary.contains("explain: omitted"),
+            "default explain state must surface: {summary}"
+        );
+
+        // Privacy: must NEVER echo the query token, the
+        // snippet, the record_id, or the native_path.
+        assert!(
+            !summary.contains("platypusBanjoCometCanary"),
+            "summary must not echo query/snippet: {summary}"
+        );
+        assert!(
+            !summary.contains("claude-code:default:x"),
+            "summary must not echo record_id: {summary}"
+        );
+    }
+
+    /// `trace: true` + `explain: true` flip the summary's
+    /// flag clauses to `included`, but the privacy contract
+    /// (no query echo) holds.
+    #[tokio::test]
+    async fn search_memories_summary_reflects_trace_explain_flags() {
+        let r = make_record("claude-code", "x", "trace test phrase", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {
+                        "query": "trace",
+                        "mode": "fulltext",
+                        "trace": true,
+                        "explain": true,
+                    }
+                }),
+            ))
+            .await;
+        let payload = resp.result.unwrap()["structuredContent"].clone();
+        let summary = payload["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("trace: included"),
+            "trace:true must flip summary clause: {summary}"
+        );
+        assert!(
+            summary.contains("explain: included"),
+            "explain:true must flip summary clause: {summary}"
+        );
+        // trace block still present (back-compat).
+        assert!(
+            payload["trace"].is_object(),
+            "trace block must remain when opted in"
+        );
     }
 
     /// Round-8: wire-format hardening. Lock the JSON shape an MCP agent
