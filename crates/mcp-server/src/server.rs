@@ -1547,7 +1547,11 @@ impl AnamnesisServer {
         let chunk_id_arg = args.get("chunk_id").and_then(|v| v.as_str());
         let record_id_arg = args.get("id").and_then(|v| v.as_str());
 
-        let (rec, chunk_extras) = match (chunk_id_arg, record_id_arg) {
+        // R121 (PR-78ap): capture the chunk's token estimate
+        // before the typed structure is dissolved into JSON,
+        // so the summary can include it without re-reading
+        // sensitive chunk content.
+        let (rec, chunk_extras, chunk_token_estimate) = match (chunk_id_arg, record_id_arg) {
             (Some(cid), _) => {
                 let lookup = store
                     .get_chunk(cid)
@@ -1563,21 +1567,22 @@ impl AnamnesisServer {
                         )
                     })?;
                 let tokenized = anamnesis_store::cjk::tokenize_indexing(&lookup.content);
+                let token_estimate = lookup.token_estimate;
                 let extras = json!({
                     "chunk_id": lookup.chunk_id,
                     "chunk_seq": lookup.seq,
                     "chunk_content": lookup.content,
                     "chunk_content_tokenized": tokenized,
-                    "chunk_token_estimate": lookup.token_estimate,
+                    "chunk_token_estimate": token_estimate,
                 });
-                (rec, Some(extras))
+                (rec, Some(extras), Some(token_estimate))
             }
             (None, Some(id)) => {
                 let rec = store
                     .get_record(&RecordId(id.to_string()))
                     .map_err(|e| format!("store: {e}"))?
                     .ok_or_else(|| format!("record not found: {id}"))?;
-                (rec, None)
+                (rec, None, None)
             }
             (None, None) => {
                 return Err(
@@ -1586,8 +1591,43 @@ impl AnamnesisServer {
             }
         };
 
+        // Round 121 (PR-78ap): top-level redacted summary —
+        // closes the MCP read-tool summary set. Summary text
+        // NEVER reads `record_id`, `chunk_id`, `native_id`,
+        // `native_path`, `raw_hash`, `chunk_content`, or
+        // `chunk_content_tokenized` — only their presence
+        // booleans and the chunk token-estimate (numeric).
+        let instance_label = match &rec.source.instance {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => "default".to_string(),
+        };
+        let target_label = if chunk_extras.is_some() {
+            "chunk"
+        } else {
+            "record"
+        };
+        let native_path_state = if rec.provenance.native_path.is_some() {
+            "present"
+        } else {
+            "absent"
+        };
+        let raw_hash_state = if rec.provenance.raw_hash.is_empty() {
+            "absent"
+        } else {
+            "present"
+        };
+        let chunk_clause = match chunk_token_estimate {
+            Some(n) => format!("chunk: included; token_estimate: {n}"),
+            None => "chunk: omitted".to_string(),
+        };
+        let summary = format!(
+            "provenance returned; target: {target_label}; source: {}:{instance_label}; native_path: {native_path_state}; raw_hash: {raw_hash_state}; {chunk_clause}.",
+            rec.source.adapter,
+        );
+
         // Base provenance — same shape as before for back-compat.
         let mut out = json!({
+            "summary": summary,
             "record_id": rec.id.0,
             "adapter": rec.source.adapter,
             "instance": rec.source.instance,
@@ -4815,6 +4855,46 @@ mod tests {
         // Back-compat: record_id call must NOT include chunk-level extras.
         assert!(structured.get("chunk_id").is_none());
         assert!(structured.get("chunk_content").is_none());
+
+        // Round 121 (PR-78ap): top-level redacted summary
+        // (record-id path).
+        let summary = structured["summary"].as_str().expect("summary present");
+        assert!(
+            summary.contains("provenance returned"),
+            "summary must declare returned: {summary}"
+        );
+        assert!(
+            summary.contains("target: record"),
+            "record-id path must surface target=record: {summary}"
+        );
+        assert!(
+            summary.contains("source: claude-code:default"),
+            "summary must surface adapter:instance: {summary}"
+        );
+        assert!(
+            summary.contains("native_path: present"),
+            "native_path presence must surface: {summary}"
+        );
+        assert!(
+            summary.contains("raw_hash: present"),
+            "raw_hash presence must surface: {summary}"
+        );
+        assert!(
+            summary.contains("chunk: omitted"),
+            "record-id path must say chunk: omitted: {summary}"
+        );
+        // Privacy canaries: summary must NEVER leak the path,
+        // hash, record_id, or native_id literal.
+        assert!(!summary.contains("/p/abc"), "must not leak native_path");
+        assert!(!summary.contains("\"h\""), "must not leak raw_hash");
+        // record_id is the hash form; native_id `abc` is a
+        // load-bearing canary because it's also part of the
+        // record_id string. Pin that the literal token does
+        // not appear in the summary.
+        assert!(
+            !summary.contains("abc"),
+            "must not leak native_id/record_id"
+        );
     }
 
     /// Round-10: trace_provenance now accepts `chunk_id` to chain
@@ -4877,6 +4957,27 @@ mod tests {
             "tokenized form should be space-joined jieba tokens, got {tokenized:?}"
         );
         assert!(structured["chunk_token_estimate"].as_u64().is_some());
+
+        // Round 121 (PR-78ap): top-level redacted summary
+        // (chunk-id path). chunk: included + numeric token
+        // estimate, source/native_path/raw_hash state.
+        // Privacy: must NOT leak chunk_id, chunk_content,
+        // tokenized form, or path.
+        let summary = structured["summary"].as_str().expect("summary present");
+        assert!(
+            summary.contains("target: chunk"),
+            "chunk-id path must surface target=chunk: {summary}"
+        );
+        assert!(
+            summary.contains("chunk: included"),
+            "chunk-id path must say chunk: included: {summary}"
+        );
+        assert!(
+            summary.contains("token_estimate:"),
+            "chunk-id path must surface token_estimate: {summary}"
+        );
+        assert!(!summary.contains("项目偏好"), "must not leak chunk_content");
+        assert!(!summary.contains("/p/abc"), "must not leak native_path");
     }
 
     #[tokio::test]
