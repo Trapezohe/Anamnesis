@@ -2267,11 +2267,41 @@ impl AnamnesisServer {
         // R109 list_forgotten — MCP clients can branch on
         // `payload.format` without probing for `entries[]`
         // vs `csv`.
+        // Round 116 (PR-78ak): top-level `summary` for JSON
+        // path only — mirrors R111/R112/R113 discovery-summary
+        // pattern but for an audit surface. Lets an agent
+        // gauge result size + filter scope in one read without
+        // walking `entries[]`. CSV path stays pure CSV (its
+        // shape is already self-describing).
+        let action_clause = if actions.is_empty() {
+            "all actions".to_string()
+        } else {
+            format!("action filter: {}", actions.join(" OR "))
+        };
+        let since_clause = match since_spec {
+            Some(spec) => format!("since: {spec}"),
+            None => "since: all time".to_string(),
+        };
+        let detail_clause = if include_detail {
+            "detail: included"
+        } else {
+            "detail: redacted"
+        };
+        let summary = format!(
+            "{} audit entries returned; limit {}; {}; {}; {}.",
+            rows.len(),
+            effective_limit,
+            action_clause,
+            since_clause,
+            detail_clause,
+        );
+
         Ok(json!({
             "count":           rows.len(),
             "format":          "json",
             "limit":           effective_limit,
             "include_detail":  include_detail,
+            "summary":         summary,
             "filter": {
                 "action":  action,
                 "actions": actions,
