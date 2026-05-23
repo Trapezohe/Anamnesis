@@ -3477,7 +3477,30 @@ impl AnamnesisServer {
             }
         }
 
+        // Round 112 (PR-78ah): additive top-level `summary`
+        // for first-time agent discovery, symmetric with
+        // R111's `prompts/list` summary. Counts `ids.len()`
+        // (NOT `resources.len()`) because the first-page
+        // `resources[]` also includes the 3 templates; the
+        // summary should report record-resource count
+        // separately so pagination semantics stay clean.
+        // `nextCursor` presence reported as `present`/`absent`
+        // so a script can branch without re-probing the payload.
+        let template_count = templates.as_array().map(|a| a.len()).unwrap_or(0);
+        let next_cursor_state = if next_cursor.is_some() {
+            "present"
+        } else {
+            "absent"
+        };
+        let summary = format!(
+            "{} record resource(s) on this page; {} resource template(s) (record/source/timeline); nextCursor {}.",
+            ids.len(),
+            template_count,
+            next_cursor_state,
+        );
+
         let mut payload = json!({
+            "summary": summary,
             "resources": resources,
             "resourceTemplates": templates,
         });
@@ -4460,6 +4483,81 @@ mod tests {
         assert!(uris.iter().any(|u| u.contains("record")));
         assert!(uris.iter().any(|u| u.contains("source")));
         assert!(uris.iter().any(|u| u.contains("timeline")));
+    }
+
+    /// Round 112 (PR-78ah): `resources/list` carries a top-
+    /// level `summary` line so an agent doing first-time
+    /// discovery can branch without parsing the full
+    /// `resources[]` + `resourceTemplates`. Symmetric with
+    /// R111's `prompts/list` summary.
+    #[tokio::test]
+    async fn resources_list_carries_top_level_summary_line() {
+        // Empty record store → 0 record resources, but the 3
+        // templates still surface on page 1.
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("resources/list", Value::Null)).await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"]
+            .as_str()
+            .expect("resources/list must carry a top-level `summary` for agent discovery");
+        // Empty store → 0 record resources.
+        assert!(
+            summary.contains("0 record resource"),
+            "summary should declare record-resource page count: {summary}"
+        );
+        // 3 templates always — record / source / timeline.
+        assert!(
+            summary.contains("3 resource template"),
+            "summary should declare the 3-template count: {summary}"
+        );
+        assert!(
+            summary.contains("record/source/timeline"),
+            "summary should name template families: {summary}"
+        );
+        // Empty store + no `limit` → page does not hit cap →
+        // nextCursor absent.
+        assert!(
+            summary.contains("absent"),
+            "empty page must report nextCursor absent: {summary}"
+        );
+        // Back-compat: `resources[]` and `resourceTemplates`
+        // continue to exist with their R0-R111 shape.
+        let resources = payload["resources"].as_array().unwrap();
+        // First page still includes templates inline.
+        assert_eq!(resources.len(), 3);
+        let templates = payload["resourceTemplates"].as_array().unwrap();
+        assert_eq!(templates.len(), 3);
+    }
+
+    /// When the page hits its limit, `nextCursor` is set;
+    /// summary must reflect that with `nextCursor present`.
+    #[tokio::test]
+    async fn resources_list_summary_reports_next_cursor_present_when_paginating() {
+        // Seed 3 records and ask for limit=1 so page 1 hits
+        // the cap and exposes a nextCursor.
+        let records: Vec<_> = (0..3)
+            .map(|i| {
+                make_record(
+                    "claude-code",
+                    &format!("p{i}"),
+                    "body",
+                    1700000000 + i as i64,
+                )
+            })
+            .collect();
+        let s = server_with_records(&records);
+        let resp = s.handle(req("resources/list", json!({"limit": 1}))).await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("nextCursor present"),
+            "paginated page must report nextCursor present: {summary}"
+        );
+        assert!(
+            summary.contains("1 record resource"),
+            "summary should declare 1-record page: {summary}"
+        );
+        assert!(payload["nextCursor"].is_string());
     }
 
     #[tokio::test]
