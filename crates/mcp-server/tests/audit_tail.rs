@@ -114,6 +114,11 @@ async fn audit_tail_default_response_omits_detail() {
     assert!(resp.error.is_none(), "{:?}", resp.error);
     let payload = extract_payload(&resp);
     assert_eq!(payload["count"], 2);
+    // Round 109 (PR-78ae): `format: "json"` marker pairs
+    // with R92's `format: "csv"` on the CSV branch — MCP
+    // clients can branch on `payload.format` without
+    // probing for `entries[]` vs `csv`.
+    assert_eq!(payload["format"], "json");
     assert_eq!(payload["include_detail"], false);
     let entries = payload["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);

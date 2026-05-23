@@ -1902,8 +1902,17 @@ impl AnamnesisServer {
                 row
             })
             .collect();
+        // Round 109 (PR-78ae): `"format": "json"` marker
+        // pairs with R105's `"format": "csv"` on the CSV
+        // branch (`return Ok(json!({...}))` above). MCP
+        // clients can switch on `payload.format` instead of
+        // probing for `rows[]` vs `csv`. Completes the trio
+        // started in R108: dedupe, list_forgotten, audit_tail
+        // all now carry symmetric format markers on both
+        // branches.
         let mut payload = json!({
             "count":              rows.len(),
+            "format":             "json",
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
             "rows":               rows_payload,
@@ -2256,8 +2265,15 @@ impl AnamnesisServer {
             })
             .collect();
 
+        // Round 109 (PR-78ae): `"format": "json"` marker
+        // pairs with R92's `"format": "csv"` on the CSV
+        // branch above. Same symmetry as R108 (dedupe) and
+        // R109 list_forgotten — MCP clients can branch on
+        // `payload.format` without probing for `entries[]`
+        // vs `csv`.
         Ok(json!({
             "count":           rows.len(),
+            "format":          "json",
             "limit":           effective_limit,
             "include_detail":  include_detail,
             "filter": {

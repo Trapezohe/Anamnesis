@@ -93,6 +93,11 @@ async fn list_forgotten_default_has_no_counts_block() {
     let resp = server.handle(tool_call("list_forgotten", json!({}))).await;
     assert!(resp.error.is_none(), "{:?}", resp.error);
     let payload = extract_payload(&resp);
+    // Round 109 (PR-78ae): `format: "json"` marker pairs
+    // with R105's `format: "csv"` on the CSV branch so MCP
+    // clients can switch on `payload.format` without probing
+    // for `rows[]` vs `csv`.
+    assert_eq!(payload["format"], "json");
     assert!(
         payload.get("counts").is_none(),
         "default list_forgotten must not carry counts; got {payload}"
