@@ -1730,6 +1730,52 @@ fn doctor_filter_source_narrows_output() {
     assert_eq!(arr[0]["adapter"], "mem0");
 }
 
+// ─── Round-110 PR-78af: doctor --source multi-value OR ────────────
+
+/// `doctor --source a,b` is the OR filter: both adapter rows
+/// survive, the third drops. Whitespace + empty tokens
+/// normalised via core's `parse_csv_filter`. Symmetric with
+/// R102 audit-tail / R103 list-sources / R104 dedupe.
+#[test]
+fn doctor_source_multi_value_or_narrows_to_listed_adapters() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/a"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/b.sqlite"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "codex", "--path", "/tmp/c"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--source", "mem0, , claude-code", "--json"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = payload.as_array().unwrap();
+    let adapters: std::collections::HashSet<&str> =
+        arr.iter().map(|r| r["adapter"].as_str().unwrap()).collect();
+    assert_eq!(
+        adapters,
+        ["mem0", "claude-code"].into_iter().collect(),
+        "expected only the two listed adapters; got {arr:?}"
+    );
+}
+
 #[test]
 fn doctor_strict_exits_nonzero_when_a_source_is_unhealthy() {
     // Round 50: --strict turns the "all healthy?" check into a CI gate.
