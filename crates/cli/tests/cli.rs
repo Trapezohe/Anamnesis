@@ -2893,6 +2893,38 @@ fn search_default_json_has_no_explain_field() {
         row.get("explain").is_none(),
         "default search must NOT carry an `explain` field; got {row}"
     );
+
+    // Round 129 (PR-78ax): top-level redacted summary on
+    // `search --json`. Mirrors MCP R119 search_memories.
+    // Privacy: must NEVER echo query text or snippet.
+    let summary = v["summary"]
+        .as_str()
+        .expect("search --json must carry top-level `summary`");
+    assert!(
+        summary.contains("1 result(s) returned"),
+        "summary must declare count: {summary}"
+    );
+    assert!(
+        summary.contains("query: redacted"),
+        "summary must explicitly say `query: redacted`: {summary}"
+    );
+    assert!(
+        summary.contains("effective mode: fulltext"),
+        "summary must surface effective mode: {summary}"
+    );
+    assert!(
+        summary.contains("trace: omitted"),
+        "default trace state must surface: {summary}"
+    );
+    assert!(
+        summary.contains("explain: omitted"),
+        "default explain state must surface: {summary}"
+    );
+    // Privacy canary — must not echo query or snippet body.
+    assert!(
+        !summary.contains("uniqueExplainMarker"),
+        "summary must not leak query/snippet: {summary}"
+    );
 }
 
 /// `--explain` attaches a numeric breakdown to every result.

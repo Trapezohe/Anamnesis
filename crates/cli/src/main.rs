@@ -2811,7 +2811,50 @@ async fn cmd_search(
     ));
 
     if json {
+        // Round 129 (PR-78ax): top-level redacted summary
+        // mirrors MCP R119 search_memories summary. Closes
+        // the CLI summary mirror campaign (7/7).
+        // NEVER reads `query` arg body or snippet/record_id/
+        // chunk_id/native_path. `query: redacted` is explicit.
+        let effective_mode = format!("{:?}", search_trace.effective_mode).to_lowercase();
+        let source_clause = match source {
+            Some(s) if !s.is_empty() => format!("source filter: {s}"),
+            _ => "source filter: all sources".to_string(),
+        };
+        let instance_clause = match instance {
+            Some(s) if !s.is_empty() => format!("instance filter: {s}"),
+            _ => "instance filter: all instances".to_string(),
+        };
+        let kind_clause = match store_filter.kind.as_deref() {
+            Some(s) if !s.is_empty() => format!("kind filter: {s}"),
+            _ => "kind filter: all kinds".to_string(),
+        };
+        let scope_clause = match store_filter.scope.as_deref() {
+            Some(s) if !s.is_empty() => format!("scope filter: {s}"),
+            _ => "scope filter: all scopes".to_string(),
+        };
+        let user_tag_clause = match store_filter.user_tag.as_deref() {
+            Some(s) if !s.is_empty() => format!("user_tag filter: {s}"),
+            _ => "user_tag filter: absent".to_string(),
+        };
+        let summary_text = format!(
+            "{} result(s) returned; query: redacted; effective mode: {}; limit {}; {}; {}; {}; {}; {}; since: {}; until: {}; trace: {}; explain: {}.",
+            filtered.len(),
+            effective_mode,
+            limit,
+            source_clause,
+            instance_clause,
+            kind_clause,
+            scope_clause,
+            user_tag_clause,
+            if store_filter.time_from.is_some() { "set" } else { "unset" },
+            if store_filter.time_to.is_some() { "set" } else { "unset" },
+            if trace { "included" } else { "omitted" },
+            if explain { "included" } else { "omitted" },
+        );
+
         let mut payload = serde_json::json!({
+            "summary": summary_text,
             "query": query,
             "mode": mode_str,
             // Round-8: same expanded wire format as the MCP server so
