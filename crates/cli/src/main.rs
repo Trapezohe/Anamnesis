@@ -1901,7 +1901,31 @@ fn cmd_source_show(store: &Store, target: &str, errors: usize, json: bool) -> Re
     let recent = store.recent_import_errors_for_source(adapter, instance, errors)?;
 
     if json {
+        // Round 128 (PR-78aw): top-level redacted summary
+        // mirrors MCP R118 source_show summary. NEVER reads
+        // `source.location`, `recent_import_errors[].error`,
+        // `native_path`, `native_id`, or `raw_hash`.
+        let target_label = match instance {
+            Some(i) => format!("{adapter}:{i}"),
+            None => adapter.to_string(),
+        };
+        let last_import_label = match swc.source.last_import_at {
+            Some(ts) => ts.to_string(),
+            None => "never".to_string(),
+        };
+        let summary = format!(
+            "{target_label} source_show: {} record(s), {} chunk(s), {} tagged record(s); recent import errors: {} returned (limit {}); last import: {}.",
+            swc.record_count,
+            swc.chunk_count,
+            swc.tagged_record_count,
+            recent.len(),
+            errors,
+            last_import_label,
+        );
+
         let payload = serde_json::json!({
+            "summary": summary,
+            "error_limit": errors,
             "source": {
                 "adapter": swc.source.adapter,
                 "instance": if swc.source.instance.is_empty() {

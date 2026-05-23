@@ -3026,6 +3026,38 @@ fn source_show_json_returns_counts_and_empty_errors() {
     assert_eq!(v["source"]["record_count"], 0);
     assert_eq!(v["source"]["tagged_record_count"], 0);
     assert_eq!(v["recent_import_errors"].as_array().unwrap().len(), 0);
+
+    // Round 128 (PR-78aw): top-level redacted summary on
+    // empty-error case. Default --errors is 5.
+    assert_eq!(v["error_limit"], 5);
+    let summary = v["summary"]
+        .as_str()
+        .expect("source show --json must carry top-level `summary`");
+    assert!(
+        summary.contains("claude-code source_show"),
+        "summary must declare target: {summary}"
+    );
+    assert!(
+        summary.contains("0 record(s)"),
+        "summary must surface record_count: {summary}"
+    );
+    assert!(
+        summary.contains("recent import errors: 0 returned"),
+        "summary must surface error count: {summary}"
+    );
+    assert!(
+        summary.contains("limit 5"),
+        "summary must surface effective error_limit: {summary}"
+    );
+    assert!(
+        summary.contains("last import: never"),
+        "summary must declare last-import state: {summary}"
+    );
+    // Privacy: must NOT leak source location.
+    assert!(
+        !summary.contains("/tmp/cc"),
+        "summary must not leak source location: {summary}"
+    );
 }
 
 /// After seeding records + tagging one + logging an import
