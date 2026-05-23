@@ -259,6 +259,16 @@ enum Command {
         /// current page. Default off — back-compat.
         #[arg(long)]
         include_counts: bool,
+        /// Round 107: emit redacted CSV. Third tabular-redaction
+        /// surface, mirrors R91 `audit tail --csv` + R106
+        /// `list-forgotten --csv`. Mutually exclusive with
+        /// --json (clap) and --include-sensitive /
+        /// --include-counts (runtime). Same privacy contract:
+        /// `raw_hash` and `native_path` never appear; the
+        /// row's `group_index` carries duplicate-group
+        /// membership without leaking the hash.
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
     },
 
     /// Remove a tombstone so the source can resurrect the memory
@@ -1033,6 +1043,7 @@ async fn run() -> Result<()> {
             json,
             include_sensitive,
             include_counts,
+            csv,
         } => cmd_dedupe(
             &data_dir,
             source.as_deref(),
@@ -1041,6 +1052,7 @@ async fn run() -> Result<()> {
             json,
             include_sensitive,
             include_counts,
+            csv,
         ),
         Command::Unforget {
             record_id,
@@ -3429,7 +3441,25 @@ fn cmd_dedupe(
     json: bool,
     include_sensitive: bool,
     include_counts: bool,
+    csv: bool,
 ) -> Result<()> {
+    // Round 107 (PR-78ac): runtime guards for the CSV
+    // conflicts clap can't carry without flirting with the
+    // Windows stack-overflow we fixed in R106. `--csv --json`
+    // is clap-rejected; the other two combinations are checked
+    // here. CSV is the redacted-summary form — sensitive
+    // smuggling or nested counts have no place in flat rows.
+    if csv && include_sensitive {
+        return Err(anyhow!(
+            "--csv and --include-sensitive are mutually exclusive — CSV is the redacted-summary form (never carries `raw_hash` / `native_path`)."
+        ));
+    }
+    if csv && include_counts {
+        return Err(anyhow!(
+            "--csv and --include-counts are mutually exclusive — CSV is flat redacted rows. Drop --csv to get the counts block back."
+        ));
+    }
+
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::DuplicateRawHashFilter {
         source: source.map(str::to_owned),
@@ -3445,6 +3475,48 @@ fn cmd_dedupe(
     } else {
         None
     };
+
+    if csv {
+        // Round 107 (PR-78ac): CSV is the redacted-summary
+        // form, mirroring R91 `audit tail --csv` + R106
+        // `list-forgotten --csv`. Header is fixed so scripts
+        // can branch on column count; empty result still
+        // prints the header. `group_index` carries duplicate-
+        // group membership without leaking `raw_hash`: rows
+        // sharing the same index belong to the same group.
+        // `record_count` is per-group size, repeated on each
+        // row for spreadsheet-friendly downstream filtering.
+        println!(
+            "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count"
+        );
+        for (gi, g) in groups.iter().enumerate() {
+            let record_count = g.records.len();
+            for r in &g.records {
+                let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.created_at, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| r.created_at.to_string());
+                let updated_iso = match r.updated_at {
+                    Some(t) => chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                        .unwrap_or_else(|| t.to_string()),
+                    None => String::new(),
+                };
+                println!(
+                    "{group_index},{rid},{adapter},{instance},{native_id},{created},{updated},{has_native_path},{record_count}",
+                    group_index = gi,
+                    rid = csv_field(&r.record_id.0),
+                    adapter = csv_field(&r.adapter),
+                    instance = csv_field(&r.instance),
+                    native_id = csv_field(&r.native_id),
+                    created = csv_field(&created_iso),
+                    updated = csv_field(&updated_iso),
+                    has_native_path = r.native_path.is_some(),
+                    record_count = record_count,
+                );
+            }
+        }
+        return Ok(());
+    }
 
     if json {
         let mut payload = serde_json::json!({

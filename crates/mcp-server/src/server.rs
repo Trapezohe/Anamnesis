@@ -130,6 +130,51 @@ fn render_list_forgotten_csv(rows: &[anamnesis_store::ForgottenRecord]) -> Strin
     out
 }
 
+/// Round 107 (PR-78ac): render dedupe groups as the MCP CSV
+/// string. Same columns and redaction discipline as the CLI
+/// R107 helper —
+/// `group_index,record_id,adapter,instance,native_id,
+/// created_at,updated_at,has_native_path,record_count` only,
+/// never `raw_hash` / `native_path`. `group_index` carries
+/// duplicate-group membership without leaking the hash; rows
+/// sharing the same index belong to the same group.
+/// `record_count` is per-group size, repeated on each row for
+/// spreadsheet-friendly downstream filtering. Empty input still
+/// emits the header so scripts can branch uniformly. Timestamps
+/// render ISO-8601 to match audit_tail + list_forgotten CSV.
+fn render_dedupe_csv(groups: &[anamnesis_store::DuplicateRawHashGroup]) -> String {
+    let mut out = String::from(
+        "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count\n",
+    );
+    for (gi, g) in groups.iter().enumerate() {
+        let record_count = g.records.len();
+        for r in &g.records {
+            let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.created_at, 0)
+                .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| r.created_at.to_string());
+            let updated_iso = match r.updated_at {
+                Some(t) => chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| t.to_string()),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "{group_index},{rid},{adapter},{instance},{native_id},{created},{updated},{has_native_path},{record_count}\n",
+                group_index = gi,
+                rid = csv_escape(&r.record_id.0),
+                adapter = csv_escape(&r.adapter),
+                instance = csv_escape(&r.instance),
+                native_id = csv_escape(&r.native_id),
+                created = csv_escape(&created_iso),
+                updated = csv_escape(&updated_iso),
+                has_native_path = r.native_path.is_some(),
+                record_count = record_count,
+            ));
+        }
+    }
+    out
+}
+
 /// Round 92 (PR-78n): render `Audit::tail` results as the
 /// MCP CSV string. Same columns and redaction discipline as the
 /// CLI helper in R91 — `line_no,timestamp,action,via,outcome`
@@ -1908,6 +1953,27 @@ impl AnamnesisServer {
             .get("include_counts")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 107 (PR-78ac): opt-in CSV form, mirroring R92
+        // audit_tail.csv + R105 list_forgotten.csv. CSV is the
+        // redacted-summary form by design; we refuse
+        // `csv + include_sensitive` (would leak raw_hash /
+        // native_path) and `csv + include_counts` (CSV is flat,
+        // no nested counts block).
+        let csv_requested = args.get("csv").and_then(|v| v.as_bool()).unwrap_or(false);
+        if csv_requested && include_sensitive {
+            return Err(
+                "dedupe: `csv: true` and `include_sensitive: true` are mutually exclusive — \
+                 CSV is the redacted-summary form (never carries `raw_hash` / `native_path`)."
+                    .to_string(),
+            );
+        }
+        if csv_requested && include_counts {
+            return Err(
+                "dedupe: `csv: true` and `include_counts: true` are mutually exclusive — \
+                 CSV is flat redacted rows. Drop `csv` to get the `counts` block back."
+                    .to_string(),
+            );
+        }
 
         let filter = anamnesis_store::DuplicateRawHashFilter {
             source: source.clone(),
@@ -1928,6 +1994,27 @@ impl AnamnesisServer {
             None
         };
         let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
+
+        if csv_requested {
+            // CSV path returns a flat string, not `groups[]`.
+            // Same redacted-summary discipline as the CLI R107
+            // helper: `group_index` (not `raw_hash`) carries
+            // membership; `has_native_path` boolean (not the
+            // path itself).
+            let csv = render_dedupe_csv(&groups);
+            return Ok(json!({
+                "count":              groups.len(),
+                "limit":              effective_limit,
+                "format":             "csv",
+                "sensitive_included": false,
+                "filter":             {
+                    "source":   source,
+                    "instance": instance,
+                },
+                "csv":                csv,
+            }));
+        }
+
         let payload_groups: Vec<Value> = groups
             .iter()
             .map(|g| {
@@ -3193,6 +3280,11 @@ fn tools_list_payload_all() -> Value {
                             "type": "boolean",
                             "default": false,
                             "description": "Round 98: attach a `counts` block with `total_groups` (duplicate groups matching the filter), `total_records` (sum of live records across whole groups), and `by_source[]` (per-`(adapter, instance)` duplicate-record breakdown). Counts ignore `limit` and reflect the full filter-scoped set. `by_source` counts records (not group memberships) so mixed-source groups don't double-count: sum(by_source.duplicate_record_count) == total_records."
+                        },
+                        "csv": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 107: return a CSV string in `csv` (header `group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count`) instead of structured `groups[]`. Same redacted-summary discipline as R91 `audit tail --csv` and R106 `list-forgotten --csv` — never carries `raw_hash` / `native_path`. `group_index` carries duplicate-group membership without leaking the hash. Mutually exclusive with `include_sensitive: true` and `include_counts: true`."
                         }
                     }
                 }
