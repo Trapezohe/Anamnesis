@@ -486,3 +486,138 @@ async fn dedupe_tools_list_schema_advertises_multi_value_source() {
         "dedupe.source description must mention multi-value: {source_desc}"
     );
 }
+
+// ─── Round-107 PR-78ac: dedupe csv (MCP parity with CLI) ───────────
+
+/// `csv: true` returns a flat `csv` string instead of `groups[]`
+/// + `format: "csv"` marker. Empty result still emits header-
+/// only so scripts can branch uniformly.
+#[tokio::test]
+async fn dedupe_csv_empty_returns_header_only() {
+    let (server, _data) = build_bundle(false);
+    // build_bundle already plants 3 records with two sharing
+    // `secretMarkerH` — that's a 2-record group, so the empty
+    // case needs its own minimal bundle.
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = data_dir.path().join("anamnesis.sqlite");
+    let _store = Store::open(&db).expect("open store");
+    let empty_server = AnamnesisServer::new(
+        Store::open(&db).expect("re-open store"),
+        None,
+        data_dir.path().to_path_buf(),
+    );
+
+    let resp = empty_server
+        .handle(tool_call("dedupe", json!({"csv": true})))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 0);
+    assert_eq!(payload["format"], "csv");
+    assert!(payload.get("groups").is_none());
+    assert!(payload.get("counts").is_none());
+    let csv = payload["csv"].as_str().unwrap();
+    assert_eq!(
+        csv.trim(),
+        "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count"
+    );
+    // Drop unused server.
+    let _ = server;
+}
+
+/// `csv: true` emits redacted summary rows. `raw_hash` never
+/// appears (group membership via `group_index`); `native_path`
+/// never appears (`has_native_path` boolean instead).
+#[tokio::test]
+async fn dedupe_csv_returns_redacted_rows_with_group_index_membership() {
+    let (server, _data) = build_bundle(false);
+
+    let resp = server
+        .handle(tool_call("dedupe", json!({"csv": true})))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    let csv = payload["csv"].as_str().unwrap();
+
+    // raw_hash from the fixture (build_bundle plants
+    // `secretMarkerH`) must NEVER appear in CSV.
+    assert!(
+        !csv.contains("secretMarkerH"),
+        "csv must not leak raw_hash: {csv}"
+    );
+    // native_path must not appear either (build_bundle plants
+    // `/tmp/claude-code/alpha.md` etc.).
+    assert!(
+        !csv.contains("/tmp/claude-code/"),
+        "csv must not leak native_path: {csv}"
+    );
+    assert!(
+        !csv.contains("/tmp/mem0/"),
+        "csv must not leak native_path: {csv}"
+    );
+
+    // 2-record group with claude-code+mem0 records both
+    // starting at group_index 0.
+    let lines: Vec<&str> = csv.lines().collect();
+    assert!(lines.len() >= 3, "header + 2 rows minimum: {csv}");
+    assert!(lines[1].starts_with("0,"), "first row group_index=0");
+    assert!(
+        lines[2].starts_with("0,"),
+        "sibling row shares group_index=0"
+    );
+}
+
+/// `csv: true` + `include_sensitive: true` is contradictory.
+/// Handler errors with a clear message.
+#[tokio::test]
+async fn dedupe_csv_conflicts_with_include_sensitive() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"csv": true, "include_sensitive": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "must error on the conflict");
+    let msg = resp.error.unwrap().message;
+    assert!(
+        msg.contains("mutually exclusive") || msg.contains("redacted-summary"),
+        "error must explain the conflict; got {msg}"
+    );
+}
+
+/// `csv: true` + `include_counts: true` is also contradictory.
+/// CSV is flat rows; counts have no place there.
+#[tokio::test]
+async fn dedupe_csv_conflicts_with_include_counts() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"csv": true, "include_counts": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some(), "must error on the conflict");
+}
+
+/// Schema advertises the `csv` arg so MCP clients can discover
+/// the new capability via tools/list.
+#[tokio::test]
+async fn dedupe_tools_list_schema_advertises_csv() {
+    let (server, _data) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let dedupe = tools
+        .iter()
+        .find(|t| t["name"] == "dedupe")
+        .expect("dedupe in tools/list");
+    let props = &dedupe["inputSchema"]["properties"];
+    assert_eq!(props["csv"]["type"], "boolean");
+}

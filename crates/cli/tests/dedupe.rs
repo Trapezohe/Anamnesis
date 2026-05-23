@@ -508,3 +508,125 @@ fn dedupe_counts_block_carries_no_sensitive_fields() {
         );
     }
 }
+
+// ─── Round-107 PR-78ac: dedupe --csv ────────────────────────────────
+
+/// Empty store + `--csv` still emits the fixed header so
+/// downstream scripts can branch uniformly. Same contract as
+/// R91 `audit tail --csv` and R106 `list-forgotten --csv`.
+#[test]
+fn dedupe_csv_empty_emits_header_only() {
+    let data = tmp_dir();
+    init_db(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "csv on empty store must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.trim(),
+        "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count"
+    );
+}
+
+/// `--csv` emits redacted summary rows. `raw_hash` (the
+/// duplicate-grouping key) NEVER appears. `native_path` NEVER
+/// appears. Rows in the same group share the same
+/// `group_index` — operator can pivot by it without ever
+/// seeing the underlying hash.
+#[test]
+fn dedupe_csv_returns_redacted_rows_with_group_index_membership() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Header + 4 rows (2 groups × 2 records each).
+    assert_eq!(lines.len(), 5, "expected header + 4 rows: {stdout}");
+    assert!(lines[0].starts_with("group_index,record_id,"));
+
+    // raw_hash MUST NOT appear (load-bearing privacy contract).
+    assert!(
+        !stdout.contains("h-mixed"),
+        "csv must not leak raw_hash `h-mixed`: {stdout}"
+    );
+    assert!(
+        !stdout.contains("h-other"),
+        "csv must not leak raw_hash `h-other`: {stdout}"
+    );
+    // native_path MUST NOT appear.
+    assert!(
+        !stdout.contains("/tmp/mem0/"),
+        "csv must not leak native_path: {stdout}"
+    );
+    assert!(
+        !stdout.contains("/tmp/claude-code/"),
+        "csv must not leak native_path: {stdout}"
+    );
+
+    // group_index pivot: row[1] is the first row of the first
+    // group, row[2] is the second record of the same group, so
+    // they must share group_index `0`. row[3] starts the next
+    // group with group_index `1`.
+    let first_group_index = lines[1].split(',').next().unwrap();
+    let second_row_group_index = lines[2].split(',').next().unwrap();
+    let third_row_group_index = lines[3].split(',').next().unwrap();
+    assert_eq!(first_group_index, "0");
+    assert_eq!(
+        second_row_group_index, "0",
+        "second row of first group must share group_index"
+    );
+    assert_eq!(
+        third_row_group_index, "1",
+        "first row of second group must increment group_index"
+    );
+}
+
+/// `--csv` is mutually exclusive with `--include-sensitive`
+/// (runtime check). CSV is the redacted-summary form by
+/// design; mixing them would either leak `raw_hash` /
+/// `native_path` or pretend the CSV carried more shape than
+/// it does.
+#[test]
+fn dedupe_csv_and_include_sensitive_are_mutually_exclusive() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--csv", "--include-sensitive"])
+        .assert()
+        .failure();
+}
+
+/// `--csv --json` (clap-rejected) and `--csv --include-counts`
+/// (runtime-rejected). CSV is flat redacted rows — no nested
+/// counts block, no structured form.
+#[test]
+fn dedupe_csv_and_json_are_mutually_exclusive() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_two_groups(data.path());
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--csv", "--json"])
+        .assert()
+        .failure();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--csv", "--include-counts"])
+        .assert()
+        .failure();
+}
