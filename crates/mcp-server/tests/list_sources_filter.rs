@@ -262,3 +262,72 @@ async fn list_sources_instance_multi_value_or_filters_matching_set() {
     assert_eq!(instances, ["dev", "prod"].into_iter().collect());
     assert_eq!(payload["stats"]["records"], 3);
 }
+
+// ─── Round-117 PR-78al: list_sources JSON summary line ────────────
+
+/// `list_sources` JSON response carries a top-level `summary`
+/// reporting filtered/total source counts, source+instance
+/// filter, active model, whole-store stats. Symmetric with
+/// R116 audit_tail JSON summary.
+#[tokio::test]
+async fn list_sources_json_carries_top_level_summary_line() {
+    let (server, _dir, store) = build_bundle();
+    seed(&store, "claude-code", None, "a");
+    seed(&store, "mem0", Some("prod"), "b");
+    seed(&store, "mem0", Some("dev"), "c");
+
+    let resp = server
+        .handle(tool_call(
+            "list_sources",
+            json!({"source": "mem0,claude-code"}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"]
+        .as_str()
+        .expect("list_sources JSON must carry `summary`");
+    assert!(
+        summary.contains("3 source(s) returned (filtered from 3 registered)"),
+        "summary must declare returned/total counts: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: mem0 OR claude-code"),
+        "summary must echo OR source filter: {summary}"
+    );
+    assert!(
+        summary.contains("instance filter: all instances"),
+        "summary must say `all instances` when none set: {summary}"
+    );
+    assert!(
+        summary.contains("active model: none"),
+        "summary must declare active model state: {summary}"
+    );
+    assert!(
+        summary.contains("3 records"),
+        "summary must surface whole-store stats: {summary}"
+    );
+}
+
+/// Filter that narrows the set surfaces the filtered count
+/// AND the registered total — important so an operator can
+/// tell "filter narrowed 5 to 1" from "only 1 registered".
+#[tokio::test]
+async fn list_sources_json_summary_reports_filtered_count_and_total() {
+    let (server, _dir, store) = build_bundle();
+    seed(&store, "claude-code", None, "a");
+    seed(&store, "mem0", Some("prod"), "b");
+    seed(&store, "mem0", Some("dev"), "c");
+
+    let resp = server
+        .handle(tool_call(
+            "list_sources",
+            json!({"source": "mem0", "instance": "prod"}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("1 source(s) returned (filtered from 3 registered)"),
+        "summary must distinguish filtered vs total: {summary}"
+    );
+}

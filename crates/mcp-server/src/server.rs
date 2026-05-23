@@ -100,6 +100,32 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Round 117 (PR-78al): shared summary clause renderer for
+/// filter dimensions that support comma-separated OR via
+/// `parse_csv_filter`. Used by JSON-summary lines on
+/// `list_sources`, `dedupe`. Empty vec → "{label} filter: all
+/// {label}s"; non-empty → "{label} filter: a OR b". Tokens are
+/// joined verbatim so an operator-supplied value renders
+/// exactly as parsed.
+fn render_filter_clause(label: &str, values: &[String]) -> String {
+    if values.is_empty() {
+        format!("{label} filter: all {label}s")
+    } else {
+        format!("{label} filter: {}", values.join(" OR "))
+    }
+}
+
+/// Round 117 (PR-78al): single-value variant for filter
+/// dimensions like `list_forgotten`'s `source` / `instance`
+/// that stayed scalar (no OR semantics yet). Empty → "all";
+/// `Some(v)` → "{label} filter: {v}".
+fn render_scalar_filter_clause(label: &str, value: Option<&str>) -> String {
+    match value {
+        Some(v) if !v.is_empty() => format!("{label} filter: {v}"),
+        _ => format!("{label} filter: all {label}s"),
+    }
+}
+
 /// Round 105 (PR-78aa): render `Store::list_forgotten` rows as
 /// the MCP CSV string. Same columns and redaction discipline
 /// as the CLI R105 helper —
@@ -1126,7 +1152,27 @@ impl AnamnesisServer {
             .filter(|r| sources.is_empty() || sources.iter().any(|s| s == &r.source.adapter))
             .filter(|r| instances.is_empty() || instances.iter().any(|i| i == &r.source.instance))
             .collect();
+
+        // Round 117 (PR-78al): JSON `summary` matches the
+        // R111-R116 discovery pattern. `sources` is filtered;
+        // `stats` is whole-store (R96 contract). Active model
+        // presence reported as `none` when unset.
+        let active_model = store.active_model().ok().flatten();
+        let source_clause = render_filter_clause("source", &sources);
+        let instance_clause = render_filter_clause("instance", &instances);
+        let summary = format!(
+            "{} source(s) returned (filtered from {} registered); {}; {}; active model: {}; stats reflect whole store ({} records, {} chunks).",
+            filtered.len(),
+            rows.len(),
+            source_clause,
+            instance_clause,
+            active_model.clone().unwrap_or_else(|| "none".to_string()),
+            stats.records,
+            stats.chunks,
+        );
+
         Ok(json!({
+            "summary": summary,
             "sources": filtered.iter().map(|r| json!({
                 "adapter": r.source.adapter,
                 "instance": if r.source.instance.is_empty() {
@@ -1145,7 +1191,7 @@ impl AnamnesisServer {
                 // a second call. NOT the number of tag rows.
                 "tagged_record_count": r.tagged_record_count,
             })).collect::<Vec<_>>(),
-            "active_model": store.active_model().ok().flatten(),
+            "active_model": active_model,
             "stats": {
                 "records": stats.records,
                 "chunks": stats.chunks,
@@ -1906,11 +1952,34 @@ impl AnamnesisServer {
         // started in R108: dedupe, list_forgotten, audit_tail
         // all now carry symmetric format markers on both
         // branches.
+        // Round 117 (PR-78al): JSON `summary` parity with
+        // R111-R116. `list_forgotten` source/instance stayed
+        // scalar (no OR semantic yet) so the clause renderer
+        // is the scalar variant.
+        let summary = format!(
+            "{} tombstone row(s) returned; limit {}; {}; {}; sensitive: {}; counts: {}.",
+            rows.len(),
+            effective_limit,
+            render_scalar_filter_clause("source", source.as_deref()),
+            render_scalar_filter_clause("instance", instance.as_deref()),
+            if include_sensitive {
+                "included"
+            } else {
+                "redacted"
+            },
+            if include_counts {
+                "included"
+            } else {
+                "omitted"
+            },
+        );
+
         let mut payload = json!({
             "count":              rows.len(),
             "format":             "json",
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
+            "summary":            summary,
             "rows":               rows_payload,
         });
         if let Some(buckets) = &counts {
@@ -2053,11 +2122,40 @@ impl AnamnesisServer {
         // without probing for `csv` vs `groups[]`. The CSV
         // branch already returned early above, so reaching
         // here means the structured form.
+        //
+        // Round 117 (PR-78al): top-level `summary` rounds out
+        // the discovery-summary trio (R111/R112/R113) + R116
+        // audit_tail. Source/instance can be comma-separated
+        // OR (R104/R115); parse them via `parse_csv_filter`
+        // for human-readable summary rendering. The store
+        // already parses these strings internally — this is
+        // presentation-only.
+        let source_tokens = anamnesis_core::parse_csv_filter(source.as_deref());
+        let instance_tokens = anamnesis_core::parse_csv_filter(instance.as_deref());
+        let summary = format!(
+            "{} duplicate group(s) returned; limit {}; {}; {}; sensitive: {}; counts: {}.",
+            groups.len(),
+            effective_limit,
+            render_filter_clause("source", &source_tokens),
+            render_filter_clause("instance", &instance_tokens),
+            if include_sensitive {
+                "included"
+            } else {
+                "redacted"
+            },
+            if include_counts {
+                "included"
+            } else {
+                "omitted"
+            },
+        );
+
         let mut payload = json!({
             "count":              groups.len(),
             "format":             "json",
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
+            "summary":            summary,
             "filter": {
                 "source":   source,
                 "instance": instance,
