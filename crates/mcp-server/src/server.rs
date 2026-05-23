@@ -1492,10 +1492,14 @@ impl AnamnesisServer {
     /// walk the user's home dir, and the MCP boundary should not be a
     /// path-arbitrary probe surface (see `import_source` rationale).
     async fn tool_doctor(&self, args: Value) -> Result<Value, String> {
-        let filter_source = args
-            .get("source")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+        // Round 110 (PR-78af): `source` now accepts a comma-
+        // separated OR list (`"mem0,claude-code"`) via core's
+        // shared `parse_csv_filter`, symmetric with R102
+        // audit-tail / R103 list-sources / R104 dedupe. Empty
+        // parse = no filter (back-compat). `instance` stays
+        // single-value AND-combined with the adapter set.
+        let filter_source_raw = args.get("source").and_then(|v| v.as_str());
+        let sources = anamnesis_core::parse_csv_filter(filter_source_raw);
         let filter_instance = args
             .get("instance")
             .and_then(|v| v.as_str())
@@ -1521,10 +1525,8 @@ impl AnamnesisServer {
         let mut rows = Vec::new();
         for swc in &registered {
             let src = &swc.source;
-            if let Some(name) = filter_source.as_deref() {
-                if src.adapter != name {
-                    continue;
-                }
+            if !sources.is_empty() && !sources.iter().any(|s| s == &src.adapter) {
+                continue;
             }
             if let Some(inst) = filter_instance.as_deref() {
                 if src.instance != inst {
@@ -3134,8 +3136,7 @@ fn tools_list_payload_all() -> Value {
                     "properties": {
                         "source": {
                             "type": "string",
-                            "description": "Restrict to one adapter id (claude-code, codex, mem0, ...). \
-                                            Omit to check every registered source."
+                            "description": "Restrict to one or more adapter ids. Single value (`\"mem0\"`) is exact match; comma-separated list (`\"mem0,claude-code\"`) is OR (R110) — both adapters' rows come back, everything else drops. Tokens trimmed and empty tokens dropped. Omit (or empty string) to check every registered source."
                         },
                         "instance": {
                             "type": "string",
@@ -5224,6 +5225,80 @@ mod tests {
             .clone();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0]["adapter"], "mem0");
+    }
+
+    /// Round 110 (PR-78af): comma-separated `source` is the OR
+    /// filter — both adapter rows survive, third drops.
+    /// Symmetric with R102 audit-tail / R103 list-sources /
+    /// R104 dedupe multi-value pattern.
+    #[tokio::test]
+    async fn doctor_source_multi_value_or_filters_matching_adapters() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", None, Some("/nonexistent/mem0.sqlite"), None)
+            .unwrap();
+        store
+            .register_source("claude-code", None, Some("/nonexistent/claude"), None)
+            .unwrap();
+        store
+            .register_source("codex", None, Some("/nonexistent/codex"), None)
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "doctor", "arguments": {"source": "mem0, claude-code"}}),
+            ))
+            .await;
+        let sources = resp.result.unwrap()["structuredContent"]["sources"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let adapters: std::collections::BTreeSet<&str> = sources
+            .iter()
+            .map(|s| s["adapter"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            adapters,
+            ["claude-code", "mem0"].into_iter().collect(),
+            "codex must drop under multi-source OR: got {sources:?}"
+        );
+    }
+
+    /// Multi-source OR combined with `instance` is AND: row
+    /// matches iff `adapter ∈ source-set` AND `instance ==
+    /// instance-arg`. mem0:dev survives; mem0:prod drops
+    /// (instance mismatch); claude-code with default instance
+    /// drops (instance mismatch).
+    #[tokio::test]
+    async fn doctor_source_multi_value_with_instance_is_and_filter() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_source("mem0", Some("prod"), Some("/nonexistent/a"), None)
+            .unwrap();
+        store
+            .register_source("mem0", Some("dev"), Some("/nonexistent/b"), None)
+            .unwrap();
+        store
+            .register_source("claude-code", None, Some("/nonexistent/cc"), None)
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "doctor", "arguments": {
+                    "source": "mem0,claude-code",
+                    "instance": "dev",
+                }}),
+            ))
+            .await;
+        let sources = resp.result.unwrap()["structuredContent"]["sources"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(sources.len(), 1, "only mem0:dev should match: {sources:?}");
+        assert_eq!(sources[0]["adapter"], "mem0");
+        assert_eq!(sources[0]["instance"], "dev");
     }
 
     /// `since=Nd` marks a source whose `last_import_at` is older than

@@ -582,9 +582,17 @@ enum Command {
     /// the machine but not yet registered.
     Doctor {
         /// Restrict to one adapter id (and optional instance).
+        /// Round 110: also accepts a comma-separated OR list
+        /// (`--source mem0,claude-code`) — both adapters'
+        /// rows survive, everything else drops. Tokens are
+        /// trimmed and empty tokens dropped, so
+        /// `--source mem0, , claude-code` and
+        /// `--source mem0,claude-code` are equivalent.
         #[arg(long)]
         source: Option<String>,
         /// Match a specific instance within `--source`.
+        /// Combines as AND with the source OR-set
+        /// (`source ∈ [a,b] && instance == prod`).
         #[arg(long)]
         instance: Option<String>,
         /// Also run the discovery detectors for adapters with no
@@ -4625,6 +4633,17 @@ async fn cmd_doctor(
     let store = Store::open(db_path(data_dir))?;
     let registered = store.list_sources_with_counts()?;
 
+    // Round 110 (PR-78af): `--source` now accepts a comma-
+    // separated OR list (`--source mem0,claude-code`) via
+    // core's shared `parse_csv_filter`, symmetric with R102
+    // audit-tail / R103 list-sources / R104 dedupe multi-
+    // value. Empty parse = no filter (back-compat with R74's
+    // single-value semantic). `--instance` stays single-value
+    // AND-combined with the adapter set.
+    let sources = anamnesis_core::parse_csv_filter(filter_source);
+    let source_matches =
+        |adapter: &str| -> bool { sources.is_empty() || sources.iter().any(|s| s == adapter) };
+
     // Round-64 follow-up: one `GROUP BY` query instead of N row-
     // materializing scans. For 13 registered sources this turns
     // 13 × `SELECT * FROM import_errors WHERE adapter = ?` (which
@@ -4635,10 +4654,8 @@ async fn cmd_doctor(
     let mut rows = Vec::new();
     for swc in &registered {
         let src = &swc.source;
-        if let Some(name) = filter_source {
-            if src.adapter != name {
-                continue;
-            }
+        if !source_matches(&src.adapter) {
+            continue;
         }
         if let Some(inst) = filter_instance {
             if src.instance != inst {
@@ -4686,10 +4703,8 @@ async fn cmd_doctor(
             if registered_pairs.contains(&key) {
                 continue;
             }
-            if let Some(name) = filter_source {
-                if d.adapter != name {
-                    continue;
-                }
+            if !source_matches(&d.adapter) {
+                continue;
             }
             rows.push(DoctorRow {
                 adapter: d.adapter,
