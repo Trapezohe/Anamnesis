@@ -234,6 +234,37 @@ fn list_forgotten_default_json_redacts_sensitive_fields() {
         !stdout.contains("secretReasonMarkerCli"),
         "reason marker must not leak into redacted output"
     );
+
+    // Round 126 (PR-78au): top-level redacted summary on
+    // `list-forgotten --json`. Mirrors MCP R117. NEVER reads
+    // reason/native_path/raw_hash.
+    let summary = v["summary"]
+        .as_str()
+        .expect("list-forgotten --json must carry top-level `summary`");
+    assert!(
+        summary.contains("1 tombstone row(s) returned"),
+        "summary must declare count: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: all sources"),
+        "default no-filter summary must say `all sources`: {summary}"
+    );
+    assert!(
+        summary.contains("instance filter: all instances"),
+        "default no-filter summary must say `all instances`: {summary}"
+    );
+    assert!(
+        summary.contains("sensitive: redacted"),
+        "default sensitive state must surface: {summary}"
+    );
+    assert!(
+        summary.contains("counts: omitted"),
+        "default counts state must surface: {summary}"
+    );
+    assert!(
+        !summary.contains("secretReasonMarkerCli"),
+        "summary must not leak reason: {summary}"
+    );
 }
 
 #[test]
