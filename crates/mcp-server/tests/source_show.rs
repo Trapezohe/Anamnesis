@@ -185,6 +185,48 @@ async fn source_show_returns_counts_and_recent_errors_scoped_to_instance() {
     assert_eq!(errors.len(), 1, "must NOT include the cloud-instance error");
     assert_eq!(errors[0]["error"], "self-error");
     assert_eq!(errors[0]["native_path"], "/local/rec.json");
+
+    // Round 118 (PR-78am): top-level redacted summary
+    // closes the MCP discovery-summary trilogy on the
+    // admin surface. Must mention target, counts, recent
+    // import error count + limit. Must NOT leak the error
+    // text or the native_path.
+    let summary = payload["summary"]
+        .as_str()
+        .expect("source_show must carry top-level `summary`");
+    assert!(
+        summary.contains("mem0:self-hosted source_show"),
+        "summary must declare target: {summary}"
+    );
+    assert!(
+        summary.contains("1 record(s)"),
+        "summary must surface record_count: {summary}"
+    );
+    assert!(
+        summary.contains("1 tagged record(s)"),
+        "summary must surface tagged count: {summary}"
+    );
+    assert!(
+        summary.contains("recent import errors: 1 returned"),
+        "summary must surface error count: {summary}"
+    );
+    assert!(
+        summary.contains("limit 5"),
+        "summary must surface the effective error_limit: {summary}"
+    );
+    assert!(
+        summary.contains("last import: never"),
+        "summary must declare last-import state: {summary}"
+    );
+    // Privacy: summary must NEVER leak error text or path.
+    assert!(
+        !summary.contains("self-error"),
+        "summary must not leak error text: {summary}"
+    );
+    assert!(
+        !summary.contains("/local/rec.json"),
+        "summary must not leak native_path: {summary}"
+    );
     // Cross-check: cloud instance has its own error, isolated.
     let cloud_resp = server
         .handle(tool_call(

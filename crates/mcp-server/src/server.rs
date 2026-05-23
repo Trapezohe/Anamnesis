@@ -2480,7 +2480,33 @@ impl AnamnesisServer {
             })
             .collect();
 
+        // Round 118 (PR-78am): top-level redacted summary —
+        // closes the MCP discovery-summary set on the admin
+        // surface too (R111-R117 covered the read tools).
+        // Summary is operator-friendly counts + state; it
+        // NEVER touches `error.error` text, `native_path`,
+        // `native_id`, or `raw_hash`, so the admin gate's
+        // existing privacy assumptions hold.
+        let target_label = match instance {
+            Some(i) => format!("{adapter}:{i}"),
+            None => adapter.to_string(),
+        };
+        let last_import_label = match swc.source.last_import_at {
+            Some(ts) => ts.to_string(),
+            None => "never".to_string(),
+        };
+        let summary = format!(
+            "{target_label} source_show: {} record(s), {} chunk(s), {} tagged record(s); recent import errors: {} returned (limit {}); last import: {}.",
+            swc.record_count,
+            swc.chunk_count,
+            swc.tagged_record_count,
+            recent.len(),
+            error_limit,
+            last_import_label,
+        );
+
         Ok(json!({
+            "summary": summary,
             "source": {
                 "adapter": swc.source.adapter,
                 "instance": if swc.source.instance.is_empty() {
