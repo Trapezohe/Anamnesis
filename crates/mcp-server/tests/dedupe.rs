@@ -114,6 +114,11 @@ async fn dedupe_default_payload_redacts_sensitive_fields() {
     let (server, _data) = build_bundle(false);
     let body = server.handle(tool_call("dedupe", json!({}))).await;
     let payload = extract_payload(&body);
+    // Round 108 (PR-78ad): `format: "json"` marker pairs
+    // with the R107 CSV path's `format: "csv"` so MCP
+    // clients can branch on `payload.format` without probing
+    // for `csv` vs `groups[]`.
+    assert_eq!(payload["format"], "json");
     assert_eq!(payload["sensitive_included"], false);
     let group = &payload["groups"][0];
     assert!(
