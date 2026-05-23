@@ -417,3 +417,129 @@ async fn audit_tail_no_action_arg_emits_empty_actions_array() {
     assert_eq!(payload["filter"]["actions"], json!([]));
     assert_eq!(payload["count"], 1);
 }
+
+// ─── Round-116 PR-78ak: audit_tail JSON summary line ──────────────
+
+/// JSON path carries a top-level `summary` reporting count,
+/// limit, action filter (with OR), since, and detail state.
+/// CSV path does NOT carry it (its shape is self-describing).
+/// Mirrors R111/R112/R113 MCP discovery summary pattern.
+#[tokio::test]
+async fn audit_tail_json_carries_top_level_summary_line() {
+    let bundle = build_bundle(true);
+    for _ in 0..2 {
+        bundle.audit.record(AuditEntry::new(
+            "forget",
+            json!({"via": "cli", "outcome": "forgotten", "reason": "do-not-leak-this-canary"}),
+        ));
+    }
+    bundle.audit.record(AuditEntry::new(
+        "tag_record",
+        json!({"via": "mcp", "outcome": "tagged"}),
+    ));
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "audit_tail",
+            json!({"action": "forget, tag_record", "since": "24h"}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"]
+        .as_str()
+        .expect("audit_tail JSON must carry top-level `summary`");
+
+    assert!(
+        summary.contains("3 audit entries returned"),
+        "summary must declare returned count: {summary}"
+    );
+    assert!(
+        summary.contains("forget OR tag_record"),
+        "summary must echo OR action filter: {summary}"
+    );
+    assert!(
+        summary.contains("since: 24h"),
+        "summary must echo since clause: {summary}"
+    );
+    assert!(
+        summary.contains("detail: redacted"),
+        "summary must declare detail state (redacted by default): {summary}"
+    );
+    // Privacy: summary must never leak `reason` text.
+    assert!(
+        !summary.contains("do-not-leak-this-canary"),
+        "summary must not leak reason: {summary}"
+    );
+}
+
+/// No filter args → summary reports `all actions` + `all time`
+/// + `detail: redacted`, anchoring the no-filter shape.
+#[tokio::test]
+async fn audit_tail_json_summary_no_filter_reports_all_actions_all_time() {
+    let bundle = build_bundle(true);
+    bundle
+        .audit
+        .record(AuditEntry::new("search", json!({"via": "mcp"})));
+    let resp = bundle
+        .server
+        .handle(tool_call("audit_tail", json!({})))
+        .await;
+    assert!(resp.error.is_none());
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("all actions"),
+        "no-action summary must say `all actions`: {summary}"
+    );
+    assert!(
+        summary.contains("all time"),
+        "no-since summary must say `all time`: {summary}"
+    );
+}
+
+/// `include_detail: true` switches the detail clause from
+/// `redacted` to `included` so MCP clients can see the
+/// elevated-access state at a glance.
+#[tokio::test]
+async fn audit_tail_json_summary_reports_detail_included_when_opted_in() {
+    let bundle = build_bundle(true);
+    bundle
+        .audit
+        .record(AuditEntry::new("search", json!({"via": "mcp"})));
+    let resp = bundle
+        .server
+        .handle(tool_call("audit_tail", json!({"include_detail": true})))
+        .await;
+    let summary = extract_payload(&resp)["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        summary.contains("detail: included"),
+        "include_detail=true must surface in summary: {summary}"
+    );
+}
+
+/// CSV path is unaffected — `summary` is JSON-only by design.
+/// Pins the boundary so a future renderer change doesn't
+/// accidentally bleed the summary into a flat-CSV payload.
+#[tokio::test]
+async fn audit_tail_csv_response_has_no_summary_field() {
+    let bundle = build_bundle(true);
+    bundle.audit.record(AuditEntry::new(
+        "forget",
+        json!({"via": "cli", "outcome": "forgotten"}),
+    ));
+    let resp = bundle
+        .server
+        .handle(tool_call("audit_tail", json!({"csv": true})))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    assert!(
+        payload.get("summary").is_none(),
+        "CSV payload must not carry `summary`; got {payload}"
+    );
+}
