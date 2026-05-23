@@ -2924,6 +2924,30 @@ impl AnamnesisServer {
                 });
             }
         }
+        // Round 113 (PR-78ai): additive top-level `summary`
+        // for first-time agent discovery, closing the trio
+        // started in R111 (prompts/list) + R112 (resources/list).
+        // **Load-bearing**: count from the *post-filter*
+        // `tools[]` so the line never claims admin tools are
+        // exposed when they're hidden. Admin tool *names* are
+        // surfaced in either mode (so the agent knows what
+        // gating exists), but the count and "enabled/hidden"
+        // verb reflect the actual visible set.
+        let visible_count = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let admin_names = ADMIN_TOOLS.join(", ");
+        let admin_clause = if self.allow_admin_tools {
+            format!("admin tools enabled ({admin_names})")
+        } else {
+            format!("admin tools hidden ({admin_names})")
+        };
+        let summary = format!("{visible_count} tools exposed; {admin_clause}.");
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("summary".into(), Value::String(summary));
+        }
         payload
     }
 }
@@ -3734,6 +3758,65 @@ mod tests {
                 "missing tool {expected}"
             );
         }
+    }
+
+    /// Round 113 (PR-78ai): `tools/list` carries a top-level
+    /// `summary` line for agent discovery, completing the trio
+    /// started in R111 (`prompts/list`) + R112
+    /// (`resources/list`). Default (admin off): counts only
+    /// the 6 visible tools and says `admin tools hidden`.
+    #[tokio::test]
+    async fn tools_list_carries_top_level_summary_admin_off() {
+        let s = server_with_records(&[]);
+        assert!(!s.admin_tools_allowed());
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"]
+            .as_str()
+            .expect("tools/list must carry top-level `summary` for discovery");
+        // Visible-count must match post-filter `tools[]`.len().
+        // R86 baseline: 13 catalogue - 7 admin = 6 visible.
+        assert!(
+            summary.contains("6 tools exposed"),
+            "non-admin summary should declare 6 visible tools: {summary}"
+        );
+        // Operator must learn which tools are gated even when
+        // they're hidden.
+        assert!(
+            summary.contains("admin tools hidden"),
+            "non-admin summary should say `admin tools hidden`: {summary}"
+        );
+        assert!(
+            summary.contains("forget_record"),
+            "summary should name a representative admin tool: {summary}"
+        );
+        // Back-compat: `tools[]` continues to carry only the
+        // 6 visible entries.
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 6);
+    }
+
+    /// With admin enabled, summary reports 13 visible tools
+    /// and switches the verb to `admin tools enabled`.
+    #[tokio::test]
+    async fn tools_list_carries_top_level_summary_admin_on() {
+        let store = Store::open_in_memory().unwrap();
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("13 tools exposed"),
+            "admin-on summary should declare 13 visible tools: {summary}"
+        );
+        assert!(
+            summary.contains("admin tools enabled"),
+            "admin-on summary should switch to enabled verb: {summary}"
+        );
+        // Same back-compat assertion: `tools[]` carries the
+        // 13 entries.
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 13);
     }
 
     #[tokio::test]
