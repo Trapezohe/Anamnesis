@@ -590,9 +590,12 @@ enum Command {
         /// `--source mem0,claude-code` are equivalent.
         #[arg(long)]
         source: Option<String>,
-        /// Match a specific instance within `--source`.
-        /// Combines as AND with the source OR-set
-        /// (`source ∈ [a,b] && instance == prod`).
+        /// Match an instance within `--source`. Round 114:
+        /// also accepts a comma-separated OR list
+        /// (`--instance prod,dev`) — any listed instance
+        /// matches. Combines as AND with the source OR-set
+        /// (`source ∈ [a,b] && instance ∈ [c,d]`). Tokens
+        /// trimmed and empty tokens dropped.
         #[arg(long)]
         instance: Option<String>,
         /// Also run the discovery detectors for adapters with no
@@ -4644,6 +4647,18 @@ async fn cmd_doctor(
     let source_matches =
         |adapter: &str| -> bool { sources.is_empty() || sources.iter().any(|s| s == adapter) };
 
+    // Round 114 (PR-78aj): `--instance` now also accepts a
+    // comma-separated OR list, symmetric with `--source`'s
+    // R110 behaviour. Combined as AND with the source set:
+    // `source ∈ [a,b] && instance ∈ [c,d]`. Empty parse on
+    // either dimension = no filter on that dimension. The
+    // registered-source path uses both predicates; the
+    // unregistered detector path doesn't carry instance, so
+    // it stays unchanged.
+    let instances = anamnesis_core::parse_csv_filter(filter_instance);
+    let instance_matches =
+        |inst: &str| -> bool { instances.is_empty() || instances.iter().any(|i| i == inst) };
+
     // Round-64 follow-up: one `GROUP BY` query instead of N row-
     // materializing scans. For 13 registered sources this turns
     // 13 × `SELECT * FROM import_errors WHERE adapter = ?` (which
@@ -4657,10 +4672,8 @@ async fn cmd_doctor(
         if !source_matches(&src.adapter) {
             continue;
         }
-        if let Some(inst) = filter_instance {
-            if src.instance != inst {
-                continue;
-            }
+        if !instance_matches(&src.instance) {
+            continue;
         }
         let health = run_adapter_health(src).await;
         let stale = stale_threshold.map(|t| match src.last_import_at {
