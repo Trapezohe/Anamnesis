@@ -3615,7 +3615,44 @@ fn cmd_dedupe(
         // on `payload.format` instead of probing for `csv` vs
         // `groups[]`. Position is alphabetical-ish next to
         // `count` so the structural keys cluster.
+        //
+        // Round 125 (PR-78at): top-level redacted summary
+        // mirrors MCP `dedupe` R117 + CLI `source list --json`
+        // R124 + CLI `status --json` R123. NEVER reads
+        // `raw_hash` or `native_path` — only counts, filter
+        // clauses, sensitive/counts state.
+        let source_tokens = anamnesis_core::parse_csv_filter(source);
+        let instance_tokens = anamnesis_core::parse_csv_filter(instance);
+        let source_clause = if source_tokens.is_empty() {
+            "source filter: all sources".to_string()
+        } else {
+            format!("source filter: {}", source_tokens.join(" OR "))
+        };
+        let instance_clause = if instance_tokens.is_empty() {
+            "instance filter: all instances".to_string()
+        } else {
+            format!("instance filter: {}", instance_tokens.join(" OR "))
+        };
+        let summary = format!(
+            "{} duplicate group(s) returned; limit {}; {}; {}; sensitive: {}; counts: {}.",
+            groups.len(),
+            effective_limit,
+            source_clause,
+            instance_clause,
+            if include_sensitive {
+                "included"
+            } else {
+                "redacted"
+            },
+            if include_counts {
+                "included"
+            } else {
+                "omitted"
+            },
+        );
+
         let mut payload = serde_json::json!({
+            "summary": summary,
             "count": groups.len(),
             "format": "json",
             "limit": effective_limit,

@@ -106,6 +106,37 @@ fn dedupe_default_json_redacts_sensitive_fields() {
     // both shapes can branch on `payload.format` instead of
     // probing for `groups[]` vs `csv`.
     assert_eq!(v["format"], "json");
+    // Round 125 (PR-78at): top-level redacted summary
+    // mirrors MCP R117 dedupe summary. Must surface count
+    // and default filter/sensitive/counts state. Must NEVER
+    // contain raw_hash (`h-shared`) or native_path.
+    let summary = v["summary"]
+        .as_str()
+        .expect("dedupe --json must carry top-level `summary`");
+    assert!(
+        summary.contains("1 duplicate group(s) returned"),
+        "summary must declare count: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: all sources"),
+        "no-filter summary must say `all sources`: {summary}"
+    );
+    assert!(
+        summary.contains("sensitive: redacted"),
+        "default sensitive state must surface: {summary}"
+    );
+    assert!(
+        summary.contains("counts: omitted"),
+        "default counts state must surface: {summary}"
+    );
+    assert!(
+        !summary.contains("h-shared"),
+        "summary must not leak raw_hash: {summary}"
+    );
+    assert!(
+        !summary.contains("/tmp/claude-code/alpha.md"),
+        "summary must not leak native_path: {summary}"
+    );
     assert_eq!(v["sensitive_included"], false);
     let groups = v["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 1);
