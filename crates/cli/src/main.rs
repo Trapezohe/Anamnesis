@@ -5299,7 +5299,31 @@ fn cmd_audit_tail(
     let effective_limit = limit.clamp(1, anamnesis_core::AUDIT_TAIL_MAX_LIMIT);
 
     if json {
+        // Round 127 (PR-78av): top-level redacted summary
+        // mirroring MCP R116 + CLI R123-R126 operator
+        // summary pattern. NEVER reads `entry.detail`,
+        // `reason`, or `query`. CLI JSON path historically
+        // includes full detail in `entries[]` (operator
+        // surface), so the summary clause reports
+        // `detail: included` to reflect that.
+        let action_clause = if actions.is_empty() {
+            "all actions".to_string()
+        } else {
+            format!("action filter: {}", actions.join(" OR "))
+        };
+        let since_clause = match since {
+            Some(s) => format!("since: {s}"),
+            None => "since: all time".to_string(),
+        };
+        let summary = format!(
+            "{} audit entries returned; limit {}; {}; {}; detail: included.",
+            rows.len(),
+            effective_limit,
+            action_clause,
+            since_clause,
+        );
         let payload = serde_json::json!({
+            "summary": summary,
             "count": rows.len(),
             "limit": effective_limit,
             "filter": {
