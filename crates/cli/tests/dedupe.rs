@@ -101,6 +101,11 @@ fn dedupe_default_json_redacts_sensitive_fields() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(v["count"], 1);
+    // Round 108 (PR-78ad): `format: "json"` marker pairs
+    // with R107's `format: "csv"` so a script that supports
+    // both shapes can branch on `payload.format` instead of
+    // probing for `groups[]` vs `csv`.
+    assert_eq!(v["format"], "json");
     assert_eq!(v["sensitive_included"], false);
     let groups = v["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 1);

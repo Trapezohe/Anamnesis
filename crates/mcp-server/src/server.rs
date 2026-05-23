@@ -2042,8 +2042,15 @@ impl AnamnesisServer {
                 group
             })
             .collect();
+        // Round 108 (PR-78ad): `"format": "json"` marker
+        // pairs with R107's `"format": "csv"` on the CSV
+        // branch. MCP clients can switch on `payload.format`
+        // without probing for `csv` vs `groups[]`. The CSV
+        // branch already returned early above, so reaching
+        // here means the structured form.
         let mut payload = json!({
             "count":              groups.len(),
+            "format":             "json",
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
             "filter": {

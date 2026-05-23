@@ -3519,8 +3519,15 @@ fn cmd_dedupe(
     }
 
     if json {
+        // Round 108 (PR-78ad): `"format": "json"` marker
+        // mirrors R107's `"format": "csv"` on the MCP CSV
+        // path. Lets a script that supports both shapes branch
+        // on `payload.format` instead of probing for `csv` vs
+        // `groups[]`. Position is alphabetical-ish next to
+        // `count` so the structural keys cluster.
         let mut payload = serde_json::json!({
             "count": groups.len(),
+            "format": "json",
             "limit": effective_limit,
             "sensitive_included": include_sensitive,
             "filter": {
