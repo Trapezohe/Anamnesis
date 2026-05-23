@@ -726,3 +726,71 @@ async fn dedupe_tools_list_schema_advertises_csv() {
     let props = &dedupe["inputSchema"]["properties"];
     assert_eq!(props["csv"]["type"], "boolean");
 }
+
+// ─── Round-117 PR-78al: dedupe JSON summary line ───────────────────
+
+/// `dedupe` JSON response carries top-level `summary` reporting
+/// group count, limit, source/instance OR filter, sensitive +
+/// counts state. CSV path doesn't carry it. `raw_hash` MUST
+/// NOT appear in summary even when seeded raw_hash is present
+/// in the fixture (`secretMarkerH`).
+#[tokio::test]
+async fn dedupe_json_carries_top_level_summary_line() {
+    let (server, _data) = build_bundle(false);
+    let resp = server.handle(tool_call("dedupe", json!({}))).await;
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"]
+        .as_str()
+        .expect("dedupe JSON must carry `summary`");
+    assert!(
+        summary.contains("1 duplicate group(s) returned"),
+        "summary must declare count: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: all sources"),
+        "no-source summary must say `all sources`: {summary}"
+    );
+    assert!(
+        summary.contains("sensitive: redacted"),
+        "default sensitive state must surface: {summary}"
+    );
+    assert!(
+        summary.contains("counts: omitted"),
+        "default counts state must surface: {summary}"
+    );
+    // Privacy: `raw_hash` must NEVER appear.
+    assert!(
+        !summary.contains("secretMarkerH"),
+        "summary must not leak raw_hash: {summary}"
+    );
+}
+
+/// Multi-value `source` OR is reflected in the summary clause.
+#[tokio::test]
+async fn dedupe_json_summary_reflects_multi_value_source_filter() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call("dedupe", json!({"source": "mem0,claude-code"})))
+        .await;
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("source filter: mem0 OR claude-code"),
+        "summary must echo OR source filter: {summary}"
+    );
+}
+
+/// CSV branch must NOT carry `summary` (JSON-only contract).
+#[tokio::test]
+async fn dedupe_csv_response_has_no_summary_field() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call("dedupe", json!({"csv": true})))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    assert!(
+        payload.get("summary").is_none(),
+        "CSV payload must not carry `summary`; got {payload}"
+    );
+}

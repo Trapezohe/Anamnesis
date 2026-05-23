@@ -306,3 +306,57 @@ async fn list_forgotten_tools_list_schema_advertises_csv() {
     let props = &lf["inputSchema"]["properties"];
     assert_eq!(props["csv"]["type"], "boolean");
 }
+
+// ─── Round-117 PR-78al: list_forgotten JSON summary line ───────────
+
+/// `list_forgotten` JSON response carries top-level `summary`
+/// reporting count, limit, source/instance filter, sensitive +
+/// counts state. CSV path doesn't carry it.
+#[tokio::test]
+async fn list_forgotten_json_carries_top_level_summary_line() {
+    let (server, _dir, store) = build_bundle(true);
+    seed_and_forget(&store, "claude-code", "a", "secret-canary");
+
+    let resp = server.handle(tool_call("list_forgotten", json!({}))).await;
+    let payload = extract_payload(&resp);
+    let summary = payload["summary"]
+        .as_str()
+        .expect("list_forgotten JSON must carry `summary`");
+    assert!(
+        summary.contains("1 tombstone row(s) returned"),
+        "summary must declare count: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: all sources"),
+        "no-source summary must say `all sources`: {summary}"
+    );
+    assert!(
+        summary.contains("sensitive: redacted"),
+        "default sensitive state must surface: {summary}"
+    );
+    assert!(
+        summary.contains("counts: omitted"),
+        "default counts state must surface: {summary}"
+    );
+    // Privacy: summary must never leak `reason`.
+    assert!(
+        !summary.contains("secret-canary"),
+        "summary must not leak reason: {summary}"
+    );
+}
+
+/// CSV branch must NOT carry `summary` (JSON-only contract).
+#[tokio::test]
+async fn list_forgotten_csv_response_has_no_summary_field() {
+    let (server, _dir, store) = build_bundle(true);
+    seed_and_forget(&store, "claude-code", "a", "ok");
+    let resp = server
+        .handle(tool_call("list_forgotten", json!({"csv": true})))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    assert!(
+        payload.get("summary").is_none(),
+        "CSV payload must not carry `summary`; got {payload}"
+    );
+}
