@@ -3888,9 +3888,42 @@ fn cmd_list_forgotten(
     }
 
     if json {
+        // Round 126 (PR-78au): top-level redacted summary,
+        // mirroring MCP `list_forgotten` R117 + CLI R123-R125
+        // operator summary pattern. Source/instance are scalar
+        // here (R74 store API). NEVER reads `reason`,
+        // `native_path`, or `raw_hash`.
+        let effective_limit = limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT);
+        let source_clause = match source {
+            Some(v) if !v.is_empty() => format!("source filter: {v}"),
+            _ => "source filter: all sources".to_string(),
+        };
+        let instance_clause = match instance {
+            Some(v) if !v.is_empty() => format!("instance filter: {v}"),
+            _ => "instance filter: all instances".to_string(),
+        };
+        let summary = format!(
+            "{} tombstone row(s) returned; limit {}; {}; {}; sensitive: {}; counts: {}.",
+            rows.len(),
+            effective_limit,
+            source_clause,
+            instance_clause,
+            if include_sensitive {
+                "included"
+            } else {
+                "redacted"
+            },
+            if include_counts {
+                "included"
+            } else {
+                "omitted"
+            },
+        );
+
         let mut payload = serde_json::json!({
+            "summary": summary,
             "count": rows.len(),
-            "limit": limit.clamp(1, anamnesis_store::LIST_FORGOTTEN_MAX_LIMIT),
+            "limit": effective_limit,
             "sensitive_included": include_sensitive,
             "rows": rows.iter().map(|r| {
                 let mut row = serde_json::json!({
