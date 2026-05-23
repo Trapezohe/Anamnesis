@@ -3202,6 +3202,35 @@ fn audit_tail_json_returns_recent_forget_entries() {
         .expect("forget entry");
     assert_eq!(forget_entry["detail"]["outcome"], "forgotten");
     assert_eq!(forget_entry["detail"]["reason"], "auditing");
+
+    // Round 127 (PR-78av): top-level redacted summary
+    // mirrors MCP R116 audit_tail summary. CLI JSON path
+    // includes full detail, so summary reports
+    // `detail: included`. Summary text itself must NEVER
+    // leak the `reason` from `entry.detail`.
+    let summary = v["summary"]
+        .as_str()
+        .expect("audit tail --json must carry top-level `summary`");
+    assert!(
+        summary.contains("audit entries returned"),
+        "summary must declare count: {summary}"
+    );
+    assert!(
+        summary.contains("action filter: forget"),
+        "summary must echo --action filter: {summary}"
+    );
+    assert!(
+        summary.contains("since: all time"),
+        "no-since summary must say `all time`: {summary}"
+    );
+    assert!(
+        summary.contains("detail: included"),
+        "CLI JSON path must declare detail: included: {summary}"
+    );
+    assert!(
+        !summary.contains("auditing"),
+        "summary must not leak reason text: {summary}"
+    );
 }
 
 /// `--action` filter excludes unrelated entries. Two operations
