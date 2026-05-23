@@ -199,3 +199,112 @@ async fn get_record_tools_list_schema_advertises_include_lineage() {
     );
     assert_eq!(props["include_lineage"]["type"], "boolean");
 }
+
+// ─── Round-120 PR-78ao: get_record top-level redacted summary ─────
+
+fn extract_structured(resp: &anamnesis_mcp_server::protocol::JsonRpcResponse) -> Value {
+    serde_json::to_value(resp).unwrap()["result"]["structuredContent"].clone()
+}
+
+/// Hit shape carries a top-level redacted `summary`. Must
+/// report source / kind / scope / chunks readiness / user_tags
+/// count / lineage state. NEVER leak `content`, `native_path`,
+/// `raw_hash`, or `native_id`.
+#[tokio::test]
+async fn get_record_carries_top_level_redacted_summary() {
+    let (server, _dir, store) = build_server();
+    let id = seed_record(
+        &store,
+        "claude-code",
+        "lone",
+        "the marker phrase platypusBanjoCometCanary",
+        None,
+    );
+
+    let resp = server
+        .handle(tool_call("get_record", json!({"id": id.0})))
+        .await;
+    let payload = extract_structured(&resp);
+    let summary = payload["summary"]
+        .as_str()
+        .expect("get_record hit must carry top-level `summary`");
+
+    assert!(
+        summary.contains("record returned"),
+        "summary must declare record returned: {summary}"
+    );
+    assert!(
+        summary.contains("source: claude-code:default"),
+        "summary must surface adapter:instance: {summary}"
+    );
+    assert!(
+        summary.contains("kind: fact"),
+        "summary must surface kind: {summary}"
+    );
+    assert!(
+        summary.contains("scope: user"),
+        "summary must surface scope: {summary}"
+    );
+    assert!(
+        summary.contains("chunks:"),
+        "summary must surface chunk readiness: {summary}"
+    );
+    assert!(
+        summary.contains("lineage: omitted"),
+        "default lineage state must surface: {summary}"
+    );
+    assert!(
+        summary.contains("user_tags: 0"),
+        "default user_tags count must surface: {summary}"
+    );
+
+    // Privacy: summary must NEVER leak content, native_path,
+    // raw_hash, or native_id.
+    assert!(
+        !summary.contains("platypusBanjoCometCanary"),
+        "summary must not leak content: {summary}"
+    );
+    assert!(
+        !summary.contains("/tmp/claude-code/lone.md"),
+        "summary must not leak native_path: {summary}"
+    );
+    assert!(
+        !summary.contains("h-claude-code-lone"),
+        "summary must not leak raw_hash: {summary}"
+    );
+    assert!(
+        !summary.contains("lone"),
+        "summary must not leak native_id token: {summary}"
+    );
+}
+
+/// `include_lineage: true` flips the lineage clause to
+/// `depth N, complete` AND the structured `lineage` block
+/// still ships (back-compat). Summary doesn't echo ancestor
+/// record_ids.
+#[tokio::test]
+async fn get_record_summary_reports_lineage_depth_and_completeness() {
+    let (server, _dir, store) = build_server();
+    let root = seed_record(&store, "claude-code", "root", "root content", None);
+    let child = seed_record(&store, "claude-code", "child", "child content", Some(&root));
+
+    let resp = server
+        .handle(tool_call(
+            "get_record",
+            json!({"id": child.0, "include_lineage": true}),
+        ))
+        .await;
+    let payload = extract_structured(&resp);
+    let summary = payload["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("lineage: depth 2, complete"),
+        "include_lineage must surface depth + completeness: {summary}"
+    );
+    // Lineage block still ships (back-compat with R85).
+    assert!(payload["lineage"].is_object(), "lineage block must ship");
+    // Summary must NOT echo the ancestor record_id text.
+    assert!(
+        !summary.contains(&root.0),
+        "summary must not leak ancestor record_id: {summary}"
+    );
+}

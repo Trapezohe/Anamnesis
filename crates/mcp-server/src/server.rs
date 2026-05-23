@@ -1097,7 +1097,10 @@ impl AnamnesisServer {
         // lower-case enums, JSON null for absent instance, surface
         // chunk/embedding readiness so the agent can decide whether
         // hybrid retrieval will hit this record right now.
-        let summary = store
+        // R120: rename internal `summary` → `record_summary`
+        // so the top-level redacted `summary` string introduced
+        // below doesn't shadow it.
+        let record_summary = store
             .record_summary(&r.id)
             .map_err(|e| format!("store: {e}"))?
             .ok_or_else(|| "record vanished between lookup and summary".to_string())?;
@@ -1114,17 +1117,57 @@ impl AnamnesisServer {
         // an extractor produced a deep chain. `chain[0]` is the
         // record the caller asked for; `chain[last]` is the
         // furthest ancestor we could resolve.
-        let lineage_payload: Option<Value> = if include_lineage {
+        // Round 85 (PR-78g): provenance walk + R120 (PR-78ao)
+        // summary clause about lineage. Capture chain-shape
+        // metrics (depth + completeness) while we still own
+        // the typed `LineageChain`; the payload form drops
+        // type-specific fields once it's serialised.
+        let (lineage_payload, lineage_clause) = if include_lineage {
             let chain = store
                 .lineage_chain(&r.id)
                 .map_err(|e| format!("get_record.include_lineage: {e}"))?
                 .ok_or_else(|| "lineage: record vanished between lookup and walk".to_string())?;
-            Some(build_lineage_payload(&chain))
+            let depth = chain.records.len();
+            let complete = chain.missing_parent.is_none();
+            let payload = build_lineage_payload(&chain);
+            let clause = format!(
+                "lineage: depth {depth}, {}",
+                if complete { "complete" } else { "incomplete" }
+            );
+            (Some(payload), clause)
         } else {
-            None
+            (None, "lineage: omitted".to_string())
         };
 
+        // Round 120 (PR-78ao): top-level redacted summary —
+        // mirrors the R111-R119 discovery-summary pattern on
+        // the drill-down read tool. Summary NEVER reads
+        // `content`, `metadata`, `native_id`, `native_path`,
+        // or `raw_hash` so an agent can ingest it without
+        // dragging record body into its context.
+        let instance_label = match &r.source.instance {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => "default".to_string(),
+        };
+        let active_model_label = record_summary
+            .active_model
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
+        let summary = format!(
+            "record returned; source: {}:{}; kind: {}; scope: {}; chunks: {}/{}; active model: {}; user_tags: {}; {}.",
+            r.source.adapter,
+            instance_label,
+            format!("{:?}", r.kind).to_lowercase(),
+            format!("{:?}", r.scope).to_lowercase(),
+            record_summary.chunk_count,
+            record_summary.embedded_chunk_count,
+            active_model_label,
+            user_tags.len(),
+            lineage_clause,
+        );
+
         Ok(json!({
+            "summary": summary,
             "record_id": r.id.0,
             // trace_id alias mirrors the search wire format — agents
             // can pass it straight back to `trace_provenance`.
@@ -1153,14 +1196,14 @@ impl AnamnesisServer {
             // to ensure vector retrieval will hit this record can
             // assert `chunk_count == embedded_chunk_count` and
             // `active_model` matches expectations.
-            "chunk_count": summary.chunk_count,
-            "embedded_chunk_count": summary.embedded_chunk_count,
-            "active_model": summary.active_model,
+            "chunk_count": record_summary.chunk_count,
+            "embedded_chunk_count": record_summary.embedded_chunk_count,
+            "active_model": record_summary.active_model,
             // Source-vector breadcrumb only. We do NOT return the
             // vector itself — source embeddings are provenance, not
             // retrieval (BLUEPRINT §6.6.1).
-            "source_embedding_model": summary.source_embedding_model,
-            "source_embedding_dim": summary.source_embedding_dim,
+            "source_embedding_model": record_summary.source_embedding_model,
+            "source_embedding_dim": record_summary.source_embedding_dim,
             // Round 78: user-tag overlay. Distinct from `tags`
             // (which is adapter-derived and gets overwritten on
             // re-import). Empty array is the common case.
