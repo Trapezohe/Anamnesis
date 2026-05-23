@@ -1732,6 +1732,59 @@ fn doctor_filter_source_narrows_output() {
 
 // ─── Round-110 PR-78af: doctor --source multi-value OR ────────────
 
+/// Round 114: `--instance a,b` is the OR filter. Combined
+/// with `--source` it's AND between the two OR-sets:
+/// `source ∈ [a,b] && instance ∈ [c,d]`. mem0:prod and
+/// mem0:dev survive; mem0:qa drops.
+#[test]
+fn doctor_instance_multi_value_or_narrows_to_listed_instances() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    for inst in ["prod", "dev", "qa"] {
+        cli()
+            .env("ANAMNESIS_DATA_DIR", dir.path())
+            .args([
+                "source",
+                "add",
+                "mem0",
+                "--instance",
+                inst,
+                "--path",
+                &format!("/tmp/mem0-{inst}.sqlite"),
+            ])
+            .assert()
+            .success();
+    }
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "doctor",
+            "--source",
+            "mem0",
+            "--instance",
+            "prod, dev",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = payload.as_array().unwrap();
+    let instances: std::collections::HashSet<&str> = arr
+        .iter()
+        .map(|r| r["instance"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        instances,
+        ["prod", "dev"].into_iter().collect(),
+        "qa must drop under multi-instance OR: got {arr:?}"
+    );
+}
+
 /// `doctor --source a,b` is the OR filter: both adapter rows
 /// survive, the third drops. Whitespace + empty tokens
 /// normalised via core's `parse_csv_filter`. Symmetric with

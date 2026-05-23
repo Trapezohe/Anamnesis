@@ -1492,18 +1492,19 @@ impl AnamnesisServer {
     /// walk the user's home dir, and the MCP boundary should not be a
     /// path-arbitrary probe surface (see `import_source` rationale).
     async fn tool_doctor(&self, args: Value) -> Result<Value, String> {
-        // Round 110 (PR-78af): `source` now accepts a comma-
+        // Round 110 (PR-78af): `source` accepts a comma-
         // separated OR list (`"mem0,claude-code"`) via core's
         // shared `parse_csv_filter`, symmetric with R102
-        // audit-tail / R103 list-sources / R104 dedupe. Empty
-        // parse = no filter (back-compat). `instance` stays
-        // single-value AND-combined with the adapter set.
+        // audit-tail / R103 list-sources / R104 dedupe.
+        // Round 114 (PR-78aj): `instance` now also accepts a
+        // comma-separated OR list, symmetric with `source`.
+        // Combined as AND: `source ∈ [a,b] && instance ∈ [c,d]`.
+        // Empty parse on either dimension = no filter on that
+        // dimension.
         let filter_source_raw = args.get("source").and_then(|v| v.as_str());
         let sources = anamnesis_core::parse_csv_filter(filter_source_raw);
-        let filter_instance = args
-            .get("instance")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+        let filter_instance_raw = args.get("instance").and_then(|v| v.as_str());
+        let instances = anamnesis_core::parse_csv_filter(filter_instance_raw);
         let stale_threshold = match args.get("since").and_then(|v| v.as_str()) {
             Some(spec) => Some(parse_doctor_since(spec)?),
             None => None,
@@ -1528,10 +1529,8 @@ impl AnamnesisServer {
             if !sources.is_empty() && !sources.iter().any(|s| s == &src.adapter) {
                 continue;
             }
-            if let Some(inst) = filter_instance.as_deref() {
-                if src.instance != inst {
-                    continue;
-                }
+            if !instances.is_empty() && !instances.iter().any(|i| i == &src.instance) {
+                continue;
             }
             let health = self.run_adapter_health_for_source(src).await;
             let stale = stale_threshold.map(|t| match src.last_import_at {
@@ -3175,7 +3174,7 @@ fn tools_list_payload_all() -> Value {
                         },
                         "instance": {
                             "type": "string",
-                            "description": "Instance discriminator. Meaningful only when `source` is also set."
+                            "description": "Instance discriminator. Single value (`\"prod\"`) is exact match; comma-separated list (`\"prod,dev\"`) is OR (R114) — any listed instance matches. Combines as AND with `source` (`source ∈ [a,b] && instance ∈ [c,d]`). Meaningful only when `source` is also set."
                         },
                         "since": {
                             "type": "string",
@@ -5493,6 +5492,70 @@ mod tests {
             adapters,
             ["claude-code", "mem0"].into_iter().collect(),
             "codex must drop under multi-source OR: got {sources:?}"
+        );
+    }
+
+    /// Round 114 (PR-78aj): `instance` accepts a comma-
+    /// separated OR list, symmetric with R110's `source`. With
+    /// 3 mem0 instances (prod/dev/qa), `instance: "prod,dev"`
+    /// survives 2 rows and drops qa. Schema description must
+    /// also advertise the multi-value capability.
+    #[tokio::test]
+    async fn doctor_instance_multi_value_or_filters_matching_instances() {
+        let store = Store::open_in_memory().unwrap();
+        for inst in ["prod", "dev", "qa"] {
+            store
+                .register_source(
+                    "mem0",
+                    Some(inst),
+                    Some(&format!("/nonexistent/mem0-{inst}")),
+                    None,
+                )
+                .unwrap();
+        }
+        let s = AnamnesisServer::new(store, None, std::env::temp_dir());
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({"name": "doctor", "arguments": {
+                    "source": "mem0",
+                    "instance": "prod, dev",
+                }}),
+            ))
+            .await;
+        let sources = resp.result.unwrap()["structuredContent"]["sources"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let instances: std::collections::BTreeSet<&str> = sources
+            .iter()
+            .map(|s| s["instance"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            instances,
+            ["dev", "prod"].into_iter().collect(),
+            "qa must drop under multi-instance OR: got {sources:?}"
+        );
+
+        // Schema must advertise the multi-value capability.
+        let tools = s
+            .handle(req("tools/list", Value::Null))
+            .await
+            .result
+            .unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let doctor = tools
+            .iter()
+            .find(|t| t["name"] == "doctor")
+            .expect("doctor in tools/list");
+        let inst_desc = doctor["inputSchema"]["properties"]["instance"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            inst_desc.contains("comma-separated"),
+            "doctor.instance description must mention multi-value: {inst_desc}"
         );
     }
 
