@@ -635,14 +635,18 @@ pub struct DuplicateRawHashGroup {
 /// [`anamnesis_core::parse_csv_filter`] inside the helpers, so
 /// the external shape stays `Option<String>` (no API break).
 /// `None` and `Some("")` continue to mean "no source filter".
+///
+/// Round 115: `instance` follows the same single-value-or-CSV
+/// shape (`"prod"` / `"prod,dev"`). Empty tokens are dropped;
+/// an empty parse means "no instance filter".
 #[derive(Debug, Clone, Default)]
 pub struct DuplicateRawHashFilter {
     /// Adapter id (e.g. `"mem0"`) or comma-separated OR list
     /// (`"mem0,claude-code"`) — see the struct doc. `None` or
     /// empty string matches any adapter.
     pub source: Option<String>,
-    /// Instance discriminator. Only meaningful when `source` is
-    /// also set. `None` matches any instance.
+    /// Instance discriminator or comma-separated OR list. `None`
+    /// or empty string matches any instance.
     pub instance: Option<String>,
     /// Max groups to return. Clamped by the store.
     pub limit: u32,
@@ -1796,14 +1800,17 @@ impl Store {
         // (`"mem0"`) and a comma-separated OR list
         // (`"mem0,claude-code"`) both work. Empty parse = no
         // source filter (back-compat with R80).
+        // Round 115: `filter.instance` now uses the same parser
+        // and emits `instance IN (?, ?, ...)` when non-empty.
         let sources = anamnesis_core::parse_csv_filter(filter.source.as_deref());
+        let instances = anamnesis_core::parse_csv_filter(filter.instance.as_deref());
         let mut sql = String::from(
             "SELECT raw_hash, COUNT(*) AS n, MAX(created_at) AS newest \
              FROM records \
              WHERE raw_hash IN (",
         );
         let mut eligible_params: Vec<rusqlite::types::Value> = Vec::new();
-        if !sources.is_empty() || filter.instance.is_some() {
+        if !sources.is_empty() || !instances.is_empty() {
             sql.push_str("SELECT raw_hash FROM records WHERE 1=1");
             if !sources.is_empty() {
                 // `adapter IN (?, ?, ...)` — N placeholders
@@ -1816,9 +1823,14 @@ impl Store {
                     eligible_params.push(rusqlite::types::Value::Text(s.clone()));
                 }
             }
-            if let Some(i) = &filter.instance {
-                sql.push_str(" AND instance = ?");
-                eligible_params.push(rusqlite::types::Value::Text(i.clone()));
+            if !instances.is_empty() {
+                let placeholders = std::iter::repeat_n("?", instances.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql.push_str(&format!(" AND instance IN ({placeholders})"));
+                for i in &instances {
+                    eligible_params.push(rusqlite::types::Value::Text(i.clone()));
+                }
             }
         } else {
             // No filter: trivially "all hashes are eligible."
@@ -1931,14 +1943,16 @@ impl Store {
         // honour the same eligibility rule as the list, so we
         // emit `adapter IN (?, ?, ...)` when the parsed token
         // list is non-empty.
+        // Round 115: same rule for multi-instance OR.
         let sources = anamnesis_core::parse_csv_filter(filter.source.as_deref());
+        let instances = anamnesis_core::parse_csv_filter(filter.instance.as_deref());
         let mut sql = String::from(
             "SELECT raw_hash, COUNT(*) AS n \
              FROM records \
              WHERE raw_hash IN (",
         );
         let mut bound: Vec<rusqlite::types::Value> = Vec::new();
-        if !sources.is_empty() || filter.instance.is_some() {
+        if !sources.is_empty() || !instances.is_empty() {
             sql.push_str("SELECT raw_hash FROM records WHERE 1=1");
             if !sources.is_empty() {
                 let placeholders = std::iter::repeat_n("?", sources.len())
@@ -1949,9 +1963,14 @@ impl Store {
                     bound.push(rusqlite::types::Value::Text(s.clone()));
                 }
             }
-            if let Some(i) = &filter.instance {
-                sql.push_str(" AND instance = ?");
-                bound.push(rusqlite::types::Value::Text(i.clone()));
+            if !instances.is_empty() {
+                let placeholders = std::iter::repeat_n("?", instances.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql.push_str(&format!(" AND instance IN ({placeholders})"));
+                for i in &instances {
+                    bound.push(rusqlite::types::Value::Text(i.clone()));
+                }
             }
         } else {
             sql.push_str("SELECT raw_hash FROM records");
@@ -6633,6 +6652,27 @@ mod tests {
         r.id
     }
 
+    fn seed_with_raw_hash_instance(
+        store: &Store,
+        adapter: &str,
+        native: &str,
+        instance: &str,
+        hash: &str,
+    ) -> RecordId {
+        let mut r = make_record(
+            adapter,
+            native,
+            &format!("{adapter}:{instance}|{native} content"),
+            Kind::Fact,
+        );
+        r.source.instance = Some(instance.into());
+        r.id = RecordId::from_parts(adapter, Some(instance), native);
+        r.provenance.raw_hash = hash.into();
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        r.id
+    }
+
     /// The report must skip raw_hashes with only one record
     /// (singletons are not duplicates) and include only live
     /// records (`forget` removes the row from `records`).
@@ -6950,6 +6990,67 @@ mod tests {
         assert!(
             counts.by_source.iter().all(|b| b.adapter != "codex"),
             "codex must be excluded from by_source: {:?}",
+            counts.by_source
+        );
+    }
+
+    // ─── Round-115: dedupe instance multi-value OR ───────────────────
+
+    /// `instance = "prod,dev"` is an OR filter, and mixed groups
+    /// still return their full sibling set. `qa` is only visible
+    /// when it shares a hash with a matching instance.
+    #[test]
+    fn list_duplicate_raw_hashes_filtered_multi_instance_or_keeps_eligible_groups() {
+        let store = Store::open_in_memory().unwrap();
+        seed_with_raw_hash_instance(&store, "mem0", "p1", "prod", "h-prod");
+        seed_with_raw_hash_instance(&store, "mem0", "p2", "prod", "h-prod");
+        seed_with_raw_hash_instance(&store, "mem0", "d1", "dev", "h-dev");
+        seed_with_raw_hash_instance(&store, "mem0", "q1", "qa", "h-dev");
+        seed_with_raw_hash_instance(&store, "mem0", "q2", "qa", "h-qa");
+        seed_with_raw_hash_instance(&store, "mem0", "q3", "qa", "h-qa");
+
+        let groups = store
+            .list_duplicate_raw_hashes_filtered(&DuplicateRawHashFilter {
+                source: Some("mem0".into()),
+                instance: Some("prod, dev".into()),
+                limit: 20,
+            })
+            .unwrap();
+        let hashes: std::collections::BTreeSet<_> =
+            groups.iter().map(|g| g.raw_hash.as_str()).collect();
+        assert_eq!(hashes, ["h-dev", "h-prod"].into_iter().collect());
+        let h_dev = groups.iter().find(|g| g.raw_hash == "h-dev").unwrap();
+        assert!(
+            h_dev.records.iter().any(|r| r.instance == "qa"),
+            "non-matching sibling must stay visible"
+        );
+    }
+
+    #[test]
+    fn count_duplicate_raw_hashes_by_source_multi_instance_or_respects_same_filter() {
+        let store = Store::open_in_memory().unwrap();
+        seed_with_raw_hash_instance(&store, "mem0", "p1", "prod", "h-prod");
+        seed_with_raw_hash_instance(&store, "mem0", "p2", "prod", "h-prod");
+        seed_with_raw_hash_instance(&store, "mem0", "d1", "dev", "h-dev");
+        seed_with_raw_hash_instance(&store, "mem0", "q1", "qa", "h-dev");
+        seed_with_raw_hash_instance(&store, "mem0", "q2", "qa", "h-qa");
+        seed_with_raw_hash_instance(&store, "mem0", "q3", "qa", "h-qa");
+
+        let counts = store
+            .count_duplicate_raw_hashes_by_source(&DuplicateRawHashFilter {
+                source: Some("mem0".into()),
+                instance: Some("prod,dev".into()),
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(counts.total_groups, 2);
+        assert_eq!(counts.total_records, 4);
+        assert!(
+            counts
+                .by_source
+                .iter()
+                .any(|b| b.instance == "qa" && b.duplicate_record_count == 1),
+            "qa sibling from h-dev remains in whole-group counts: {:?}",
             counts.by_source
         );
     }

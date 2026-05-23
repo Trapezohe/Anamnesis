@@ -407,6 +407,50 @@ fn build_bundle_three_groups() -> (AnamnesisServer, tempfile::TempDir) {
     (server, data_dir)
 }
 
+fn build_bundle_instance_groups() -> (AnamnesisServer, tempfile::TempDir) {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let make = |instance: &str, native: &str, hash: &str| AnamnesisRecord {
+        id: RecordId::from_parts("mem0", Some(instance), native),
+        source: SourceDescriptor {
+            adapter: "mem0".into(),
+            instance: Some(instance.into()),
+            version: "0".into(),
+        },
+        content: format!("mem0:{instance}|{native} content"),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/mem0/{instance}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: hash.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        make("prod", "p1", "h-prod"),
+        make("prod", "p2", "h-prod"),
+        make("dev", "d1", "h-dev"),
+        make("qa", "q1", "h-dev"),
+        make("qa", "q2", "h-qa"),
+        make("qa", "q3", "h-qa"),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+    let server =
+        AnamnesisServer::new(store, None, data_dir.path().to_path_buf()).with_admin_tools(false);
+    (server, data_dir)
+}
+
 /// `source: "mem0,claude-code"` is the OR filter on MCP —
 /// mem0 + claude-code groups survive, codex drops. Symmetric
 /// with R103 list_sources / R102 audit_tail.
@@ -466,10 +510,59 @@ async fn dedupe_source_multi_value_or_counts_respect_filter() {
     );
 }
 
-/// Schema advertises the multi-value `source` capability so MCP
+// ─── Round-115 PR-78ak: dedupe instance multi-value OR ──────────────
+
+#[tokio::test]
+async fn dedupe_instance_multi_value_or_filters_matching_groups() {
+    let (server, _data) = build_bundle_instance_groups();
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"source": "mem0", "instance": "prod,dev", "include_sensitive": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 2);
+    let hashes: std::collections::BTreeSet<&str> = payload["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["raw_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(hashes, ["h-dev", "h-prod"].into_iter().collect());
+    assert_eq!(payload["filter"]["instance"], "prod,dev");
+}
+
+#[tokio::test]
+async fn dedupe_instance_multi_value_or_counts_respect_filter() {
+    let (server, _data) = build_bundle_instance_groups();
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"source": "mem0", "instance": "prod,dev", "include_counts": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    let counts = &payload["counts"];
+    assert_eq!(counts["total_groups"], 2);
+    assert_eq!(counts["total_records"], 4);
+    let has_qa_sibling = counts["by_source"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["instance"] == "qa" && b["duplicate_record_count"] == 1);
+    assert!(
+        has_qa_sibling,
+        "whole-group counts must keep qa sibling: {counts}"
+    );
+}
+
+/// Schema advertises the multi-value filter capabilities so MCP
 /// clients can surface it in autocomplete / docs.
 #[tokio::test]
-async fn dedupe_tools_list_schema_advertises_multi_value_source() {
+async fn dedupe_tools_list_schema_advertises_multi_value_filters() {
     let (server, _data) = build_bundle(false);
     let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
         jsonrpc: "2.0".into(),
@@ -489,6 +582,13 @@ async fn dedupe_tools_list_schema_advertises_multi_value_source() {
     assert!(
         source_desc.contains("comma-separated"),
         "dedupe.source description must mention multi-value: {source_desc}"
+    );
+    let instance_desc = dedupe["inputSchema"]["properties"]["instance"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        instance_desc.contains("comma-separated"),
+        "dedupe.instance description must mention multi-value: {instance_desc}"
     );
 }
 

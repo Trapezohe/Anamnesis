@@ -169,6 +169,11 @@ async fn list_sources_tools_list_schema_advertises_filter_args() {
         source_desc.contains("comma-separated"),
         "list_sources.source description must mention multi-value: {source_desc}"
     );
+    let instance_desc = props["instance"]["description"].as_str().unwrap();
+    assert!(
+        instance_desc.contains("comma-separated"),
+        "list_sources.instance description must mention multi-value: {instance_desc}"
+    );
 }
 
 // ─── Round-103 PR-78y: list_sources source multi-value OR ───────────
@@ -230,4 +235,30 @@ async fn list_sources_source_multi_value_with_instance_is_and_filter() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0]["adapter"], "mem0");
     assert_eq!(sources[0]["instance"], "dev");
+}
+
+/// Round 115: `instance: "prod,dev"` is OR on the source list
+/// presentation path. Top-level stats still reflect the whole
+/// store, same as the earlier `source` filter.
+#[tokio::test]
+async fn list_sources_instance_multi_value_or_filters_matching_set() {
+    let (server, _dir, store) = build_bundle();
+    seed(&store, "mem0", Some("prod"), "a");
+    seed(&store, "mem0", Some("dev"), "b");
+    seed(&store, "mem0", Some("qa"), "c");
+
+    let resp = server
+        .handle(tool_call(
+            "list_sources",
+            json!({"source": "mem0", "instance": "prod, dev"}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let sources = payload["sources"].as_array().unwrap();
+    let instances: std::collections::BTreeSet<&str> = sources
+        .iter()
+        .map(|s| s["instance"].as_str().unwrap())
+        .collect();
+    assert_eq!(instances, ["dev", "prod"].into_iter().collect());
+    assert_eq!(payload["stats"]["records"], 3);
 }

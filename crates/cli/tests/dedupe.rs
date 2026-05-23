@@ -405,6 +405,53 @@ fn seed_three_groups(data_dir: &std::path::Path) {
     }
 }
 
+fn seed_instance_groups(data_dir: &std::path::Path) {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let db = data_dir.join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let make = |instance: &str, native: &str, hash: &str| AnamnesisRecord {
+        id: RecordId::from_parts("mem0", Some(instance), native),
+        source: SourceDescriptor {
+            adapter: "mem0".into(),
+            instance: Some(instance.into()),
+            version: "0".into(),
+        },
+        content: format!("mem0:{instance}|{native} content"),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/mem0/{instance}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: hash.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        make("prod", "p1", "h-prod"),
+        make("prod", "p2", "h-prod"),
+        make("dev", "d1", "h-dev"),
+        make("qa", "q1", "h-dev"),
+        make("qa", "q2", "h-qa"),
+        make("qa", "q3", "h-qa"),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+}
+
 /// `--source mem0,claude-code` is the OR filter: both
 /// adapter-specific groups survive, the codex group drops.
 /// `filter.source` echoes the raw input string (R97/R80 wire
@@ -487,6 +534,72 @@ fn dedupe_source_multi_value_or_counts_respect_filter() {
     assert!(
         !adapters.contains("codex"),
         "codex must be excluded from by_source under filter: {adapters:?}"
+    );
+}
+
+// ─── Round-115 PR-78ak: dedupe --instance multi-value OR ────────────
+
+#[test]
+fn dedupe_instance_multi_value_or_narrows_to_listed_instances() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_instance_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "dedupe",
+            "--source",
+            "mem0",
+            "--instance",
+            "prod, , dev",
+            "--json",
+            "--include-sensitive",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["count"], 2);
+    let hashes: std::collections::BTreeSet<&str> = v["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["raw_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(hashes, ["h-dev", "h-prod"].into_iter().collect());
+    assert_eq!(v["filter"]["instance"], "prod, , dev");
+}
+
+#[test]
+fn dedupe_instance_multi_value_or_counts_respect_filter() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_instance_groups(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "dedupe",
+            "--source",
+            "mem0",
+            "--instance",
+            "prod,dev",
+            "--json",
+            "--include-counts",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counts"]["total_groups"], 2);
+    assert_eq!(v["counts"]["total_records"], 4);
+    let has_qa_sibling = v["counts"]["by_source"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["instance"] == "qa" && b["duplicate_record_count"] == 1);
+    assert!(
+        has_qa_sibling,
+        "whole-group counts must keep qa sibling: {v}"
     );
 }
 

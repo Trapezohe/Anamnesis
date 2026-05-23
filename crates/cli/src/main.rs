@@ -235,8 +235,9 @@ enum Command {
         #[arg(long)]
         source: Option<String>,
         /// Scope to duplicate groups that include ≥1 record from
-        /// this `(adapter, instance)`. Only meaningful with
-        /// `--source`.
+        /// this instance. Round 115: comma-separated list is also
+        /// accepted (`--instance prod,dev`) for an OR filter.
+        /// Combines as AND with `--source` when both are set.
         #[arg(long)]
         instance: Option<String>,
         /// Max number of groups to return. Default 20, cap 100.
@@ -667,7 +668,10 @@ enum SourceCmd {
         #[arg(long)]
         source: Option<String>,
         /// Round 99: restrict to one instance discriminator.
-        /// Only meaningful when `--source` is also set.
+        ///
+        /// Round 115: comma-separated list is also accepted
+        /// (`--instance prod,dev`) for an OR filter. Combines as
+        /// AND with `--source` when both are set.
         #[arg(long)]
         instance: Option<String>,
         /// Round 88: emit JSON instead of the human table.
@@ -1715,17 +1719,17 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             // OR (`--source mem0,claude-code`) via core's shared
             // `parse_csv_filter`, symmetric with R102 audit-tail
             // multi-value. Empty parse = no filter (back-compat).
-            // `--instance` stays single-value AND-combined with the
-            // adapter set.
+            // Round 115: `--instance` now follows the same
+            // comma-separated OR parser, symmetric with doctor.
             let rows = store.list_sources_with_counts()?;
             let sources = anamnesis_core::parse_csv_filter(source.as_deref());
-            let filter_applied = !sources.is_empty() || instance.is_some();
+            let instances = anamnesis_core::parse_csv_filter(instance.as_deref());
+            let filter_applied = !sources.is_empty() || !instances.is_empty();
             let rows: Vec<_> = rows
                 .into_iter()
                 .filter(|r| sources.is_empty() || sources.iter().any(|s| s == &r.source.adapter))
-                .filter(|r| match instance.as_deref() {
-                    Some(i) => r.source.instance == i,
-                    None => true,
+                .filter(|r| {
+                    instances.is_empty() || instances.iter().any(|i| i == &r.source.instance)
                 })
                 .collect();
             if json {

@@ -1104,15 +1104,13 @@ impl AnamnesisServer {
         // Round 103 (PR-78y): `source` now also accepts a
         // comma-separated OR list (`"mem0,claude-code"`) via
         // core's shared `parse_csv_filter`, symmetric with R102
-        // audit-tail multi-value. Empty parse = no filter
-        // (back-compat with R96). `instance` stays single-value
-        // AND-combined with the adapter set.
+        // audit-tail multi-value. Round 115: `instance` now uses
+        // the same comma-separated OR parser, symmetric with
+        // doctor. Empty parse = no filter on that dimension.
         let source_raw = args.get("source").and_then(|v| v.as_str());
         let sources = anamnesis_core::parse_csv_filter(source_raw);
-        let instance_filter = args
-            .get("instance")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+        let instance_raw = args.get("instance").and_then(|v| v.as_str());
+        let instances = anamnesis_core::parse_csv_filter(instance_raw);
 
         let stats = store.stats().map_err(|e| format!("stats: {e}"))?;
         // Round-9: per-source counts + last_import_at let an agent
@@ -1126,10 +1124,7 @@ impl AnamnesisServer {
         let filtered: Vec<&anamnesis_store::SourceWithCounts> = rows
             .iter()
             .filter(|r| sources.is_empty() || sources.iter().any(|s| s == &r.source.adapter))
-            .filter(|r| match instance_filter {
-                Some(i) => r.source.instance == i,
-                None => true,
-            })
+            .filter(|r| instances.is_empty() || instances.iter().any(|i| i == &r.source.instance))
             .collect();
         Ok(json!({
             "sources": filtered.iter().map(|r| json!({
@@ -3058,8 +3053,8 @@ fn tools_list_payload_all() -> Value {
                                 records with ≥1 user_tag), `last_import_at`, and `location`. \
                                 Round 96: optional `source` / `instance` narrow the `sources[]` array; \
                                 the top-level `stats` block keeps reporting the whole store so existing \
-                                consumers reading `stats.records` are unaffected. Round 103: `source` \
-                                also accepts a comma-separated OR list — see the arg description.",
+                                consumers reading `stats.records` are unaffected. Round 103/115: `source` \
+                                and `instance` also accept comma-separated OR lists — see the arg descriptions.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -3069,7 +3064,7 @@ fn tools_list_payload_all() -> Value {
                         },
                         "instance": {
                             "type": "string",
-                            "description": "Round 96: restrict the sources array to one instance discriminator. Only meaningful when `source` is also set."
+                            "description": "Restrict the sources array to one or more instance discriminators. Single value (`\"prod\"`) is exact match (R96); comma-separated list (`\"prod,dev\"`) is OR (R115) — rows from either instance come back. Tokens are trimmed and empty tokens dropped. Combines as AND with `source` when both are set."
                         }
                     }
                 }
@@ -3321,7 +3316,7 @@ fn tools_list_payload_all() -> Value {
                         },
                         "instance": {
                             "type": "string",
-                            "description": "Instance discriminator. Only meaningful when `source` is also set."
+                            "description": "Restrict duplicate groups to those containing ≥1 record from one or more instances. Single value (`\"prod\"`) is exact match (R80); comma-separated list (`\"prod,dev\"`) is OR (R115) — groups whose members include at least one record from any listed instance stay eligible. Tokens trimmed and empty tokens dropped. Combines as AND with `source` when both are set."
                         },
                         "limit": {
                             "type": "integer",

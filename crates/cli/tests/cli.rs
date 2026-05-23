@@ -2299,6 +2299,55 @@ fn source_list_source_multi_value_or_narrows_json_to_matching_adapters() {
     );
 }
 
+/// Round 115: `--instance prod,dev` is the OR filter on the
+/// presentation-only `source list` path. Combined with `--source`,
+/// rows match `adapter ∈ source-set && instance ∈ instance-set`.
+#[test]
+fn source_list_instance_multi_value_or_narrows_json_to_matching_instances() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    for (instance, path) in [("prod", "/p"), ("dev", "/d"), ("qa", "/q")] {
+        cli()
+            .env("ANAMNESIS_DATA_DIR", dir.path())
+            .args([
+                "source",
+                "add",
+                "mem0",
+                "--instance",
+                instance,
+                "--path",
+                path,
+            ])
+            .assert()
+            .success();
+    }
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "source",
+            "list",
+            "--source",
+            "mem0",
+            "--instance",
+            "prod, , dev",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = v["sources"].as_array().unwrap();
+    let instances: std::collections::BTreeSet<&str> = sources
+        .iter()
+        .map(|s| s["instance"].as_str().unwrap())
+        .collect();
+    assert_eq!(instances, ["dev", "prod"].into_iter().collect());
+}
+
 /// Human output: filter that matches nothing prints
 /// "no sources matched filter" (NOT the empty-registry
 /// "no sources registered" prose), so the operator can
