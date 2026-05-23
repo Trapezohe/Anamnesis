@@ -2858,7 +2858,23 @@ impl AnamnesisServer {
              ---\n{summary_line}{bullets}",
         );
 
+        // Round 122 (PR-78aq): response-level redacted
+        // `summary`. Mirrors R111 prompts/list summary + the
+        // R111-R121 read-tool summary pattern but on a prompt
+        // response. NEVER includes the actual user_tag value
+        // (case-normalisation already happened in the recall
+        // path) or any record content/native_id/path/hash.
+        let user_tag_state = if user_tag.is_some() {
+            "present"
+        } else {
+            "absent"
+        };
+        let response_summary = format!(
+            "prompt: summarize_my_preferences; messages: 1; bullets: {bullet_count}; limit: {limit}; user_tag filter: {user_tag_state}.",
+        );
+
         Ok(json!({
+            "summary": response_summary,
             "description": "Summarize the user's stable preferences from Anamnesis records.",
             "messages": [{
                 "role": "user",
@@ -3008,7 +3024,47 @@ impl AnamnesisServer {
              contradict or reinforce what the user is asking. Don't repeat verbatim; weave them \
              into your reply where useful.\n\n---\n{summary_line}{bullets}",
         );
+
+        // Round 122 (PR-78aq): response-level redacted
+        // `summary` mirroring R111-R121 read-tool pattern.
+        // `query: redacted` is explicit — the renderer NEVER
+        // touches the `text` arg or any snippet/native field.
+        let source_state = if filter.source.is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        let instance_state = if filter.instance.is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        let kind_state = if filter.kind.is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        let scope_state = if filter.scope.is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        let user_tag_state = if filter.user_tag.is_some() {
+            "present"
+        } else {
+            "absent"
+        };
+        let explain_state = if explain_requested {
+            "included"
+        } else {
+            "omitted"
+        };
+        let response_summary = format!(
+            "prompt: find_related; messages: 1; bullets: {bullet_count}; limit: {limit}; query: redacted; source: {source_state}; instance: {instance_state}; kind: {kind_state}; scope: {scope_state}; user_tag filter: {user_tag_state}; explain: {explain_state}.",
+        );
+
         Ok(json!({
+            "summary": response_summary,
             "description": "Inject the top-N related Anamnesis memories into the LLM's context.",
             "messages": [{
                 "role": "user",
@@ -5207,6 +5263,117 @@ mod tests {
             .filter_map(|p| p["name"].as_str())
             .collect();
         assert_eq!(names.len(), 2);
+    }
+
+    /// Round 122 (PR-78aq): `prompts/get` for
+    /// `summarize_my_preferences` carries a top-level redacted
+    /// `summary`. Privacy: summary must NEVER include record
+    /// content/canary or the actual user_tag value.
+    #[tokio::test]
+    async fn prompt_summarize_preferences_get_carries_top_level_summary() {
+        let r1 = make_record(
+            "claude-code",
+            "p1",
+            "User prefers thorough error handling SUMMARIZE_PREF_CANARY",
+            1700000000,
+        );
+        let s = server_with_records(&[r1]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({"name": "summarize_my_preferences", "arguments": {"limit": 10, "user_tag": "Keep"}}),
+            ))
+            .await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"]
+            .as_str()
+            .expect("summarize_my_preferences must carry response-level `summary`");
+
+        assert!(
+            summary.contains("prompt: summarize_my_preferences"),
+            "summary must name the prompt: {summary}"
+        );
+        assert!(
+            summary.contains("messages: 1"),
+            "summary must declare message count: {summary}"
+        );
+        assert!(
+            summary.contains("limit: 10"),
+            "summary must surface the limit: {summary}"
+        );
+        assert!(
+            summary.contains("user_tag filter: present"),
+            "summary must report user_tag filter state: {summary}"
+        );
+        // Privacy canaries:
+        assert!(
+            !summary.contains("SUMMARIZE_PREF_CANARY"),
+            "summary must not leak record content: {summary}"
+        );
+        assert!(
+            !summary.contains("Keep") && !summary.contains("keep"),
+            "summary must not leak the user_tag value: {summary}"
+        );
+    }
+
+    /// Round 122 (PR-78aq): `prompts/get` for `find_related`
+    /// carries a top-level redacted `summary` with
+    /// `query: redacted` explicit. Summary must not echo the
+    /// `text` arg or any snippet.
+    #[tokio::test]
+    async fn prompt_find_related_get_carries_top_level_summary() {
+        let r = make_record(
+            "claude-code",
+            "x",
+            "marker phrase FIND_RELATED_CANARY content snippet",
+            1700000000,
+        );
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "prompts/get",
+                json!({
+                    "name": "find_related",
+                    "arguments": {
+                        "text": "FIND_RELATED_CANARY",
+                        "limit": 3,
+                        "source": "claude-code",
+                        "explain": true,
+                    }
+                }),
+            ))
+            .await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"]
+            .as_str()
+            .expect("find_related must carry response-level `summary`");
+
+        assert!(
+            summary.contains("prompt: find_related"),
+            "summary must name the prompt: {summary}"
+        );
+        assert!(
+            summary.contains("query: redacted"),
+            "summary must explicitly declare query redaction: {summary}"
+        );
+        assert!(
+            summary.contains("limit: 3"),
+            "summary must surface the limit: {summary}"
+        );
+        assert!(
+            summary.contains("source: set"),
+            "summary must surface source filter state: {summary}"
+        );
+        assert!(
+            summary.contains("explain: included"),
+            "summary must surface explain flag: {summary}"
+        );
+        // Privacy canaries — must not echo the query or any
+        // snippet text.
+        assert!(
+            !summary.contains("FIND_RELATED_CANARY"),
+            "summary must not leak query/snippet: {summary}"
+        );
     }
 
     #[tokio::test]
