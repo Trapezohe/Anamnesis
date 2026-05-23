@@ -1397,7 +1397,12 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     let db = db_path(data_dir);
     if !db.exists() {
         if json {
+            // Round 123 (PR-78ar): top-level `summary` mirrors
+            // the MCP discovery-summary pattern (R111-R122) on
+            // the operator-facing status surface. NEVER reads
+            // `data_dir`/`db_path` so it stays path-free.
             let payload = serde_json::json!({
+                "summary": "database not initialized; run `anamnesis init`.",
                 "initialized": false,
                 "data_dir": data_dir.display().to_string(),
                 "db_path": db.display().to_string(),
@@ -1421,7 +1426,42 @@ fn cmd_status(data_dir: &std::path::Path, json: bool) -> Result<()> {
     let per_source = store.list_sources_with_counts()?;
     let now = chrono::Utc::now().timestamp();
     if json {
+        // Round 123 (PR-78ar): redacted top-level `summary` +
+        // structured `source_summary` rollup. Mirrors the
+        // MCP discovery-summary pattern (R111-R122) on the
+        // operator side. Summary NEVER reads `location`,
+        // `data_dir`, recent import error text/path, or any
+        // record content.
+        let mut fresh = 0u64;
+        let mut stale = 0u64;
+        let mut never_imported = 0u64;
+        for r in &per_source {
+            match source_freshness(r.source.last_import_at, now).label {
+                "fresh" => fresh += 1,
+                "stale" => stale += 1,
+                _ => never_imported += 1,
+            }
+        }
+        let active_label = active.as_deref().unwrap_or("none");
+        let summary = format!(
+            "database initialized; {} registered source(s); active model: {}; stats reflect whole store ({} records, {} chunks); freshness: {} fresh, {} stale, {} never-imported; import errors: {}.",
+            stats.sources,
+            active_label,
+            stats.records,
+            stats.chunks,
+            fresh,
+            stale,
+            never_imported,
+            stats.import_errors,
+        );
         let payload = serde_json::json!({
+            "summary": summary,
+            "source_summary": {
+                "registered": stats.sources,
+                "fresh": fresh,
+                "stale": stale,
+                "never_imported": never_imported,
+            },
             "initialized": true,
             "data_dir": data_dir.display().to_string(),
             "models_dir": models_dir(data_dir).display().to_string(),

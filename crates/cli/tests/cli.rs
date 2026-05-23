@@ -552,6 +552,108 @@ fn status_json_emits_structured_output() {
     assert!(payload["stats"]["records"].as_u64() == Some(0));
 }
 
+// ─── Round-123 PR-78ar: status --json summary enrichment ─────────
+
+/// Initialized `status --json` carries a top-level redacted
+/// `summary` AND a structured `source_summary` rollup.
+/// Mirrors MCP discovery-summary pattern (R111-R122) on the
+/// operator-facing surface.
+#[test]
+fn status_json_carries_top_level_summary_and_source_summary() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let canary_path = "/tmp/status-summary-canary-do-not-leak.sqlite";
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", canary_path])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    // Summary present + reports key state.
+    let summary = payload["summary"]
+        .as_str()
+        .expect("status --json must carry top-level `summary`");
+    assert!(
+        summary.contains("database initialized"),
+        "summary must declare initialised state: {summary}"
+    );
+    assert!(
+        summary.contains("2 registered source(s)"),
+        "summary must declare registered count: {summary}"
+    );
+    assert!(
+        summary.contains("active model:"),
+        "summary must surface active model: {summary}"
+    );
+    assert!(
+        summary.contains("freshness:"),
+        "summary must surface freshness rollup: {summary}"
+    );
+    assert!(
+        summary.contains("2 never-imported"),
+        "two unimported sources must surface in summary: {summary}"
+    );
+
+    // Privacy: canary path must NOT leak into the summary.
+    assert!(
+        !summary.contains(canary_path),
+        "summary must not echo source location/path: {summary}"
+    );
+
+    // Structured source_summary rollup matches summary text.
+    let source_summary = &payload["source_summary"];
+    assert_eq!(source_summary["registered"], 2);
+    assert_eq!(source_summary["fresh"], 0);
+    assert_eq!(source_summary["stale"], 0);
+    assert_eq!(source_summary["never_imported"], 2);
+}
+
+/// Uninitialized `status --json` (no database) still carries a
+/// top-level `summary` so scripts can branch uniformly.
+#[test]
+fn status_json_uninitialized_carries_summary() {
+    let dir = tmp_dir();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["initialized"], false);
+    let summary = payload["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("database not initialized"),
+        "summary must explain uninit state: {summary}"
+    );
+    assert!(
+        summary.contains("anamnesis init"),
+        "summary must point operator at init command: {summary}"
+    );
+    // Path-free: summary must not echo data_dir.
+    assert!(
+        !summary.contains(dir.path().to_str().unwrap()),
+        "summary must not leak data_dir: {summary}"
+    );
+}
+
 #[test]
 fn export_jsonl_round_trips_records() {
     use rusqlite::Connection;
