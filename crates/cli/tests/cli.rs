@@ -2632,6 +2632,116 @@ fn source_list_json_empty_registry_returns_structured_payload() {
     );
 }
 
+// ─── Round-124 PR-78as: source list --json summary ────────────────
+
+/// CLI `source list --json` carries a top-level summary
+/// mirroring the MCP `list_sources` summary (R117) and the
+/// CLI `status --json` summary (R123). Privacy: must not
+/// echo `location` path canary.
+#[test]
+fn source_list_json_summary_carries_top_level_line() {
+    let dir = tmp_dir();
+    let canary_path = "/tmp/source-list-summary-canary-do-not-leak.sqlite";
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", canary_path])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let summary = v["summary"]
+        .as_str()
+        .expect("source list --json must carry top-level `summary`");
+
+    assert!(
+        summary.contains("2 source(s) returned"),
+        "summary must declare returned count: {summary}"
+    );
+    assert!(
+        summary.contains("(filtered from 2 registered)"),
+        "summary must declare registered total: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: all sources"),
+        "no-filter summary must say `all sources`: {summary}"
+    );
+    assert!(
+        summary.contains("instance filter: all instances"),
+        "no-filter summary must say `all instances`: {summary}"
+    );
+    assert!(
+        summary.contains("active model:"),
+        "summary must surface active model: {summary}"
+    );
+    assert!(
+        summary.contains("0 records"),
+        "summary must surface whole-store record count: {summary}"
+    );
+    // Privacy canary: must not echo source location/path.
+    assert!(
+        !summary.contains(canary_path),
+        "summary must not echo source location/path: {summary}"
+    );
+}
+
+/// Filter reduces returned count but the registered total
+/// stays accurate.
+#[test]
+fn source_list_json_summary_reports_filtered_count_and_total() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/m"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "codex", "--path", "/tmp/cx"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "list", "--source", "mem0,claude-code", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let summary = v["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("2 source(s) returned (filtered from 3 registered)"),
+        "summary must distinguish filtered vs registered: {summary}"
+    );
+    assert!(
+        summary.contains("source filter: mem0 OR claude-code"),
+        "summary must echo OR source filter: {summary}"
+    );
+}
+
 /// With a registered source + seeded records, `source list --json`
 /// reports counts and serialises the default instance as
 /// `null` — same wire convention MCP `list_sources` uses.

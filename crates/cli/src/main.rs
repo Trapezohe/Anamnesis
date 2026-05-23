@@ -1762,6 +1762,7 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
             // Round 115: `--instance` now follows the same
             // comma-separated OR parser, symmetric with doctor.
             let rows = store.list_sources_with_counts()?;
+            let total_registered = rows.len() as u64;
             let sources = anamnesis_core::parse_csv_filter(source.as_deref());
             let instances = anamnesis_core::parse_csv_filter(instance.as_deref());
             let filter_applied = !sources.is_empty() || !instances.is_empty();
@@ -1777,7 +1778,41 @@ fn cmd_source(data_dir: &std::path::Path, sub: SourceCmd) -> Result<()> {
                 // + MCP `list_sources.sources[]`. Empty registry
                 // returns `{ "sources": [] }` (not human prose)
                 // so scripts can branch uniformly.
+                //
+                // Round 124 (PR-78as): top-level redacted summary
+                // mirrors the MCP `list_sources` summary (R117)
+                // and the CLI `status --json` summary (R123).
+                // NEVER reads `r.source.location` (path) — only
+                // counts, filter clauses, active model, and
+                // whole-store stats.
+                let stats = store.stats()?;
+                let active_model_label = store
+                    .active_model()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "none".to_string());
+                let source_clause = if sources.is_empty() {
+                    "source filter: all sources".to_string()
+                } else {
+                    format!("source filter: {}", sources.join(" OR "))
+                };
+                let instance_clause = if instances.is_empty() {
+                    "instance filter: all instances".to_string()
+                } else {
+                    format!("instance filter: {}", instances.join(" OR "))
+                };
+                let summary = format!(
+                    "{} source(s) returned (filtered from {} registered); {}; {}; active model: {}; stats reflect whole store ({} records, {} chunks).",
+                    rows.len(),
+                    total_registered,
+                    source_clause,
+                    instance_clause,
+                    active_model_label,
+                    stats.records,
+                    stats.chunks,
+                );
                 let payload = serde_json::json!({
+                    "summary": summary,
                     "sources": rows.iter().map(render_source_with_counts_json).collect::<Vec<_>>(),
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
