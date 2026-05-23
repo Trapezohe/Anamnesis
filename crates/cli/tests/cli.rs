@@ -1802,6 +1802,139 @@ fn doctor_json_shape_includes_adapter_and_ok() {
     assert!(arr[0]["detail"].is_string());
 }
 
+// ─── Round-130 PR-78ay: doctor --json-summary additive envelope ──
+
+/// `doctor --json-summary` returns an additive envelope
+/// `{ summary, filters, sources }` while preserving the
+/// existing bare-array `--json` for back-compat. Privacy:
+/// summary + filters must not echo source `location` paths.
+#[test]
+fn doctor_json_summary_envelope_reports_counts_filters_and_sources() {
+    let dir = tmp_dir();
+    let canary_path = "/tmp/anamnesis-doctor-summary-canary.sqlite";
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", canary_path])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--json-summary"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    // Envelope shape.
+    let summary = &payload["summary"];
+    assert_eq!(summary["total"], 2);
+    assert_eq!(summary["registered"], 2);
+    assert_eq!(summary["unregistered"], 0);
+
+    // Filters echoed (no filter args → empty arrays).
+    let filters = &payload["filters"];
+    assert!(filters["source"].as_array().unwrap().is_empty());
+    assert!(filters["instance"].as_array().unwrap().is_empty());
+    assert!(filters["since_seconds"].is_null());
+    assert_eq!(filters["include_unregistered"], false);
+
+    // sources[] array still present (back-compat with bare-array
+    // R64 wire shape but wrapped in envelope).
+    let sources = payload["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    let adapters: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|r| r["adapter"].as_str().unwrap())
+        .collect();
+    assert!(adapters.contains("mem0"));
+    assert!(adapters.contains("claude-code"));
+
+    // Privacy: summary/filters must NOT echo source location.
+    let envelope_no_sources = serde_json::json!({
+        "summary": payload["summary"].clone(),
+        "filters": payload["filters"].clone(),
+    });
+    let envelope_str = serde_json::to_string(&envelope_no_sources).unwrap();
+    assert!(
+        !envelope_str.contains(canary_path),
+        "summary/filters must not echo source location: {envelope_str}"
+    );
+}
+
+/// `--json` and `--json-summary` are mutually exclusive.
+#[test]
+fn doctor_json_and_json_summary_are_mutually_exclusive() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["doctor", "--json", "--json-summary"])
+        .assert()
+        .failure();
+}
+
+/// `--json-summary` echoes parsed filter tokens (post
+/// `parse_csv_filter`) — operator can confirm what the CLI
+/// understood from `--source mem0, , claude-code`.
+#[test]
+fn doctor_json_summary_filters_echo_parsed_csv_tokens() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "mem0", "--path", "/tmp/m"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["source", "add", "claude-code", "--path", "/tmp/cc"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "doctor",
+            "--json-summary",
+            "--source",
+            "mem0, , claude-code",
+            "--since",
+            "1d",
+        ])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let parsed_sources: Vec<&str> = payload["filters"]["source"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        parsed_sources,
+        vec!["mem0", "claude-code"],
+        "filters.source must reflect parse_csv_filter output"
+    );
+    assert!(payload["filters"]["since_seconds"].is_number());
+}
+
 #[test]
 fn doctor_filter_source_narrows_output() {
     let dir = tmp_dir();

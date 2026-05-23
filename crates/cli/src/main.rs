@@ -624,6 +624,16 @@ enum Command {
         /// source is stale per `--since`. No effect without `--since`.
         #[arg(long)]
         strict_staleness: bool,
+        /// Round 130: emit an enriched JSON envelope
+        /// `{ summary, filters, sources, request_metrics }`
+        /// instead of the bare-array `--json`. Mutually
+        /// exclusive with `--json`. The bare-array shape is
+        /// preserved for back-compat — scripts that pin it
+        /// keep working; scripts that want operator-facing
+        /// counts / filter echo / metrics window opt into
+        /// the envelope here.
+        #[arg(long, conflicts_with = "json")]
+        json_summary: bool,
     },
 }
 
@@ -1143,6 +1153,7 @@ async fn run() -> Result<()> {
             strict,
             since,
             strict_staleness,
+            json_summary,
         } => {
             cmd_doctor(
                 &data_dir,
@@ -1153,6 +1164,7 @@ async fn run() -> Result<()> {
                 strict,
                 since.as_deref(),
                 strict_staleness,
+                json_summary,
             )
             .await
         }
@@ -4843,6 +4855,7 @@ async fn cmd_doctor(
     strict: bool,
     since: Option<&str>,
     strict_staleness: bool,
+    json_summary: bool,
 ) -> Result<()> {
     let stale_threshold = match since {
         Some(spec) => Some(parse_doctor_since(spec)?),
@@ -4953,8 +4966,8 @@ async fn cmd_doctor(
         }
     }
 
-    if json {
-        let out: Vec<_> = rows
+    if json || json_summary {
+        let rows_json: Vec<_> = rows
             .iter()
             .map(|r| {
                 serde_json::json!({
@@ -4972,7 +4985,42 @@ async fn cmd_doctor(
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
+
+        if json_summary {
+            // Round 130 (PR-78ay): additive enrichment
+            // envelope. The bare-array `--json` shape stays
+            // for back-compat with existing CI scripts.
+            // `summary` / `filters` NEVER read `location` or
+            // `detail` text — only counts and parsed filter
+            // tokens.
+            let total = rows.len() as u64;
+            let registered_count = rows.iter().filter(|r| r.registered).count() as u64;
+            let ok_count = rows.iter().filter(|r| r.ok && r.registered).count() as u64;
+            let unhealthy_count = rows.iter().filter(|r| !r.ok && r.registered).count() as u64;
+            let stale_count = rows.iter().filter(|r| r.stale.unwrap_or(false)).count() as u64;
+            let unregistered_count = rows.iter().filter(|r| !r.registered).count() as u64;
+
+            let envelope = serde_json::json!({
+                "summary": {
+                    "total": total,
+                    "registered": registered_count,
+                    "ok": ok_count,
+                    "unhealthy": unhealthy_count,
+                    "stale": stale_count,
+                    "unregistered": unregistered_count,
+                },
+                "filters": {
+                    "source": anamnesis_core::parse_csv_filter(filter_source),
+                    "instance": anamnesis_core::parse_csv_filter(filter_instance),
+                    "since_seconds": stale_threshold,
+                    "include_unregistered": include_unregistered,
+                },
+                "sources": rows_json,
+            });
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&rows_json)?);
+        }
         // Honor --strict and --strict-staleness in json mode too — print
         // the JSON first so the caller can still parse stdout, then exit
         // non-zero. Lets CI gates do `doctor --json --strict | tee report.json`.
