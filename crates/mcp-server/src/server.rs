@@ -2745,7 +2745,18 @@ fn trim_for_prompt(s: &str, max_chars: usize) -> String {
 }
 
 fn prompts_list_payload() -> Value {
+    // Round 111 (PR-78ag): top-level `summary` field is an
+    // additive enrichment on top of the MCP `prompts/list`
+    // shape so an agent doing first-time discovery can decide
+    // which prompt to fetch without parsing every per-arg
+    // description. The per-prompt entries are unchanged
+    // (back-compat with every R0-R110 client). Counted from
+    // `prompts[].len()` would be more elegant if the array
+    // were built first; kept hard-coded here because the
+    // array is small and the summary text needs to be hand-
+    // authored anyway.
     json!({
+        "summary": "2 prompts: `summarize_my_preferences` distills the user's stable user-scope preferences (with optional `user_tag` overlay); `find_related` injects top-N memories related to a free-text query (filterable by source / instance / kind / scope / user_tag, optional score `explain`).",
         "prompts": [
             {
                 "name": "summarize_my_preferences",
@@ -4519,6 +4530,45 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"summarize_my_preferences"));
         assert!(names.contains(&"find_related"));
+    }
+
+    /// Round 111 (PR-78ag): `prompts/list` carries a top-level
+    /// `summary` line so an agent doing first-time discovery
+    /// can decide which prompt to fetch without parsing every
+    /// per-arg description. Additive on top of the MCP spec —
+    /// existing R0+ consumers reading `prompts[]` are
+    /// unaffected.
+    #[tokio::test]
+    async fn prompts_list_carries_top_level_summary_line() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("prompts/list", Value::Null)).await;
+        let payload = resp.result.unwrap();
+        let summary = payload["summary"]
+            .as_str()
+            .expect("prompts/list must carry a top-level `summary` field for agent discovery");
+        // Must mention both prompts by name + the prompt count
+        // so the line is self-describing.
+        assert!(
+            summary.contains("2 prompts"),
+            "summary should declare the prompt count: {summary}"
+        );
+        assert!(
+            summary.contains("summarize_my_preferences"),
+            "summary should name `summarize_my_preferences`: {summary}"
+        );
+        assert!(
+            summary.contains("find_related"),
+            "summary should name `find_related`: {summary}"
+        );
+        // `prompts[]` must continue to carry both entries
+        // (back-compat).
+        let names: Vec<&str> = payload["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
     }
 
     #[tokio::test]
