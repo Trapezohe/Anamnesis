@@ -6820,11 +6820,12 @@ async fn run_search_traced(
     mode: SearchMode,
     provider: Option<&ProviderHandle>,
 ) -> Result<anamnesis_search::TracedSearchResult> {
-    let opts = HybridOpts {
-        limit,
-        candidate_pool: (limit * 4).max(limit),
-        mode,
-    };
+    // Round 136 (PR-78be): central candidate-pool policy. Replaces
+    // the historic `limit * 4` heuristic with a clamped 8× scale
+    // (floor 64, ceil 512) so tiny-limit queries don't starve
+    // recall and huge-limit queries don't burn ANN cycles on
+    // candidates the post-rerank top-K won't use.
+    let opts = HybridOpts::for_limit(limit, mode);
     match provider {
         Some(handle) => match handle {
             #[cfg(feature = "local-fastembed")]

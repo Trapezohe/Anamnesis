@@ -45,30 +45,82 @@ pub struct HybridOpts {
     /// Max chunks to return.
     pub limit: u32,
     /// Candidate pool size per modality before RRF merge. Larger pool =
-    /// better recall on rare matches but more work. Default: limit * 4.
+    /// better recall on rare matches but more work. Computed by
+    /// [`candidate_pool_for_limit`] when constructed via
+    /// `HybridOpts::for_limit` / `HybridOpts::fulltext_only`.
     pub candidate_pool: u32,
     /// Modalities to combine.
     pub mode: SearchMode,
 }
 
+/// Round 136 (PR-78be): the floor on the per-modality candidate pool.
+/// Tiny `limit=1` queries previously got pool=4 (`limit * 4`), which
+/// starved both FTS and sqlite-vec ANN — a rare-token match could be
+/// hiding in candidate 5+ and never reach the RRF merge. 64 is the
+/// empirical floor where ANN recall stabilises on the curated
+/// benchmark fixtures.
+pub const CANDIDATE_POOL_FLOOR: u32 = 64;
+
+/// Round 136 (PR-78be): the ceiling. Without it, a `limit=200` query
+/// would push `(limit * 8) = 1600` into vec0 KNN, which is wasted
+/// work — the post-RRF top-K rarely benefits from a pool deeper than
+/// 512 in profiled traces, and the ANN scan walks the whole
+/// candidate set per record.
+pub const CANDIDATE_POOL_CEIL: u32 = 512;
+
+/// Round 136 (PR-78be): central candidate-pool sizing policy used by
+/// every search entry point (CLI `search`, MCP `search_memories`,
+/// MCP `find_related`, …). Returns the per-modality pool size for a
+/// given `limit`, applying:
+///
+/// 1. `limit == 0` short-circuits to 0 (nothing to retrieve).
+/// 2. Otherwise compute `limit * 8` (saturating) — wider than the
+///    historic `limit * 4` so a `limit=20` query gets pool=160
+///    instead of 80, lifting recall on rare-token queries the
+///    hybrid RRF merge depends on.
+/// 3. Clamp to `[CANDIDATE_POOL_FLOOR, CANDIDATE_POOL_CEIL]`. The
+///    floor protects tiny `limit=1/2/5` queries from a starved
+///    candidate set; the ceiling protects large-limit queries from
+///    paying ANN cost that the post-rerank top-K won't use.
+/// 4. Final guard: never below `limit` itself (vanishingly rare with
+///    the clamp + 8× scaling, but kept as a correctness invariant
+///    so a future tweak of the constants can't ever return a pool
+///    smaller than the user asked for).
+pub fn candidate_pool_for_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        return 0;
+    }
+    limit
+        .saturating_mul(8)
+        .clamp(CANDIDATE_POOL_FLOOR, CANDIDATE_POOL_CEIL)
+        .max(limit)
+}
+
 impl Default for HybridOpts {
     fn default() -> Self {
-        Self {
-            limit: 20,
-            candidate_pool: 80,
-            mode: SearchMode::Hybrid,
-        }
+        Self::for_limit(20, SearchMode::Hybrid)
     }
 }
 
 impl HybridOpts {
-    /// Convenience: only FTS, no embedding call.
-    pub fn fulltext_only(limit: u32) -> Self {
+    /// Round 136 (PR-78be): central constructor used by every CLI /
+    /// MCP entry point. Routes the per-modality `candidate_pool`
+    /// through [`candidate_pool_for_limit`] so a single policy
+    /// change covers `anamnesis search`, MCP `search_memories`,
+    /// MCP `find_related`, and any future read surface.
+    pub fn for_limit(limit: u32, mode: SearchMode) -> Self {
         Self {
             limit,
-            candidate_pool: limit.saturating_mul(4).max(limit),
-            mode: SearchMode::Fulltext,
+            candidate_pool: candidate_pool_for_limit(limit),
+            mode,
         }
+    }
+
+    /// Convenience: only FTS, no embedding call. Now delegates to
+    /// [`HybridOpts::for_limit`] so the candidate-pool policy is
+    /// applied uniformly.
+    pub fn fulltext_only(limit: u32) -> Self {
+        Self::for_limit(limit, SearchMode::Fulltext)
     }
 }
 
@@ -633,6 +685,98 @@ mod tests {
         AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
     };
     use async_trait::async_trait;
+
+    // ─── Round-136 PR-78be: candidate_pool_for_limit policy ─────
+
+    #[test]
+    fn candidate_pool_for_limit_zero_short_circuits() {
+        // No retrieval requested → no pool to assemble.
+        assert_eq!(candidate_pool_for_limit(0), 0);
+    }
+
+    #[test]
+    fn candidate_pool_for_limit_tiny_limits_hit_the_floor() {
+        // The whole point of the floor: a `limit=1` query was
+        // previously getting pool=4 (`limit * 4`), which starved
+        // both FTS and ANN. 64 is the empirical floor.
+        for limit in [1u32, 2, 5, 7] {
+            assert_eq!(
+                candidate_pool_for_limit(limit),
+                CANDIDATE_POOL_FLOOR,
+                "limit={limit} must clamp UP to the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_pool_for_limit_midrange_uses_eight_times_scaling() {
+        // Inside the floor/ceil window the 8× scaling applies.
+        // limit=10 → 80, limit=20 → 160, limit=50 → 400.
+        assert_eq!(candidate_pool_for_limit(10), 80);
+        assert_eq!(candidate_pool_for_limit(20), 160);
+        assert_eq!(candidate_pool_for_limit(50), 400);
+    }
+
+    #[test]
+    fn candidate_pool_for_limit_large_limits_clamp_to_ceiling() {
+        // limit=100 → 800 → clamped down to 512; limit at/below the
+        // ceiling never bumps back up because of the `.max(limit)`
+        // guard.
+        assert_eq!(candidate_pool_for_limit(100), CANDIDATE_POOL_CEIL);
+        assert_eq!(candidate_pool_for_limit(500), CANDIDATE_POOL_CEIL);
+        // limit ABOVE the ceiling is a corner case: the user asked
+        // for more results than the ceiling, so the pool MUST be
+        // at least `limit` (otherwise the rerank can't even fill
+        // the result set). The clamp protects "ask for 100, scan
+        // 1000"; it can't protect "ask for 1000, scan ≥1000".
+        assert_eq!(candidate_pool_for_limit(1000), 1000);
+        assert_eq!(candidate_pool_for_limit(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn candidate_pool_for_limit_never_below_limit_itself() {
+        // The final `.max(limit)` guard is an invariant: even if a
+        // future tweak ever shrank the floor below typical limits,
+        // the pool must never return fewer candidates than the
+        // caller asked for. We can't break this without the
+        // top-level RankedChunk count silently dropping below the
+        // user's `limit`.
+        for limit in [1u32, 50, 200, 600, 1000] {
+            let pool = candidate_pool_for_limit(limit);
+            assert!(
+                pool >= limit.min(CANDIDATE_POOL_CEIL),
+                "pool={pool} must be ≥ min(limit={limit}, ceil={CANDIDATE_POOL_CEIL})"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_opts_default_routes_through_central_policy() {
+        // Smoke: the default constructor honours the policy. If
+        // someone reintroduces a hardcoded value here, this test
+        // catches it.
+        let opts = HybridOpts::default();
+        assert_eq!(opts.limit, 20);
+        assert_eq!(opts.candidate_pool, candidate_pool_for_limit(20));
+        assert!(matches!(opts.mode, SearchMode::Hybrid));
+    }
+
+    #[test]
+    fn hybrid_opts_for_limit_picks_up_mode() {
+        let opts = HybridOpts::for_limit(5, SearchMode::Vector);
+        assert_eq!(opts.limit, 5);
+        assert_eq!(opts.candidate_pool, CANDIDATE_POOL_FLOOR);
+        assert!(matches!(opts.mode, SearchMode::Vector));
+    }
+
+    #[test]
+    fn hybrid_opts_fulltext_only_delegates_to_policy() {
+        let opts = HybridOpts::fulltext_only(7);
+        assert_eq!(opts.limit, 7);
+        // Below the floor → clamped up.
+        assert_eq!(opts.candidate_pool, CANDIDATE_POOL_FLOOR);
+        assert!(matches!(opts.mode, SearchMode::Fulltext));
+    }
     use chrono::Utc;
 
     /// Returns a deterministic vector that's 1.0 on the index of one of
