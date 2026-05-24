@@ -22,6 +22,7 @@ members = [
     "crates/adapter-memos",
     "crates/adapter-memary",
     "crates/extractor",
+    "crates/export",
 ]
 
 [workspace.package]
@@ -58,6 +59,7 @@ anamnesis-adapter-memori = { path = "crates/adapter-memori", version = "0.1.0" }
 anamnesis-adapter-memos = { path = "crates/adapter-memos", version = "0.1.0" }
 anamnesis-adapter-memary = { path = "crates/adapter-memary", version = "0.1.0" }
 anamnesis-mcp-server = { path = "crates/mcp-server", version = "0.1.0", default-features = false }
+anamnesis-export = { path = "crates/export", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

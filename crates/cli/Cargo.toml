@@ -21,6 +21,7 @@ anamnesis-store = { workspace = true }
 anamnesis-embedder = { workspace = true, default-features = false }
 anamnesis-importer = { workspace = true }
 anamnesis-extractor = { workspace = true }
+anamnesis-export = { workspace = true }
 anamnesis-search = { workspace = true }
 anamnesis-adapter-claude-code = { workspace = true }
 anamnesis-adapter-codex = { workspace = true }

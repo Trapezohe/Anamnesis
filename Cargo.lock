@@ -300,6 +300,7 @@ dependencies = [
  "anamnesis-adapter-tdai",
  "anamnesis-core",
  "anamnesis-embedder",
+ "anamnesis-export",
  "anamnesis-extractor",
  "anamnesis-importer",
  "anamnesis-mcp-server",
@@ -356,6 +357,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "anamnesis-export"
+version = "0.1.0"
+dependencies = [
+ "anamnesis-core",
+ "anamnesis-store",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "anamnesis-extractor"
 version = "0.1.0"
 dependencies = [
@@ -408,6 +423,7 @@ dependencies = [
  "anamnesis-adapter-tdai",
  "anamnesis-core",
  "anamnesis-embedder",
+ "anamnesis-export",
  "anamnesis-importer",
  "anamnesis-search",
  "anamnesis-store",
