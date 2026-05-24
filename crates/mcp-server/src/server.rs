@@ -64,6 +64,8 @@ pub const ADMIN_TOOLS: &[&str] = &[
     "source_show",
     // `export_memories` writes a new file and can dump the corpus.
     "export_memories",
+    // R144: tombstones loser variants in a cross-adapter conflict.
+    "accept_conflict_variant",
 ];
 
 /// Was this tool tagged as admin?
@@ -841,6 +843,7 @@ impl AnamnesisServer {
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             "dedupe" => self.tool_dedupe(args.clone()).await,
             "list_conflicts" => self.tool_list_conflicts(args.clone()).await,
+            "accept_conflict_variant" => self.tool_accept_conflict_variant(args.clone()).await,
             "discover_adapters" => self.tool_discover_adapters().await,
             "export_memories" => self.tool_export_memories(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
@@ -2549,6 +2552,144 @@ impl AnamnesisServer {
                 "instance": instance,
             },
             "groups":           payload_groups,
+        }))
+    }
+
+    /// MCP `accept_conflict_variant` — resolve one `native_id` conflict.
+    /// Admin-gated. `apply: false` (default) is a dry-run preview;
+    /// `apply: true` tombstones losers in one IMMEDIATE tx.
+    /// Picks the keeper via `keep_variant` (1-based index from the
+    /// `list_conflicts` payload) or `keep_record_id`. Audit-logged.
+    async fn tool_accept_conflict_variant(&self, args: Value) -> Result<Value, String> {
+        let native_id = args
+            .get("native_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "accept_conflict_variant.native_id is required".to_string())?;
+        let keep_variant = args
+            .get("keep_variant")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let keep_record_id = args
+            .get("keep_record_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let selector = match (keep_variant, keep_record_id) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "accept_conflict_variant: pass exactly one of `keep_variant` or \
+                     `keep_record_id`, not both"
+                        .to_string(),
+                );
+            }
+            (Some(v), None) => anamnesis_store::AcceptConflictSelector::KeepVariant(v),
+            (None, Some(id)) => anamnesis_store::AcceptConflictSelector::KeepRecordId(
+                anamnesis_core::model::RecordId(id),
+            ),
+            (None, None) => {
+                return Err(
+                    "accept_conflict_variant: pass either `keep_variant` (1-based) or \
+                     `keep_record_id`"
+                        .to_string(),
+                );
+            }
+        };
+        let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cascade_derived = args
+            .get("cascade_derived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        let opts = anamnesis_store::AcceptConflictOptions {
+            native_id: native_id.clone(),
+            selector: selector.clone(),
+            reason: reason.clone(),
+            cascade_derived,
+        };
+
+        let outcome = if apply {
+            self.store
+                .accept_native_conflict_variant(&opts)
+                .map_err(|e| format!("accept_conflict_variant: {e}"))?
+        } else {
+            self.store
+                .preview_accept_native_conflict_variant(&opts)
+                .map_err(|e| format!("accept_conflict_variant: {e}"))?
+        };
+
+        if apply {
+            anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
+                "accept_conflict_variant",
+                json!({
+                    "native_id":        native_id,
+                    "keep_variant":     outcome.keep_variant,
+                    "keep_record_ids":  outcome.keep_records.iter().map(|r| r.record_id.0.clone()).collect::<Vec<_>>(),
+                    "forget_record_ids": outcome.forget_records.iter().map(|r| r.record_id.0.clone()).collect::<Vec<_>>(),
+                    "cascade_derived":  cascade_derived,
+                    "reason":           reason,
+                    "via":              "mcp",
+                }),
+            ));
+        }
+
+        let render = |r: &anamnesis_store::AcceptConflictRecord| {
+            json!({
+                "record_id":       r.record_id.0,
+                "adapter":         r.adapter,
+                "instance":        if r.instance.is_empty() { Value::Null } else { Value::String(r.instance.clone()) },
+                "native_id":       r.native_id,
+                "content_variant": r.content_variant,
+                "decision":        r.decision,
+            })
+        };
+        let cascade: Vec<Value> = outcome
+            .cascade_derived
+            .iter()
+            .map(|d| {
+                json!({
+                    "record_id":             d.record_id.0,
+                    "adapter":               d.adapter,
+                    "instance":              if d.instance.is_empty() { Value::Null } else { Value::String(d.instance.clone()) },
+                    "native_id":             d.native_id,
+                    "forgotten_at":          d.forgotten_at,
+                    "was_already_forgotten": d.was_already_forgotten,
+                })
+            })
+            .collect();
+        let summary = format!(
+            "{} variant {}; keep {} record(s), {} record(s) {} tombstoned{}.",
+            if outcome.dry_run {
+                "would-accept"
+            } else {
+                "accepted"
+            },
+            outcome.keep_variant,
+            outcome.keep_records.len(),
+            outcome.forget_records.len(),
+            if outcome.dry_run { "would be" } else { "were" },
+            if cascade_derived {
+                format!("; cascade={}", cascade.len())
+            } else {
+                String::new()
+            },
+        );
+        Ok(json!({
+            "summary":          summary,
+            "status":           if outcome.dry_run { "would-accept" } else { "accepted" },
+            "dry_run":          outcome.dry_run,
+            "native_id":        outcome.native_id,
+            "keep_variant":     outcome.keep_variant,
+            "keep_records":     outcome.keep_records.iter().map(render).collect::<Vec<_>>(),
+            "forget_records":   outcome.forget_records.iter().map(render).collect::<Vec<_>>(),
+            "cascade_derived":  cascade_derived,
+            "cascade":          cascade,
         }))
     }
 
@@ -4418,6 +4559,56 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "accept_conflict_variant",
+                "description": "Resolve a cross-adapter `native_id` content conflict surfaced by \
+                                `list_conflicts`: keep one variant, tombstone the losers. ADMIN-GATED. \
+                                Dry-run by default (`apply: false`); pass `apply: true` to commit in \
+                                a single transaction. Pair with `cascade_derived: true` to also \
+                                tombstone every loser's `provenance.derived_from` descendants (kept \
+                                records' descendants are never touched). Response carries the partition \
+                                and tombstone IDs but never `content` / `raw_hash` / `native_path`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "native_id": {
+                            "type": "string",
+                            "description": "`native_id` of the conflict group to resolve (from \
+                                            `list_conflicts.groups[].native_id`)."
+                        },
+                        "keep_variant": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "1-based variant index from the conflict listing. Mutually \
+                                            exclusive with `keep_record_id`."
+                        },
+                        "keep_record_id": {
+                            "type": "string",
+                            "description": "Specific record id to keep. Siblings sharing its content \
+                                            stay live. Mutually exclusive with `keep_variant`."
+                        },
+                        "apply": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "`false` (default) returns a dry-run preview. `true` commits \
+                                            the tombstones inside one IMMEDIATE transaction and writes \
+                                            an audit entry."
+                        },
+                        "cascade_derived": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Also tombstone every loser's `provenance.derived_from` \
+                                            descendants. Kept records never lose descendants."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Operator-supplied reason recorded on each loser tombstone \
+                                            and on the audit entry."
+                        }
+                    },
+                    "required": ["native_id"]
+                }
+            },
+            {
                 "name": "discover_adapters",
                 "description": "Capability discovery. Returns the static catalogue of adapters compiled \
                                 into this binary (`adapters[]`) plus a runtime detection pass of memory \
@@ -4812,21 +5003,13 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_includes_all_when_admin_enabled() {
-        // PR-A: with admin enabled, the full catalogue is back.
-        // Round 73 added `forget_record` as a 2nd admin tool, so the
-        // total climbed 6 → 7.
+        // With admin enabled, the full catalogue surfaces. R144 added
+        // accept_conflict_variant (16→17).
         let store = Store::open_in_memory().unwrap();
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        // R73 added forget_record (6→7). R74 added list_forgotten
-        // (7→8). R75 added unforget_record (8→9). R77 added
-        // dedupe (9→10). R78 added tag_record (10→11). R84 added
-        // audit_tail (11→12). R86 added source_show (12→13).
-        // R135 added list_conflicts (13→14). R137 added
-        // discover_adapters (14→15). R140 added export_memories
-        // (15→16).
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
         for expected in [
             "search_memories",
             "get_record",
@@ -4842,6 +5025,7 @@ mod tests {
             "audit_tail",
             "source_show",
             "list_conflicts",
+            "accept_conflict_variant",
             "discover_adapters",
             "export_memories",
         ] {
@@ -4891,9 +5075,8 @@ mod tests {
         assert_eq!(tools.len(), 8);
     }
 
-    /// With admin enabled, summary reports 16 visible tools
-    /// (R140 added export_memories) and switches the verb to
-    /// `admin tools enabled`.
+    /// Admin-on summary: 17 visible tools (R144 added
+    /// `accept_conflict_variant`).
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
         let store = Store::open_in_memory().unwrap();
@@ -4902,17 +5085,15 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("16 tools exposed"),
-            "admin-on summary should declare 16 visible tools: {summary}"
+            summary.contains("17 tools exposed"),
+            "admin-on summary should declare 17 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
-        // Same back-compat assertion: `tools[]` carries the
-        // 16 entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[tokio::test]

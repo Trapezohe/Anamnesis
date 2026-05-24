@@ -87,6 +87,13 @@ pub fn blob_to_f32(b: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
+/// Shared planning result for `accept_native_conflict_variant`.
+struct AcceptConflictPlan {
+    keep_variant: u32,
+    keep_records: Vec<AcceptConflictRecord>,
+    forget_records: Vec<AcceptConflictRecord>,
+}
+
 /// Forget one record inside an existing tx. Shared by single-record
 /// and cascade paths. Captures `derived_from` so unforget can BFS the
 /// tombstone subtree. Returns `Forgotten` / `AlreadyForgotten` / `NotFound`.
@@ -979,7 +986,90 @@ pub struct NativeConflictFilter {
     pub include_content: bool,
 }
 
-/// Round 74 (PR-74): filter for `Store::list_forgotten`. Mirrors
+/// Pick the winning content variant inside one `native_id` conflict.
+/// Exactly one selector must be `Some`. `KeepVariant(n)` selects every
+/// record whose `content_variant == n` (variant numbering matches
+/// `Store::list_native_content_conflicts_filtered`). `KeepRecordId(id)`
+/// keeps the record with that id and every sibling sharing its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptConflictSelector {
+    /// 1-based variant index from the conflict listing.
+    KeepVariant(u32),
+    /// Specific record id; siblings with identical content also stay live.
+    KeepRecordId(RecordId),
+}
+
+/// Options for `Store::accept_native_conflict_variant` /
+/// `Store::preview_accept_native_conflict_variant`.
+#[derive(Debug, Clone)]
+pub struct AcceptConflictOptions {
+    /// `(adapter, instance, native_id)` group key — same `native_id` the
+    /// conflict listing surfaces. Empty `instance` is the default.
+    pub native_id: String,
+    /// Which variant to keep.
+    pub selector: AcceptConflictSelector,
+    /// Audit/tombstone reason echoed on every loser tombstone.
+    pub reason: Option<String>,
+    /// Also tombstone every loser's `provenance.derived_from` descendants;
+    /// kept records (and their descendants) are never touched.
+    pub cascade_derived: bool,
+}
+
+/// One record inside an accept-conflict outcome / preview. Same redacted
+/// projection as `NativeConflictRecord`; carries the post-call decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptConflictRecord {
+    /// Hashed record id.
+    pub record_id: RecordId,
+    /// Adapter id.
+    pub adapter: String,
+    /// Instance discriminator; `""` for default.
+    pub instance: String,
+    /// Shared `native_id` (the conflict key).
+    pub native_id: String,
+    /// 1-based variant index inside the group (matches conflict listing).
+    pub content_variant: u32,
+    /// `"keep"` for the chosen variant, `"forget"` for losers.
+    pub decision: &'static str,
+}
+
+/// Snapshot of one descendant tombstone an apply would write (or did).
+/// Mirrors `DerivedForgetRecord` minus `raw_hash` / `native_path` for
+/// the same redacted privacy contract `NativeConflictRecord` honours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptConflictDescendant {
+    /// Hashed record id.
+    pub record_id: RecordId,
+    /// Adapter id.
+    pub adapter: String,
+    /// Instance discriminator; `""` for default.
+    pub instance: String,
+    /// Native id at the source.
+    pub native_id: String,
+    /// Unix-seconds tombstone timestamp; `None` for previews.
+    pub forgotten_at: Option<i64>,
+    /// `true` when the descendant already carried a tombstone before this call.
+    pub was_already_forgotten: bool,
+}
+
+/// Result of `accept_native_conflict_variant` (apply) or its preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptConflictOutcome {
+    /// `native_id` the call acted on.
+    pub native_id: String,
+    /// 1-based variant index of the keeper (matches conflict listing).
+    pub keep_variant: u32,
+    /// Live records the call would keep (preview) or kept (apply).
+    pub keep_records: Vec<AcceptConflictRecord>,
+    /// Loser records the call would tombstone (preview) or tombstoned (apply).
+    pub forget_records: Vec<AcceptConflictRecord>,
+    /// Descendants tombstoned when `cascade_derived = true`; empty otherwise.
+    pub cascade_derived: Vec<AcceptConflictDescendant>,
+    /// `true` when no write happened (dry-run / preview path).
+    pub dry_run: bool,
+}
+
+/// Filter for `Store::list_forgotten`. Mirrors
 /// the `(adapter, instance)` natural key the tombstones are
 /// indexed on so the operator can scope to a single source. `limit`
 /// is clamped to `[1, LIST_FORGOTTEN_MAX_LIMIT]` by the store.
@@ -2666,6 +2756,271 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Dry-run [`accept_native_conflict_variant`]: partitions the conflict
+    /// group into keep/forget sets without mutating the store.
+    pub fn preview_accept_native_conflict_variant(
+        &self,
+        opts: &AcceptConflictOptions,
+    ) -> Result<AcceptConflictOutcome> {
+        let plan = self.plan_accept_conflict(opts)?;
+        let mut cascade: Vec<AcceptConflictDescendant> = Vec::new();
+        if opts.cascade_derived {
+            for loser in &plan.forget_records {
+                for child in self.collect_descendants(&loser.record_id)? {
+                    let snap = self.snapshot_descendant_for_preview(&child)?;
+                    if let Some(d) = snap {
+                        cascade.push(d);
+                    }
+                }
+            }
+        }
+        Ok(AcceptConflictOutcome {
+            native_id: opts.native_id.clone(),
+            keep_variant: plan.keep_variant,
+            keep_records: plan.keep_records,
+            forget_records: plan.forget_records,
+            cascade_derived: cascade,
+            dry_run: true,
+        })
+    }
+
+    /// Resolve one `native_id` content conflict by keeping the chosen
+    /// variant and tombstoning every loser. Writes happen inside one
+    /// IMMEDIATE transaction; partial-apply is impossible.
+    /// `cascade_derived=true` also tombstones loser descendants
+    /// (`provenance.derived_from`); kept records never lose descendants.
+    pub fn accept_native_conflict_variant(
+        &self,
+        opts: &AcceptConflictOptions,
+    ) -> Result<AcceptConflictOutcome> {
+        let plan = self.plan_accept_conflict(opts)?;
+        let mut loser_descendants: Vec<RecordId> = Vec::new();
+        if opts.cascade_derived {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for loser in &plan.forget_records {
+                for child in self.collect_descendants(&loser.record_id)? {
+                    if seen.insert(child.0.clone()) {
+                        loser_descendants.push(child);
+                    }
+                }
+            }
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().timestamp();
+        let reason = opts.reason.as_deref();
+
+        for loser in &plan.forget_records {
+            forget_one_in_tx(&tx, &loser.record_id, reason, now)?;
+        }
+
+        let mut cascade: Vec<AcceptConflictDescendant> =
+            Vec::with_capacity(loser_descendants.len());
+        for child_id in &loser_descendants {
+            let outcome = forget_one_in_tx(&tx, child_id, None, now)?;
+            match outcome {
+                ForgetRecordOutcome::Forgotten(r) => cascade.push(AcceptConflictDescendant {
+                    record_id: r.record_id,
+                    adapter: r.adapter,
+                    instance: r.instance,
+                    native_id: r.native_id,
+                    forgotten_at: Some(r.forgotten_at),
+                    was_already_forgotten: false,
+                }),
+                ForgetRecordOutcome::AlreadyForgotten(r) => {
+                    cascade.push(AcceptConflictDescendant {
+                        record_id: r.record_id,
+                        adapter: r.adapter,
+                        instance: r.instance,
+                        native_id: r.native_id,
+                        forgotten_at: Some(r.forgotten_at),
+                        was_already_forgotten: true,
+                    });
+                }
+                ForgetRecordOutcome::NotFound => {
+                    // Raced away between snapshot and apply — cascade
+                    // goal (no live derived row) is already satisfied.
+                }
+            }
+        }
+        tx.commit()?;
+
+        Ok(AcceptConflictOutcome {
+            native_id: opts.native_id.clone(),
+            keep_variant: plan.keep_variant,
+            keep_records: plan.keep_records,
+            forget_records: plan.forget_records,
+            cascade_derived: cascade,
+            dry_run: false,
+        })
+    }
+
+    /// Shared planning step: read the conflict group, validate the
+    /// selector, partition records into keep/forget. Read-only.
+    fn plan_accept_conflict(&self, opts: &AcceptConflictOptions) -> Result<AcceptConflictPlan> {
+        // Read every live record sharing this native_id.
+        type Row = (RecordId, String, String, String, String);
+        let rows: Vec<Row> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, adapter, instance, native_id, content \
+                 FROM records WHERE native_id = ?1 \
+                 ORDER BY adapter ASC, id ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![opts.native_id], |r| {
+                    Ok((
+                        RecordId(r.get::<_, String>(0)?),
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+        if rows.is_empty() {
+            return Err(StoreError::Corruption(format!(
+                "accept_conflict: no live records for native_id {:?}",
+                opts.native_id
+            )));
+        }
+
+        // Same variant numbering as `list_native_content_conflicts_filtered`:
+        // first-occurrence in `(adapter ASC, id ASC)` order.
+        let mut variants: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut next_variant: u32 = 1;
+        let mut decorated: Vec<(RecordId, String, String, String, u32)> =
+            Vec::with_capacity(rows.len());
+        for (rid, adapter, instance, native_id, content) in rows {
+            let variant = *variants.entry(content).or_insert_with(|| {
+                let v = next_variant;
+                next_variant += 1;
+                v
+            });
+            decorated.push((rid, adapter, instance, native_id, variant));
+        }
+        let variant_count = next_variant - 1;
+        let adapter_count = decorated
+            .iter()
+            .map(|r| r.1.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if decorated.len() < 2 || adapter_count < 2 || variant_count < 2 {
+            return Err(StoreError::Corruption(format!(
+                "accept_conflict: native_id {:?} is not a cross-adapter content conflict \
+                 (records={}, adapters={}, variants={})",
+                opts.native_id,
+                decorated.len(),
+                adapter_count,
+                variant_count
+            )));
+        }
+
+        let keep_variant = match &opts.selector {
+            AcceptConflictSelector::KeepVariant(v) => {
+                if *v < 1 || *v > variant_count {
+                    return Err(StoreError::Corruption(format!(
+                        "accept_conflict: keep_variant={v} out of range [1, {variant_count}] \
+                         for native_id {:?}",
+                        opts.native_id
+                    )));
+                }
+                *v
+            }
+            AcceptConflictSelector::KeepRecordId(id) => {
+                let found = decorated.iter().find(|r| &r.0 == id).ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "accept_conflict: keep_record_id {:?} is not a member of \
+                         native_id {:?}'s conflict group",
+                        id.0, opts.native_id
+                    ))
+                })?;
+                found.4
+            }
+        };
+
+        let mut keep_records: Vec<AcceptConflictRecord> = Vec::new();
+        let mut forget_records: Vec<AcceptConflictRecord> = Vec::new();
+        for (rid, adapter, instance, native_id, variant) in decorated {
+            let decision = if variant == keep_variant {
+                "keep"
+            } else {
+                "forget"
+            };
+            let row = AcceptConflictRecord {
+                record_id: rid,
+                adapter,
+                instance,
+                native_id,
+                content_variant: variant,
+                decision,
+            };
+            if variant == keep_variant {
+                keep_records.push(row);
+            } else {
+                forget_records.push(row);
+            }
+        }
+        if keep_records.is_empty() || forget_records.is_empty() {
+            return Err(StoreError::Corruption(format!(
+                "accept_conflict: selector for native_id {:?} would keep \
+                 every (or no) record — nothing to resolve",
+                opts.native_id
+            )));
+        }
+        Ok(AcceptConflictPlan {
+            keep_variant,
+            keep_records,
+            forget_records,
+        })
+    }
+
+    /// Read-only descendant snapshot for the dry-run path.
+    fn snapshot_descendant_for_preview(
+        &self,
+        id: &RecordId,
+    ) -> Result<Option<AcceptConflictDescendant>> {
+        let conn = self.conn.lock();
+        let live: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT adapter, instance, native_id FROM records WHERE id = ?1",
+                params![id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((adapter, instance, native_id)) = live {
+            return Ok(Some(AcceptConflictDescendant {
+                record_id: id.clone(),
+                adapter,
+                instance,
+                native_id,
+                forgotten_at: None,
+                was_already_forgotten: false,
+            }));
+        }
+        let tomb: Option<(String, String, String, i64)> = conn
+            .query_row(
+                "SELECT adapter, instance, native_id, forgotten_at \
+                 FROM record_tombstones WHERE record_id = ?1",
+                params![id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(tomb.map(
+            |(adapter, instance, native_id, ts)| AcceptConflictDescendant {
+                record_id: id.clone(),
+                adapter,
+                instance,
+                native_id,
+                forgotten_at: Some(ts),
+                was_already_forgotten: true,
+            },
+        ))
     }
 
     /// Round 78 (PR-78): apply or remove user-tags on a record.
@@ -9157,5 +9512,184 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM record_tombstones", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ─── R144: accept_native_conflict_variant ────────────────────────
+
+    /// Three records share `shared-1`: mem0 + claude-code with content A
+    /// (variant 1), and mem0-prod with content B (variant 2). Accepting
+    /// variant 1 must keep two records and tombstone one.
+    fn seed_three_record_conflict(store: &Store) {
+        let a = make_record("claude-code", "shared-1", "Body variant A", Kind::Fact);
+        let mut b = make_record("mem0", "shared-1", "Body variant A", Kind::Fact);
+        b.id = anamnesis_core::model::RecordId::from_parts("mem0", None, "shared-1");
+        let mut c = make_record("mem0", "shared-1", "Body variant B", Kind::Fact);
+        c.id = anamnesis_core::model::RecordId::from_parts("mem0", Some("prod"), "shared-1");
+        c.source.instance = Some("prod".into());
+        for r in [&a, &b, &c] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn preview_accept_conflict_partitions_without_mutating() {
+        let store = Store::open_in_memory().unwrap();
+        seed_three_record_conflict(&store);
+
+        let outcome = store
+            .preview_accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "shared-1".into(),
+                selector: AcceptConflictSelector::KeepVariant(1),
+                reason: None,
+                cascade_derived: false,
+            })
+            .unwrap();
+
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.keep_variant, 1);
+        assert_eq!(outcome.keep_records.len(), 2);
+        assert_eq!(outcome.forget_records.len(), 1);
+        assert_eq!(outcome.forget_records[0].content_variant, 2);
+
+        // Store is unchanged: still 3 live records, 0 tombstones.
+        let live: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, 3);
+        let tomb: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tomb, 0);
+    }
+
+    #[test]
+    fn accept_conflict_tombstones_losers_and_blocks_reimport() {
+        let store = Store::open_in_memory().unwrap();
+        seed_three_record_conflict(&store);
+
+        let outcome = store
+            .accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "shared-1".into(),
+                selector: AcceptConflictSelector::KeepVariant(1),
+                reason: Some("operator picked variant 1".into()),
+                cascade_derived: false,
+            })
+            .unwrap();
+        assert!(!outcome.dry_run);
+        assert_eq!(outcome.keep_records.len(), 2);
+        assert_eq!(outcome.forget_records.len(), 1);
+
+        let live: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, 2, "loser must be tombstoned");
+        let tomb: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tomb, 1);
+        // Conflict is resolved.
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(groups.is_empty(), "conflict gone after accept: {groups:?}");
+    }
+
+    #[test]
+    fn accept_conflict_keep_record_id_selector_matches_variant() {
+        let store = Store::open_in_memory().unwrap();
+        seed_three_record_conflict(&store);
+        let target = anamnesis_core::model::RecordId::from_parts("mem0", Some("prod"), "shared-1");
+        let outcome = store
+            .accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "shared-1".into(),
+                selector: AcceptConflictSelector::KeepRecordId(target.clone()),
+                reason: None,
+                cascade_derived: false,
+            })
+            .unwrap();
+        assert_eq!(outcome.keep_variant, 2);
+        let keep_ids: std::collections::BTreeSet<&str> = outcome
+            .keep_records
+            .iter()
+            .map(|r| r.record_id.0.as_str())
+            .collect();
+        assert!(keep_ids.contains(target.0.as_str()));
+    }
+
+    #[test]
+    fn accept_conflict_rejects_unknown_native_id() {
+        let store = Store::open_in_memory().unwrap();
+        let err = store
+            .preview_accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "nope".into(),
+                selector: AcceptConflictSelector::KeepVariant(1),
+                reason: None,
+                cascade_derived: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corruption(_)));
+    }
+
+    #[test]
+    fn accept_conflict_rejects_non_conflict_native_id() {
+        // Same content across adapters → not a conflict.
+        let store = Store::open_in_memory().unwrap();
+        let a = make_record("mem0", "shared-2", "Same body", Kind::Fact);
+        let mut b = make_record("claude-code", "shared-2", "Same body", Kind::Fact);
+        b.id = anamnesis_core::model::RecordId::from_parts("claude-code", None, "shared-2");
+        for r in [&a, &b] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+        let err = store
+            .preview_accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "shared-2".into(),
+                selector: AcceptConflictSelector::KeepVariant(1),
+                reason: None,
+                cascade_derived: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corruption(_)));
+    }
+
+    #[test]
+    fn accept_conflict_rejects_out_of_range_variant() {
+        let store = Store::open_in_memory().unwrap();
+        seed_three_record_conflict(&store);
+        let err = store
+            .preview_accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "shared-1".into(),
+                selector: AcceptConflictSelector::KeepVariant(99),
+                reason: None,
+                cascade_derived: false,
+            })
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("out of range"), "{msg}");
+    }
+
+    #[test]
+    fn accept_conflict_rejects_keep_record_id_not_in_group() {
+        let store = Store::open_in_memory().unwrap();
+        seed_three_record_conflict(&store);
+        let stranger = anamnesis_core::model::RecordId::from_parts("codex", None, "stranger");
+        let err = store
+            .preview_accept_native_conflict_variant(&AcceptConflictOptions {
+                native_id: "shared-1".into(),
+                selector: AcceptConflictSelector::KeepRecordId(stranger),
+                reason: None,
+                cascade_derived: false,
+            })
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not a member"), "{msg}");
     }
 }
