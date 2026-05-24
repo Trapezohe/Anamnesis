@@ -99,12 +99,13 @@ async fn http_endpoint_round_trips_initialize() {
     // test server is built without `with_admin_tools(true)`, so only the
     // read-only tools should show up — search_memories, get_record,
     // list_sources, trace_provenance, doctor (5 since round-54) +
-    // dedupe (Round 77) + list_conflicts (Round 135) = 7.
+    // dedupe (Round 77) + list_conflicts (Round 135) +
+    // discover_adapters (Round 137) = 8.
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert_eq!(
         tools.len(),
-        7,
-        "expect 7 non-admin tools by default; got {names:?}"
+        8,
+        "expect 8 non-admin tools by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source"));
     for expected in [
