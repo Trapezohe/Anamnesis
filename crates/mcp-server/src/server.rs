@@ -4222,24 +4222,26 @@ fn tools_list_payload_all() -> Value {
             {
                 "name": "export_memories",
                 "description": "Programmatic round-trip export. Writes Anamnesis records to a fresh file in \
-                                `jsonl`, `csv`, `mem0-sqlite` (mem0's `memories` table), or `letta-sqlite` \
-                                (Letta's `block` table). SQLite formats reconstruct native columns from \
-                                metadata for the originating adapter and add an `anamnesis_*` provenance \
-                                backlink so a re-import preserves lineage. ADMIN-GATED — writes a file and \
-                                can dump the entire corpus. `out` is REQUIRED for every format (transport \
-                                cannot stream); refuses to overwrite an existing file (protects upstream \
-                                `~/.mem0/history.db`, `~/.letta/letta.db`).",
+                                `jsonl`, `csv`, `mem0-sqlite` (mem0's `memories` table), `letta-sqlite` \
+                                (Letta's `block` table), or `memos-dir` (a fresh MemOS MemCube directory \
+                                with `textual_memory.json`). SQLite formats reconstruct native columns from \
+                                metadata for the originating adapter; all round-trip formats add an \
+                                `anamnesis_*` provenance backlink so a re-import preserves lineage. \
+                                ADMIN-GATED — writes a file and can dump the entire corpus. `out` is REQUIRED \
+                                for every format (transport cannot stream); refuses to overwrite an existing \
+                                path (protects upstream `~/.mem0/history.db`, `~/.letta/letta.db`, \
+                                `~/.memos/<cube>/`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "format": {
                             "type": "string",
-                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite"],
-                            "description": "Output format. SQLite formats round-trip into the named framework."
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"],
+                            "description": "Output format. SQLite + memos-dir formats round-trip into the named framework."
                         },
                         "out": {
                             "type": "string",
-                            "description": "Absolute path for the output file. REQUIRED. Must not exist (no overwrite)."
+                            "description": "Absolute path for the output file or directory. REQUIRED. Must not exist (no overwrite)."
                         },
                         "source": {
                             "type": "string",
