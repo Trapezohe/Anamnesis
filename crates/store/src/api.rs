@@ -1069,6 +1069,101 @@ pub struct AcceptConflictOutcome {
     pub dry_run: bool,
 }
 
+/// One side of a cross-adapter reconciliation pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileSourceSelector {
+    /// Adapter id (e.g. `"mem0"`, `"letta"`).
+    pub adapter: String,
+    /// Instance discriminator; `None` = default (empty-string instance).
+    pub instance: Option<String>,
+}
+
+/// Hard cap on `Store::reconcile_sources` sample-row pages.
+/// Counts ignore this — only the per-bucket sample arrays are capped.
+pub const RECONCILE_MAX_LIMIT: u32 = 100;
+
+/// Options for [`Store::reconcile_sources`]. Counts are always
+/// computed; sample arrays are capped at `limit`.
+#[derive(Debug, Clone)]
+pub struct ReconcileOptions {
+    /// Left side of the comparison.
+    pub left: ReconcileSourceSelector,
+    /// Right side of the comparison.
+    pub right: ReconcileSourceSelector,
+    /// Max records returned per sample bucket. Clamped to
+    /// `[1, RECONCILE_MAX_LIMIT]`. Counts are unaffected.
+    pub limit: u32,
+    /// When `true`, surface the per-record `identity_key`. Off by
+    /// default — counts + minimal record_id/kind/scope are enough
+    /// for a "what's the drift?" summary.
+    pub include_identity: bool,
+}
+
+/// One sampled record inside a reconcile bucket. Redacted projection:
+/// `record_id`, `kind`, `scope`, `created_at`. `identity_key` is
+/// `Some(_)` only when [`ReconcileOptions::include_identity`] is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileSample {
+    /// Hashed record id.
+    pub record_id: RecordId,
+    /// Kind (lowercase: `fact`, `preference`, …).
+    pub kind: String,
+    /// Scope (lowercase).
+    pub scope: String,
+    /// Unix-seconds created_at.
+    pub created_at: i64,
+    /// `metadata.anamnesis_native_id` ∨ `provenance.native_id`,
+    /// only when `include_identity = true`.
+    pub identity_key: Option<String>,
+    /// Which field supplied the identity key: `"anamnesis_native_id"`
+    /// (round-tripped, comparable) or `"native_id"` (per-adapter,
+    /// only comparable when adapters share an upstream source).
+    pub identity_source: &'static str,
+}
+
+/// Filter-scoped counts. Sum-of-buckets identity:
+/// `only_left + only_right + both = total distinct identities`.
+/// `conflicts ≤ both` — each conflict belongs to `both`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcileCounts {
+    /// Identities present on left, absent on right.
+    pub only_left: u64,
+    /// Identities present on right, absent on left.
+    pub only_right: u64,
+    /// Identities present on both sides (regardless of content).
+    pub both: u64,
+    /// Subset of `both` where content differs across sides.
+    pub conflicts: u64,
+    /// Total distinct identities on the left side (after dedup by identity).
+    pub left_total: u64,
+    /// Total distinct identities on the right side.
+    pub right_total: u64,
+}
+
+/// Per-bucket sample arrays. Each capped at `ReconcileOptions::limit`.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileSamples {
+    /// Sample of left-only identities (sorted record_id ASC).
+    pub only_left: Vec<ReconcileSample>,
+    /// Sample of right-only identities.
+    pub only_right: Vec<ReconcileSample>,
+    /// Sample of conflicting identities (left side row shown).
+    pub conflicts: Vec<ReconcileSample>,
+}
+
+/// Result of [`Store::reconcile_sources`].
+#[derive(Debug, Clone)]
+pub struct ReconcileOutcome {
+    /// Left side, echoed.
+    pub left: ReconcileSourceSelector,
+    /// Right side, echoed.
+    pub right: ReconcileSourceSelector,
+    /// Filter-scoped counts.
+    pub counts: ReconcileCounts,
+    /// Sample rows per bucket.
+    pub samples: ReconcileSamples,
+}
+
 /// Filter for `Store::list_forgotten`. Mirrors
 /// the `(adapter, instance)` natural key the tombstones are
 /// indexed on so the operator can scope to a single source. `limit`
@@ -3021,6 +3116,159 @@ impl Store {
                 was_already_forgotten: true,
             },
         ))
+    }
+
+    /// Cross-adapter drift reconciliation. For each side, identity key =
+    /// `metadata.anamnesis_native_id` (round-tripped, safe to compare)
+    /// when present, else `provenance.native_id` (per-adapter, only
+    /// meaningful when adapters share an upstream source).
+    ///
+    /// Buckets: `only_left` / `only_right` / `both` / `conflicts`
+    /// (subset of `both` where `content` differs). Sample arrays are
+    /// capped at `opts.limit`; counts ignore the cap.
+    pub fn reconcile_sources(&self, opts: &ReconcileOptions) -> Result<ReconcileOutcome> {
+        let limit = opts.limit.clamp(1, RECONCILE_MAX_LIMIT) as usize;
+
+        // (identity_key, identity_source, record_id, kind, scope, created_at, content)
+        type SideRow = (String, &'static str, RecordId, String, String, i64, String);
+        let read_side = |sel: &ReconcileSourceSelector| -> Result<Vec<SideRow>> {
+            let inst = sel.instance.clone().unwrap_or_default();
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, scope, created_at, content, metadata \
+                 FROM records WHERE adapter = ?1 AND instance = ?2 \
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![sel.adapter, inst], |r| {
+                    let id: String = r.get(0)?;
+                    let kind: String = r.get(1)?;
+                    let scope: String = r.get(2)?;
+                    let created_at: i64 = r.get(3)?;
+                    let content: String = r.get(4)?;
+                    let metadata_json: Option<String> = r.get(5)?;
+                    Ok((id, kind, scope, created_at, content, metadata_json))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut out: Vec<SideRow> = Vec::with_capacity(rows.len());
+            for (rid, kind, scope, created_at, content, metadata_json) in rows {
+                // Decide identity_key. Prefer the round-tripped
+                // `anamnesis_native_id` (cross-adapter stable) over
+                // `provenance.native_id` (per-adapter). Native id read
+                // from a per-row query keeps the read pipelined.
+                let metadata: serde_json::Value = metadata_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let anamnesis_native_id = metadata
+                    .get("anamnesis_native_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let native_id: Option<String> = conn
+                    .query_row(
+                        "SELECT native_id FROM records WHERE id = ?1",
+                        params![rid],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let (identity_key, identity_source): (String, &'static str) =
+                    match (anamnesis_native_id, native_id) {
+                        (Some(a), _) => (a, "anamnesis_native_id"),
+                        (None, Some(n)) => (n, "native_id"),
+                        (None, None) => continue, // skip pathological rows
+                    };
+                out.push((
+                    identity_key,
+                    identity_source,
+                    RecordId(rid),
+                    kind,
+                    scope,
+                    created_at,
+                    content,
+                ));
+            }
+            Ok(out)
+        };
+
+        let left_rows = read_side(&opts.left)?;
+        let right_rows = read_side(&opts.right)?;
+
+        let mut left_by_id: std::collections::HashMap<String, &SideRow> =
+            std::collections::HashMap::with_capacity(left_rows.len());
+        for row in &left_rows {
+            left_by_id.entry(row.0.clone()).or_insert(row);
+        }
+        let mut right_by_id: std::collections::HashMap<String, &SideRow> =
+            std::collections::HashMap::with_capacity(right_rows.len());
+        for row in &right_rows {
+            right_by_id.entry(row.0.clone()).or_insert(row);
+        }
+
+        let make_sample = |row: &SideRow, include_id: bool| ReconcileSample {
+            record_id: row.2.clone(),
+            kind: row.3.clone(),
+            scope: row.4.clone(),
+            created_at: row.5,
+            identity_key: if include_id {
+                Some(row.0.clone())
+            } else {
+                None
+            },
+            identity_source: row.1,
+        };
+
+        let mut only_left: Vec<ReconcileSample> = Vec::new();
+        let mut only_left_total: u64 = 0;
+        for row in &left_rows {
+            if !right_by_id.contains_key(&row.0) {
+                only_left_total += 1;
+                if only_left.len() < limit {
+                    only_left.push(make_sample(row, opts.include_identity));
+                }
+            }
+        }
+        let mut only_right: Vec<ReconcileSample> = Vec::new();
+        let mut only_right_total: u64 = 0;
+        for row in &right_rows {
+            if !left_by_id.contains_key(&row.0) {
+                only_right_total += 1;
+                if only_right.len() < limit {
+                    only_right.push(make_sample(row, opts.include_identity));
+                }
+            }
+        }
+        let mut both_total: u64 = 0;
+        let mut conflicts: Vec<ReconcileSample> = Vec::new();
+        let mut conflict_total: u64 = 0;
+        for row in &left_rows {
+            if let Some(rr) = right_by_id.get(&row.0) {
+                both_total += 1;
+                if row.6 != rr.6 {
+                    conflict_total += 1;
+                    if conflicts.len() < limit {
+                        conflicts.push(make_sample(row, opts.include_identity));
+                    }
+                }
+            }
+        }
+
+        Ok(ReconcileOutcome {
+            left: opts.left.clone(),
+            right: opts.right.clone(),
+            counts: ReconcileCounts {
+                only_left: only_left_total,
+                only_right: only_right_total,
+                both: both_total,
+                conflicts: conflict_total,
+                left_total: left_rows.len() as u64,
+                right_total: right_rows.len() as u64,
+            },
+            samples: ReconcileSamples {
+                only_left,
+                only_right,
+                conflicts,
+            },
+        })
     }
 
     /// Round 78 (PR-78): apply or remove user-tags on a record.
@@ -9691,5 +9939,210 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not a member"), "{msg}");
+    }
+
+    // ─── R146: reconcile_sources ──────────────────────────────────────
+
+    /// Plant a deterministic 4-bucket fixture:
+    ///   * `shared-only-mem0` lives only on mem0
+    ///   * `shared-only-letta` lives only on letta
+    ///   * `shared-agree` lives on both with identical content
+    ///   * `shared-conflict` lives on both with different content
+    ///
+    /// Records on letta carry `anamnesis_native_id` (round-tripped from mem0).
+    fn seed_reconcile_fixture(store: &Store) {
+        let mut a = make_record("mem0", "shared-only-mem0", "Only on mem0", Kind::Fact);
+        a.provenance.native_id = "shared-only-mem0".into();
+
+        let mut b = make_record("letta", "shared-only-letta", "Only on letta", Kind::Fact);
+        b.provenance.native_id = "shared-only-letta".into();
+
+        // Agree: present on both sides via round-trip (letta side carries
+        // `anamnesis_native_id` pointing back at mem0's native id).
+        let mut agree_mem = make_record("mem0", "shared-agree", "Agreed body", Kind::Fact);
+        agree_mem.provenance.native_id = "shared-agree".into();
+        let mut agree_letta = make_record("letta", "letta-block-agree", "Agreed body", Kind::Fact);
+        agree_letta.provenance.native_id = "letta-block-agree".into();
+        agree_letta.metadata.insert(
+            "anamnesis_native_id".into(),
+            serde_json::json!("shared-agree"),
+        );
+
+        // Conflict: same identity on both sides via round-trip, content differs.
+        let mut conf_mem = make_record("mem0", "shared-conflict", "Conflict body A", Kind::Fact);
+        conf_mem.provenance.native_id = "shared-conflict".into();
+        let mut conf_letta = make_record(
+            "letta",
+            "letta-block-conflict",
+            "Conflict body B",
+            Kind::Fact,
+        );
+        conf_letta.provenance.native_id = "letta-block-conflict".into();
+        conf_letta.metadata.insert(
+            "anamnesis_native_id".into(),
+            serde_json::json!("shared-conflict"),
+        );
+
+        for r in [&a, &b, &agree_mem, &agree_letta, &conf_mem, &conf_letta] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn reconcile_sources_partitions_into_only_left_only_right_both_and_conflicts() {
+        let store = Store::open_in_memory().unwrap();
+        seed_reconcile_fixture(&store);
+
+        let outcome = store
+            .reconcile_sources(&ReconcileOptions {
+                left: ReconcileSourceSelector {
+                    adapter: "mem0".into(),
+                    instance: None,
+                },
+                right: ReconcileSourceSelector {
+                    adapter: "letta".into(),
+                    instance: None,
+                },
+                limit: 10,
+                include_identity: false,
+            })
+            .unwrap();
+        assert_eq!(outcome.counts.only_left, 1);
+        assert_eq!(outcome.counts.only_right, 1);
+        assert_eq!(
+            outcome.counts.both, 2,
+            "agree + conflict identities present"
+        );
+        assert_eq!(outcome.counts.conflicts, 1);
+        assert_eq!(outcome.counts.left_total, 3);
+        assert_eq!(outcome.counts.right_total, 3);
+    }
+
+    #[test]
+    fn reconcile_sources_include_identity_surfaces_keys_with_source_provenance() {
+        let store = Store::open_in_memory().unwrap();
+        seed_reconcile_fixture(&store);
+
+        let outcome = store
+            .reconcile_sources(&ReconcileOptions {
+                left: ReconcileSourceSelector {
+                    adapter: "mem0".into(),
+                    instance: None,
+                },
+                right: ReconcileSourceSelector {
+                    adapter: "letta".into(),
+                    instance: None,
+                },
+                limit: 10,
+                include_identity: true,
+            })
+            .unwrap();
+        // Conflict sample carries the round-tripped key.
+        let conf = outcome
+            .samples
+            .conflicts
+            .iter()
+            .find(|s| s.identity_key.as_deref() == Some("shared-conflict"))
+            .expect("conflict sample present");
+        // mem0 side originally typed the native_id — no anamnesis_native_id
+        // on the *left* row of a conflict, so identity_source is "native_id".
+        assert_eq!(conf.identity_source, "native_id");
+        // only_right sample carries `native_id` (no round-trip metadata).
+        let only_right = &outcome.samples.only_right[0];
+        assert!(only_right.identity_key.is_some());
+    }
+
+    #[test]
+    fn reconcile_sources_redacts_identity_by_default() {
+        let store = Store::open_in_memory().unwrap();
+        seed_reconcile_fixture(&store);
+        let outcome = store
+            .reconcile_sources(&ReconcileOptions {
+                left: ReconcileSourceSelector {
+                    adapter: "mem0".into(),
+                    instance: None,
+                },
+                right: ReconcileSourceSelector {
+                    adapter: "letta".into(),
+                    instance: None,
+                },
+                limit: 10,
+                include_identity: false,
+            })
+            .unwrap();
+        for s in outcome
+            .samples
+            .only_left
+            .iter()
+            .chain(outcome.samples.only_right.iter())
+            .chain(outcome.samples.conflicts.iter())
+        {
+            assert!(
+                s.identity_key.is_none(),
+                "include_identity=false must hide identity_key: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_sources_caps_samples_but_not_counts() {
+        let store = Store::open_in_memory().unwrap();
+        // Seed many only-left rows so `limit` matters.
+        for i in 0..25 {
+            let mut r = make_record(
+                "mem0",
+                &format!("left-{i}"),
+                &format!("body {i}"),
+                Kind::Fact,
+            );
+            r.provenance.native_id = format!("left-{i}");
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(&r, &chunks, None).unwrap();
+        }
+        let outcome = store
+            .reconcile_sources(&ReconcileOptions {
+                left: ReconcileSourceSelector {
+                    adapter: "mem0".into(),
+                    instance: None,
+                },
+                right: ReconcileSourceSelector {
+                    adapter: "letta".into(),
+                    instance: None,
+                },
+                limit: 5,
+                include_identity: false,
+            })
+            .unwrap();
+        assert_eq!(outcome.counts.only_left, 25, "counts ignore the cap");
+        assert_eq!(
+            outcome.samples.only_left.len(),
+            5,
+            "samples respect the cap"
+        );
+    }
+
+    #[test]
+    fn reconcile_sources_returns_empty_when_both_sides_empty() {
+        let store = Store::open_in_memory().unwrap();
+        let outcome = store
+            .reconcile_sources(&ReconcileOptions {
+                left: ReconcileSourceSelector {
+                    adapter: "nothing".into(),
+                    instance: None,
+                },
+                right: ReconcileSourceSelector {
+                    adapter: "also-nothing".into(),
+                    instance: None,
+                },
+                limit: 10,
+                include_identity: false,
+            })
+            .unwrap();
+        assert_eq!(outcome.counts.only_left, 0);
+        assert_eq!(outcome.counts.only_right, 0);
+        assert_eq!(outcome.counts.both, 0);
+        assert_eq!(outcome.counts.conflicts, 0);
+        assert!(outcome.samples.only_left.is_empty());
     }
 }

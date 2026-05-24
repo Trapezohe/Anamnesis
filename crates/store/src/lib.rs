@@ -23,12 +23,13 @@ pub use api::{
     ForgetCascadePreview, ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview,
     ForgottenRecord, ForgottenSourceCount, LineageChain, ListForgottenFilter, McpRequestMetric,
     McpToolMetricSummary, NativeConflictFilter, NativeConflictGroup, NativeConflictRecord,
-    PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter, SourceRow, SourceWithCounts,
-    StoreStats, SummarizePreferencesRow, UnforgetCascadeOptions, UnforgetCascadeOutcome,
-    UnforgetCascadePreview, UnforgetRecordOutcome, UserTagMutation, UserTagOperation,
-    LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT, LIST_FORGOTTEN_MAX_LIMIT, LIST_NATIVE_CONFLICTS_MAX_LIMIT,
-    MAX_LIST_LIMIT, MCP_METRICS_CAP, NATIVE_CONFLICT_PREVIEW_CHARS, TAG_RECORD_MAX_BATCH,
-    USER_TAG_MAX_LEN,
+    PendingEmbeddingJob, ReconcileCounts, ReconcileOptions, ReconcileOutcome, ReconcileSample,
+    ReconcileSamples, ReconcileSourceSelector, RecordHeader, RecordSummary, SearchFilter,
+    SourceRow, SourceWithCounts, StoreStats, SummarizePreferencesRow, UnforgetCascadeOptions,
+    UnforgetCascadeOutcome, UnforgetCascadePreview, UnforgetRecordOutcome, UserTagMutation,
+    UserTagOperation, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT, LIST_FORGOTTEN_MAX_LIMIT,
+    LIST_NATIVE_CONFLICTS_MAX_LIMIT, MAX_LIST_LIMIT, MCP_METRICS_CAP,
+    NATIVE_CONFLICT_PREVIEW_CHARS, RECONCILE_MAX_LIMIT, TAG_RECORD_MAX_BATCH, USER_TAG_MAX_LEN,
 };
 pub use near_merge_preview::{build_merge_preview, GroupMergePreview, RankedRecord};
 pub use semantic_dedupe::{
