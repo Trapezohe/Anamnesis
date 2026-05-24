@@ -821,6 +821,7 @@ impl AnamnesisServer {
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             "dedupe" => self.tool_dedupe(args.clone()).await,
             "list_conflicts" => self.tool_list_conflicts(args.clone()).await,
+            "discover_adapters" => self.tool_discover_adapters().await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
             "audit_tail" => self.tool_audit_tail(args.clone()).await,
             "source_show" => self.tool_source_show(args.clone()).await,
@@ -2374,6 +2375,23 @@ impl AnamnesisServer {
             payload["counts"] = render_forgotten_counts(buckets);
         }
         Ok(payload)
+    }
+
+    /// Round 137 (PR-78bf): MCP `discover_adapters` — return the
+    /// compile-time adapter capability roster and the runtime
+    /// detection pass. Lets an MCP agent discover what adapters
+    /// this Anamnesis supports and what's already on this machine
+    /// without shelling out to `anamnesis discover`. Not
+    /// admin-gated — discovery only returns paths / schema names /
+    /// counts, never user memory content (the same contract the
+    /// CLI honours per BLUEPRINT §3.3).
+    async fn tool_discover_adapters(&self) -> Result<Value, String> {
+        Ok(
+            crate::adapter_discovery::build_discover_adapters_payload(
+                self.home_override.as_deref(),
+            )
+            .await,
+        )
     }
 
     /// Round 135 (PR-78bd): MCP `list_conflicts` — cross-adapter
@@ -4282,6 +4300,22 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "discover_adapters",
+                "description": "Round 137: programmatic capability discovery. Returns the static \
+                                catalogue of adapters compiled into this MCP binary (`adapters[]`) \
+                                plus a runtime detection pass of memory sources present on this \
+                                machine (`detected[]`). Lets an agent answer 'what memory \
+                                frameworks does this Anamnesis support, and what's already on \
+                                disk?' without shelling out to the CLI. NOT admin-gated — the \
+                                same metadata-only contract the CLI honours per BLUEPRINT §3.3: \
+                                paths, schema names, glob counts only, never user memory content. \
+                                Takes no input.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
                 "name": "tag_record",
                 "description": "Apply, remove, or replace user tags on a record. Tags live in a \
                                 separate overlay table from the adapter-derived `tags` field, so \
@@ -4645,6 +4679,8 @@ mod tests {
             "dedupe",
             // Round 135: read-only diagnostic, not admin-gated.
             "list_conflicts",
+            // Round 137: programmatic capability discovery, not admin-gated.
+            "discover_adapters",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -4657,7 +4693,8 @@ mod tests {
         );
         // R77 added `dedupe` to the non-admin catalogue (5 → 6).
         // R135 added `list_conflicts` (6 → 7).
-        assert_eq!(names.len(), 7, "expect exactly 7 non-admin tools");
+        // R137 added `discover_adapters` (7 → 8).
+        assert_eq!(names.len(), 8, "expect exactly 8 non-admin tools");
     }
 
     #[tokio::test]
@@ -4673,8 +4710,9 @@ mod tests {
         // (7→8). R75 added unforget_record (8→9). R77 added
         // dedupe (9→10). R78 added tag_record (10→11). R84 added
         // audit_tail (11→12). R86 added source_show (12→13).
-        // R135 added list_conflicts (13→14).
-        assert_eq!(names.len(), 14);
+        // R135 added list_conflicts (13→14). R137 added
+        // discover_adapters (14→15).
+        assert_eq!(names.len(), 15);
         for expected in [
             "search_memories",
             "get_record",
@@ -4690,6 +4728,7 @@ mod tests {
             "audit_tail",
             "source_show",
             "list_conflicts",
+            "discover_adapters",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -4702,7 +4741,7 @@ mod tests {
     /// `summary` line for agent discovery, completing the trio
     /// started in R111 (`prompts/list`) + R112
     /// (`resources/list`). Default (admin off): counts only
-    /// the 7 visible tools (R135 added `list_conflicts`) and
+    /// the 8 visible tools (R137 added `discover_adapters`) and
     /// says `admin tools hidden`.
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_off() {
@@ -4715,10 +4754,11 @@ mod tests {
             .expect("tools/list must carry top-level `summary` for discovery");
         // Visible-count must match post-filter `tools[]`.len().
         // R86 baseline: 13 catalogue - 7 admin = 6 visible.
-        // R135 added list_conflicts (non-admin) → 14 catalogue - 7 admin = 7.
+        // R135 added list_conflicts → 14 - 7 = 7.
+        // R137 added discover_adapters → 15 - 7 = 8.
         assert!(
-            summary.contains("7 tools exposed"),
-            "non-admin summary should declare 7 visible tools: {summary}"
+            summary.contains("8 tools exposed"),
+            "non-admin summary should declare 8 visible tools: {summary}"
         );
         // Operator must learn which tools are gated even when
         // they're hidden.
@@ -4731,13 +4771,13 @@ mod tests {
             "summary should name a representative admin tool: {summary}"
         );
         // Back-compat: `tools[]` continues to carry only the
-        // 7 visible entries.
+        // 8 visible entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
     }
 
-    /// With admin enabled, summary reports 14 visible tools
-    /// (R135 added list_conflicts) and switches the verb to
+    /// With admin enabled, summary reports 15 visible tools
+    /// (R137 added discover_adapters) and switches the verb to
     /// `admin tools enabled`.
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
@@ -4747,17 +4787,17 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("14 tools exposed"),
-            "admin-on summary should declare 14 visible tools: {summary}"
+            summary.contains("15 tools exposed"),
+            "admin-on summary should declare 15 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
         // Same back-compat assertion: `tools[]` carries the
-        // 14 entries.
+        // 15 entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
     }
 
     #[tokio::test]

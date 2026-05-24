@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod adapter_discovery;
 pub mod protocol;
 pub mod server;
 pub mod stdio;
