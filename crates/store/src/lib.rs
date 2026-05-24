@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod cjk;
+pub mod semantic_dedupe;
 mod vec_ext;
 
 pub use api::{
@@ -22,6 +23,10 @@ pub use api::{
     UserTagMutation, UserTagOperation, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT,
     LIST_FORGOTTEN_MAX_LIMIT, MAX_LIST_LIMIT, MCP_METRICS_CAP, TAG_RECORD_MAX_BATCH,
     USER_TAG_MAX_LEN,
+};
+pub use semantic_dedupe::{
+    list_near_duplicates, NearDedupeScanRow, NearDuplicateFilter, NearDuplicateGroup,
+    NearDuplicateRecord, MAX_LIMIT as NEAR_DEDUPE_MAX_LIMIT,
 };
 
 use std::path::Path;

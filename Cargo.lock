@@ -452,6 +452,7 @@ name = "anamnesis-store"
 version = "0.1.0"
 dependencies = [
  "anamnesis-core",
+ "blake3",
  "chrono",
  "criterion",
  "jieba-rs",
