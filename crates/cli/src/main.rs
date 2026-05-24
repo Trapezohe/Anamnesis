@@ -524,12 +524,26 @@ enum Command {
     #[command(subcommand)]
     Audit(AuditCmd),
 
-    /// Export records as JSONL or CSV.
+    /// Export records as JSONL, CSV, or a mem0-readable SQLite DB.
+    ///
+    /// Round 138 (PR-78bg) added `mem0-sqlite` — closes the
+    /// bidirectional interop loop: an operator can `import mem0`
+    /// → normalise/dedupe/consolidate in Anamnesis → `export
+    /// --format mem0-sqlite` back into the schema mem0 itself
+    /// reads. The exported DB is a fresh file; we refuse to
+    /// overwrite an existing path so a typo can't clobber the
+    /// user's real `~/.mem0/history.db`.
     Export {
-        /// Output file path (default: stdout).
+        /// Output file path. For `jsonl` / `csv`: defaults to
+        /// stdout. For `mem0-sqlite`: REQUIRED — the SQLite
+        /// shape can't stream, so we always materialise a file
+        /// path.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Format: `jsonl` (one AnamnesisRecord per line) or `csv`.
+        /// Format: `jsonl` (one AnamnesisRecord per line), `csv`,
+        /// or `mem0-sqlite` (R138 — fresh SQLite DB with the
+        /// `memories` table mem0 itself reads, for round-tripping
+        /// memory back into mem0 after Anamnesis processing).
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// Restrict to one source (adapter id).
@@ -2621,6 +2635,37 @@ fn cmd_export(
         collected?
     }; // stmt + conn dropped here, mutex released before get_record below
 
+    // Round 138 (PR-78bg): `mem0-sqlite` exports into a brand-new
+    // SQLite file. It can't stream into stdout (rusqlite needs a
+    // path) and it must NEVER clobber an existing file — the user's
+    // real `~/.mem0/history.db` is a one-typo-away target. Refuse
+    // both error cases loudly here so the surface stays safe.
+    if format == "mem0-sqlite" {
+        let out = out.ok_or_else(|| {
+            anyhow!(
+                "--format mem0-sqlite requires --out <path>: SQLite output cannot stream to stdout"
+            )
+        })?;
+        if out.exists() {
+            return Err(anyhow!(
+                "refusing to overwrite existing file {}; pick a fresh --out path",
+                out.display()
+            ));
+        }
+        export_mem0_sqlite(&store, &ids, out)?;
+        eprintln!("exported {} record(s) to {}", ids.len(), out.display());
+        audit(data_dir).record(anamnesis_core::AuditEntry::new(
+            "export",
+            serde_json::json!({
+                "format": format,
+                "source": source,
+                "out": out.display().to_string(),
+                "records": ids.len(),
+            }),
+        ));
+        return Ok(());
+    }
+
     let mut writer: Box<dyn std::io::Write> = match out {
         Some(p) => Box::new(std::fs::File::create(p)?),
         None => Box::new(std::io::stdout()),
@@ -2629,7 +2674,11 @@ fn cmd_export(
     match format {
         "jsonl" => export_jsonl(&store, &ids, &mut writer)?,
         "csv" => export_csv(&store, &ids, &mut writer)?,
-        other => return Err(anyhow!("unsupported format: {other} (try jsonl or csv)")),
+        other => {
+            return Err(anyhow!(
+                "unsupported format: {other} (try jsonl, csv, or mem0-sqlite)"
+            ))
+        }
     }
     eprintln!("exported {} record(s)", ids.len());
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
@@ -2651,6 +2700,111 @@ fn export_jsonl(store: &Store, ids: &[String], writer: &mut dyn std::io::Write) 
             writeln!(writer, "{line}")?;
         }
     }
+    Ok(())
+}
+
+/// Round 138 (PR-78bg): export to a fresh SQLite DB whose shape
+/// matches what mem0 itself reads. Closes the round-trip:
+/// `import mem0 → normalise/dedupe/consolidate → export
+/// mem0-sqlite` produces a file the same mem0 adapter can
+/// re-scan, and any other mem0-compatible tool can consume.
+///
+/// Wire shape (matches `adapter-mem0/src/scanner.rs` PRAGMA probe):
+///
+/// ```sql
+/// CREATE TABLE memories (
+///     id         TEXT PRIMARY KEY,
+///     memory     TEXT NOT NULL,
+///     user_id    TEXT,
+///     agent_id   TEXT,
+///     run_id     TEXT,
+///     metadata   TEXT,     -- JSON; carries our provenance backlink
+///     created_at TEXT,     -- RFC3339
+///     updated_at TEXT,     -- RFC3339
+///     hash       TEXT      -- == AnamnesisRecord.provenance.raw_hash
+/// );
+/// ```
+///
+/// `metadata` is a JSON object that always carries the operator's
+/// original adapter `metadata` (when present) plus an
+/// `anamnesis_*` provenance block — so re-importing this DB into
+/// Anamnesis preserves which source originally produced each row,
+/// even after a round-trip.
+fn export_mem0_sqlite(store: &Store, ids: &[String], out: &std::path::Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(out)?;
+    conn.execute_batch(
+        "CREATE TABLE memories ( \
+            id         TEXT PRIMARY KEY, \
+            memory     TEXT NOT NULL, \
+            user_id    TEXT, \
+            agent_id   TEXT, \
+            run_id     TEXT, \
+            metadata   TEXT, \
+            created_at TEXT, \
+            updated_at TEXT, \
+            hash       TEXT \
+        );",
+    )?;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO memories \
+                (id, memory, user_id, agent_id, run_id, metadata, created_at, updated_at, hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for id in ids {
+            let Some(rec) = store.get_record(&anamnesis_core::RecordId(id.clone()))? else {
+                continue;
+            };
+            // metadata = original-adapter metadata + a provenance
+            // backlink under `anamnesis_*` keys. Both sides are
+            // serialised as a single JSON object string so the mem0
+            // reader (which keeps `metadata` as opaque text) sees
+            // exactly what it'd see for a native mem0 row.
+            // `AnamnesisRecord.metadata` is already a `Map<String,
+            // Value>` per the type — clone the existing entries and
+            // layer the `anamnesis_*` provenance keys on top.
+            let mut meta: serde_json::Map<String, serde_json::Value> = rec.metadata.clone();
+            meta.insert(
+                "anamnesis_source_adapter".into(),
+                serde_json::json!(rec.source.adapter),
+            );
+            if let Some(inst) = &rec.source.instance {
+                meta.insert("anamnesis_source_instance".into(), serde_json::json!(inst));
+            }
+            meta.insert(
+                "anamnesis_kind".into(),
+                serde_json::json!(format!("{:?}", rec.kind).to_lowercase()),
+            );
+            meta.insert(
+                "anamnesis_scope".into(),
+                serde_json::json!(format!("{:?}", rec.scope).to_lowercase()),
+            );
+            meta.insert("anamnesis_tags".into(), serde_json::json!(rec.tags));
+            meta.insert(
+                "anamnesis_native_id".into(),
+                serde_json::json!(rec.provenance.native_id),
+            );
+            if let Some(parent) = &rec.provenance.derived_from {
+                meta.insert("anamnesis_derived_from".into(), serde_json::json!(parent.0));
+            }
+            let metadata_json = serde_json::to_string(&serde_json::Value::Object(meta))?;
+            let created_iso = rec.created_at.to_rfc3339();
+            let updated_iso = rec.updated_at.map(|t| t.to_rfc3339());
+            stmt.execute(rusqlite::params![
+                rec.id.0,
+                rec.content,
+                Option::<String>::None, // user_id — Anamnesis doesn't track per-user attribution
+                Option::<String>::None, // agent_id
+                Option::<String>::None, // run_id
+                metadata_json,
+                created_iso,
+                updated_iso,
+                rec.provenance.raw_hash,
+            ])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
