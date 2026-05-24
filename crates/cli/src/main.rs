@@ -5,6 +5,13 @@
 // inlined idents — clippy's literal-format-arg lint isn't load-bearing here.
 #![allow(clippy::print_literal)]
 
+// Round 139 (PR-78bh): R138 introduced `export --format mem0-sqlite`
+// inline. As more round-trip formats land (R139 letta-sqlite,
+// future claude-code-md, etc.), the inline approach balloons
+// `cmd_export`. Keep each round-trip exporter in its own small
+// module.
+mod export_letta;
+
 use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
@@ -524,26 +531,33 @@ enum Command {
     #[command(subcommand)]
     Audit(AuditCmd),
 
-    /// Export records as JSONL, CSV, or a mem0-readable SQLite DB.
+    /// Export records as JSONL, CSV, or a mem0-/letta-readable
+    /// SQLite DB.
     ///
-    /// Round 138 (PR-78bg) added `mem0-sqlite` — closes the
-    /// bidirectional interop loop: an operator can `import mem0`
-    /// → normalise/dedupe/consolidate in Anamnesis → `export
-    /// --format mem0-sqlite` back into the schema mem0 itself
-    /// reads. The exported DB is a fresh file; we refuse to
-    /// overwrite an existing path so a typo can't clobber the
-    /// user's real `~/.mem0/history.db`.
+    /// Round 138 (PR-78bg) added `mem0-sqlite` and R139 (PR-78bh)
+    /// added `letta-sqlite` — both close the bidirectional interop
+    /// loop: an operator can import → normalise/dedupe/consolidate
+    /// in Anamnesis → export back into the schema the original
+    /// framework itself reads. Exported DBs are fresh files; we
+    /// refuse to overwrite an existing path so a typo can't
+    /// clobber the user's real `~/.mem0/history.db` or
+    /// `~/.letta/letta.db`.
     Export {
         /// Output file path. For `jsonl` / `csv`: defaults to
-        /// stdout. For `mem0-sqlite`: REQUIRED — the SQLite
-        /// shape can't stream, so we always materialise a file
-        /// path.
+        /// stdout. For `mem0-sqlite` / `letta-sqlite`: REQUIRED
+        /// — SQLite output can't stream, so we always materialise
+        /// a file path.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Format: `jsonl` (one AnamnesisRecord per line), `csv`,
-        /// or `mem0-sqlite` (R138 — fresh SQLite DB with the
-        /// `memories` table mem0 itself reads, for round-tripping
-        /// memory back into mem0 after Anamnesis processing).
+        /// `mem0-sqlite` (R138 — fresh SQLite DB with the
+        /// `memories` table mem0 itself reads), or `letta-sqlite`
+        /// (R139 — fresh SQLite DB with the `block` table the
+        /// Letta SQLite adapter reads). Letta-origin records
+        /// round-trip their native `block` columns
+        /// (label/description/template_name) from the metadata
+        /// the Letta adapter stashed at import time; non-Letta
+        /// origins get a stable `anamnesis/<adapter>` label.
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// Restrict to one source (adapter id).
@@ -2635,15 +2649,17 @@ fn cmd_export(
         collected?
     }; // stmt + conn dropped here, mutex released before get_record below
 
-    // Round 138 (PR-78bg): `mem0-sqlite` exports into a brand-new
-    // SQLite file. It can't stream into stdout (rusqlite needs a
-    // path) and it must NEVER clobber an existing file — the user's
-    // real `~/.mem0/history.db` is a one-typo-away target. Refuse
-    // both error cases loudly here so the surface stays safe.
-    if format == "mem0-sqlite" {
+    // Round 138-139 (PR-78bg, PR-78bh): `mem0-sqlite` and
+    // `letta-sqlite` both write a brand-new SQLite file. They
+    // can't stream into stdout (rusqlite needs a path) and they
+    // must NEVER clobber an existing file — the user's real
+    // `~/.mem0/history.db` or `~/.letta/letta.db` is a
+    // one-typo-away target. Shared guard so both formats — and
+    // any future SQLite-output format — get the same protection.
+    if format == "mem0-sqlite" || format == "letta-sqlite" {
         let out = out.ok_or_else(|| {
             anyhow!(
-                "--format mem0-sqlite requires --out <path>: SQLite output cannot stream to stdout"
+                "--format {format} requires --out <path>: SQLite output cannot stream to stdout"
             )
         })?;
         if out.exists() {
@@ -2652,7 +2668,11 @@ fn cmd_export(
                 out.display()
             ));
         }
-        export_mem0_sqlite(&store, &ids, out)?;
+        match format {
+            "mem0-sqlite" => export_mem0_sqlite(&store, &ids, out)?,
+            "letta-sqlite" => export_letta::export_letta_sqlite(&store, &ids, out)?,
+            _ => unreachable!("guard above narrows the format set"),
+        }
         eprintln!("exported {} record(s) to {}", ids.len(), out.display());
         audit(data_dir).record(anamnesis_core::AuditEntry::new(
             "export",
@@ -2676,7 +2696,7 @@ fn cmd_export(
         "csv" => export_csv(&store, &ids, &mut writer)?,
         other => {
             return Err(anyhow!(
-                "unsupported format: {other} (try jsonl, csv, or mem0-sqlite)"
+                "unsupported format: {other} (try jsonl, csv, mem0-sqlite, or letta-sqlite)"
             ))
         }
     }
