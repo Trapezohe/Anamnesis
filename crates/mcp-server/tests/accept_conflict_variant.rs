@@ -120,9 +120,7 @@ async fn accept_conflict_variant_dry_run_does_not_mutate() {
     assert_eq!(forget.len(), 1, "one variant B record gets queued");
 
     // Conflict still present (no writes).
-    let resp = server
-        .handle(tool_call("list_conflicts", json!({})))
-        .await;
+    let resp = server.handle(tool_call("list_conflicts", json!({}))).await;
     let payload = extract_payload(&resp);
     assert_eq!(payload["count"], 1, "dry-run must not resolve the conflict");
 }
@@ -142,9 +140,7 @@ async fn accept_conflict_variant_apply_tombstones_losers() {
     assert_eq!(payload["status"], "accepted");
 
     // Conflict is gone.
-    let resp = server
-        .handle(tool_call("list_conflicts", json!({})))
-        .await;
+    let resp = server.handle(tool_call("list_conflicts", json!({}))).await;
     let payload = extract_payload(&resp);
     assert_eq!(payload["count"], 0, "apply must resolve the conflict");
 }
