@@ -1,21 +1,8 @@
-//! Round 140 (PR-78bi): shared exporters for Anamnesis records.
+//! Shared exporters (`jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`).
 //!
-//! R138-R139 introduced `mem0-sqlite` and `letta-sqlite` exporters
-//! inline in the CLI. R140 lifts the four supported formats
-//! (`jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`) into a workspace
-//! crate so both the CLI's `anamnesis export` and the new
-//! admin-gated MCP `export_memories` tool share one implementation.
-//!
-//! Single source of truth for:
-//! - the format catalogue (`ExportFormat`),
-//! - the filter shape (`ExportFilter`),
-//! - the round-trip metadata convention (Anamnesis provenance keys
-//!   on every SQLite export so re-imports preserve lineage).
-//!
-//! Privacy / safety inherits from the CLI contract this code came
-//! from: no `cargo bench`-style work, no live `~/.mem0/history.db`
-//! overwrite (callers MUST guard `out.exists()` at the entry point —
-//! see `ExportError::OutputAlreadyExists`).
+//! Single source of truth for the format catalogue, filter shape, and the
+//! `anamnesis_*` provenance metadata on SQLite exports. Used by the CLI's
+//! `anamnesis export` and the MCP `export_memories` tool.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -26,26 +13,21 @@ use anamnesis_core::RecordId;
 use anamnesis_store::Store;
 use thiserror::Error;
 
-/// Wire-shape format identifier shared by CLI / MCP entry points.
+/// Output format token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
-    /// One [`anamnesis_core::AnamnesisRecord`] per line, JSON-encoded.
+    /// One `AnamnesisRecord` per line, JSON-encoded.
     Jsonl,
-    /// Flat tabular dump of the operator-decision-ready columns.
+    /// Flat tabular dump.
     Csv,
-    /// Fresh SQLite DB with mem0's canonical `memories` table
-    /// (R138 PR-78bg). Round-trip friendly: provenance keys live in
-    /// `metadata` JSON under `anamnesis_*`.
+    /// Fresh SQLite DB with mem0's `memories` table.
     Mem0Sqlite,
-    /// Fresh SQLite DB with Letta's canonical `block` table (R139
-    /// PR-78bh). Letta-origin records reconstruct their native
-    /// `label` / `description` / `template_name` from metadata;
-    /// foreign-origin gets a stable `anamnesis/<adapter>` label.
+    /// Fresh SQLite DB with Letta's `block` table.
     LettaSqlite,
 }
 
 impl ExportFormat {
-    /// Parse the operator-typed format token. Stable wire vocabulary.
+    /// Parse the operator-typed token.
     pub fn parse(token: &str) -> Result<Self, ExportError> {
         match token {
             "jsonl" => Ok(Self::Jsonl),
@@ -56,8 +38,7 @@ impl ExportFormat {
         }
     }
 
-    /// Inverse of [`Self::parse`] — for echoing back in audit logs
-    /// and MCP responses.
+    /// Wire token (inverse of [`Self::parse`]).
     pub fn as_token(self) -> &'static str {
         match self {
             Self::Jsonl => "jsonl",
@@ -67,48 +48,37 @@ impl ExportFormat {
         }
     }
 
-    /// SQLite-output formats MUST materialise to a path; they can't
-    /// stream to stdout (rusqlite needs a path) and a typo would
-    /// otherwise risk clobbering the operator's real upstream DB.
+    /// SQLite formats can't stream → caller MUST supply `out`.
     pub fn requires_out_path(self) -> bool {
         matches!(self, Self::Mem0Sqlite | Self::LettaSqlite)
     }
 }
 
-/// Filter for [`select_record_ids`]. All fields are optional; an
-/// empty filter selects every live record in the store.
-///
-/// `source` / `instance` use the existing R104/R115 comma-separated
-/// OR grammar (parsed via `anamnesis_core::parse_csv_filter`).
-/// `kind` is a single Kind discriminator (`fact` / `preference` /
-/// `episode` / `feedback` / `skill` / `reference` / `unknown`).
+/// Selection filter. `None` everywhere = all live records.
+/// `source` / `instance` use the comma-separated OR grammar.
 #[derive(Debug, Clone, Default)]
 pub struct ExportFilter {
-    /// Adapter id or comma-separated OR list. `None` matches all.
+    /// Adapter id or CSV OR list.
     pub source: Option<String>,
-    /// Instance discriminator or comma-separated OR list. `None`
-    /// matches all instances.
+    /// Instance id or CSV OR list.
     pub instance: Option<String>,
-    /// Single `Kind` token. `None` matches all kinds.
+    /// Single Kind token.
     pub kind: Option<String>,
 }
 
-/// Errors the exporter surface emits. CLI / MCP wrap these into
-/// their own user-facing error messages.
+/// Exporter errors. CLI/MCP wrap into user-facing strings.
 #[derive(Debug, Error)]
 pub enum ExportError {
-    /// Format token didn't match the known set.
+    /// Format token unknown.
     #[error("unsupported format: {0} (try jsonl, csv, mem0-sqlite, or letta-sqlite)")]
     UnknownFormat(String),
-    /// SQLite-output format was asked for without `--out`.
+    /// SQLite format requested without `--out`.
     #[error("--format {format} requires --out <path>: SQLite output cannot stream to stdout")]
     OutPathRequired {
-        /// The format token that requires `--out`.
+        /// The format that requires `--out`.
         format: &'static str,
     },
-    /// The target file already exists. We refuse to overwrite so
-    /// a typo can't clobber an upstream `~/.mem0/history.db` or
-    /// `~/.letta/letta.db`.
+    /// Target path exists; refuse to overwrite (protects upstream DBs).
     #[error("refusing to overwrite existing file {0}; pick a fresh --out path")]
     OutputAlreadyExists(PathBuf),
     /// Anamnesis store I/O failed.
@@ -125,31 +95,24 @@ pub enum ExportError {
     Json(#[from] serde_json::Error),
 }
 
-/// Outcome of an export call — bounded metadata the caller can
-/// echo to the operator / MCP client / audit log.
+/// Bounded export metadata — for audit logs and MCP responses.
 #[derive(Debug, Clone)]
 pub struct ExportOutcome {
-    /// Format that was written.
+    /// Format written.
     pub format: ExportFormat,
-    /// Output path (when one was written) — `None` for `jsonl` /
-    /// `csv` writing to stdout.
+    /// Output path, or `None` for stdout.
     pub out: Option<PathBuf>,
-    /// Number of records successfully written.
+    /// Records written.
     pub records: u64,
-    /// Output file size in bytes. `None` for stdout sinks.
+    /// File size, or `None` for stdout.
     pub bytes: Option<u64>,
 }
 
-/// Resolve the set of `RecordId`s an export call should serialise,
-/// honouring source/instance/kind filters. Returns ids ordered by
-/// `created_at ASC` (then `id ASC` as a stable tiebreaker), the
-/// same convention `cmd_export` has used since the original R0
-/// shape.
+/// Select matching ids ordered `(created_at ASC, id ASC)`.
 ///
-/// Releases the store's `parking_lot` connection guard before
-/// returning — callers must NOT hold an outer guard while invoking
-/// downstream `store.get_record()` calls (the underlying
-/// `parking_lot::Mutex` is not re-entrant).
+/// Drops the store connection guard before returning — caller must NOT
+/// hold an outer guard while calling downstream `store.get_record()`
+/// (parking_lot mutex is not re-entrant).
 pub fn select_record_ids(store: &Store, filter: &ExportFilter) -> Result<Vec<String>, ExportError> {
     let sources = anamnesis_core::parse_csv_filter(filter.source.as_deref());
     let instances = anamnesis_core::parse_csv_filter(filter.instance.as_deref());
@@ -192,10 +155,8 @@ pub fn select_record_ids(store: &Store, filter: &ExportFilter) -> Result<Vec<Str
     Ok(collected?)
 }
 
-/// Validate the SQLite-output safety contract: an `out` path is
-/// supplied and doesn't already exist. CLI and MCP entry points
-/// must call this BEFORE doing any work so the operator sees
-/// the failure mode before partial state lands on disk.
+/// Enforce SQLite-output safety: `out` supplied AND doesn't exist.
+/// Call BEFORE any work so failures surface before partial state.
 pub fn validate_sqlite_output(
     format: ExportFormat,
     out: Option<&Path>,
@@ -211,10 +172,7 @@ pub fn validate_sqlite_output(
     Ok(p)
 }
 
-/// Render the export's [`ExportFilter`] as a one-line summary for
-/// audit-log / MCP-response consumption. Sample:
-/// `"source filter: mem0,letta; instance filter: prod; kind filter: fact"`.
-/// Empty fields render as `"all sources"` / etc.
+/// One-line filter summary for audit/MCP. Empty fields render as `all *`.
 pub fn render_filter_summary(filter: &ExportFilter) -> String {
     let src = filter
         .source
@@ -243,14 +201,9 @@ mod text_exporters;
 pub use sqlite_exporters::{export_letta_sqlite, export_mem0_sqlite};
 pub use text_exporters::{export_csv, export_jsonl};
 
-/// High-level entry point: select records by filter, then route to
-/// the format-specific writer. CLI / MCP both call this.
-///
-/// Returns an [`ExportOutcome`] with bounded metadata (no record
-/// content). When `format.requires_out_path()` is true, this fn
-/// enforces the SQLite-output safety contract; for `jsonl` / `csv`
-/// the caller supplies its own `writer` (stdout for CLI default,
-/// fresh file for `--out`).
+/// Entry point: select + route to format writer. CLI/MCP both call this.
+/// SQLite formats enforce `validate_sqlite_output`; text formats accept
+/// an explicit `writer` (stdout) OR an `out` path (file).
 pub fn run_export(
     store: &Store,
     filter: &ExportFilter,
@@ -261,10 +214,7 @@ pub fn run_export(
     let ids = select_record_ids(store, filter)?;
     match format {
         ExportFormat::Jsonl | ExportFormat::Csv => {
-            // We accept either an explicit `writer` (CLI stdout sink)
-            // or an `out` path (CLI / MCP `--out` file). Materialise
-            // the file into a local that outlives the borrow so the
-            // dyn-Write reference stays valid for the whole call.
+            // Materialise file into a local that outlives the borrow.
             let mut owned_file: std::fs::File;
             let writer_ref: &mut dyn std::io::Write = if let Some(w) = writer {
                 w
@@ -272,9 +222,6 @@ pub fn run_export(
                 owned_file = std::fs::File::create(p)?;
                 &mut owned_file
             } else {
-                // No writer, no out — caller wanted us to materialise
-                // nothing? That's a misuse. CLI / MCP normalise this
-                // before calling us, but assert with a clear error.
                 return Err(ExportError::OutPathRequired {
                     format: format.as_token(),
                 });
@@ -310,8 +257,7 @@ pub fn run_export(
     }
 }
 
-/// Helper for callers that just want the ids; same logic as
-/// `select_record_ids` but kept as a separate symbol for clarity.
+/// `select_record_ids` typed-id variant.
 #[doc(hidden)]
 pub fn _select_record_ids(
     store: &Store,

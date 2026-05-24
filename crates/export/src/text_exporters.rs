@@ -1,9 +1,4 @@
-//! Text-format exporters (`jsonl`, `csv`).
-//!
-//! Lifted from `crates/cli/src/main.rs` so the same logic powers
-//! both the CLI's `anamnesis export` and the MCP `export_memories`
-//! tool. No behaviour change vs the original CLI implementation —
-//! only the location of the code.
+//! Text-format exporters (`jsonl`, `csv`). Shared by CLI + MCP.
 
 use std::io::Write;
 
@@ -12,10 +7,8 @@ use anamnesis_store::Store;
 
 use crate::ExportError;
 
-/// One [`anamnesis_core::AnamnesisRecord`] per line, JSON-encoded.
-/// Includes the full record (content, metadata, provenance, tags,
-/// etc.) — the most lossless format we expose. Records that vanish
-/// between `select_record_ids` and read time are silently skipped.
+/// One full record per JSONL line. Records that vanish between
+/// `select_record_ids` and read are skipped.
 pub fn export_jsonl(
     store: &Store,
     ids: &[String],
@@ -30,9 +23,7 @@ pub fn export_jsonl(
     Ok(())
 }
 
-/// Flat tabular dump of operator-decision-ready columns. Header
-/// matches the original CLI shape so any existing script keeps
-/// working unchanged.
+/// Flat tabular dump. Stable header for back-compat with existing scripts.
 pub fn export_csv(
     store: &Store,
     ids: &[String],
@@ -62,9 +53,7 @@ pub fn export_csv(
     Ok(())
 }
 
-/// Simple RFC-4180-ish escaping: quote + double-inner-quote when
-/// the field contains a comma, quote, or newline. Same rule the
-/// CLI used pre-R140.
+/// RFC-4180-ish: quote + double-inner-quote when field has `,` / `"` / `\n`.
 fn csv_field(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         let escaped = s.replace('"', "\"\"");

@@ -1,31 +1,7 @@
-//! Round 137 (PR-78bf): MCP `discover_adapters` helper.
-//!
-//! Builds the static capability roster (every adapter compiled into
-//! this MCP binary) plus the dynamic detection pass (every
-//! `SourceDetector` that found a candidate on disk). The CLI's
-//! `cmd_discover` runs the same `Discovery` orchestrator, but the
-//! CLI is text-output and shell-only — an MCP agent that wants to
-//! reason about "what adapters does this Anamnesis support, and
-//! what's already on this machine?" had no programmatic surface
-//! until now.
-//!
-//! Design constraints:
-//!
-//! - **Read-only metadata only.** The `Discovery` contract already
-//!   forbids reading memory content during detection (paths, glob
-//!   counts, DB schema names — never user memory). This module
-//!   inherits that contract.
-//! - **No new ACL.** This is a *capability discovery* surface and
-//!   stays non-admin alongside `dedupe`, `list_conflicts`,
-//!   `search_memories`. The action half (registering a source,
-//!   importing) is admin-gated through the existing
-//!   `import_source` workflow.
-//! - **Honour `home_override`.** Test fixtures must be able to
-//!   point detectors at a tempdir without touching `$HOME`. We
-//!   thread the override into `DetectOpts.home_override` AND into
-//!   the per-detector `.with_home()` builders (only the
-//!   `home_override`-aware ones — the others ignore the flag and
-//!   read `DetectOpts`).
+//! `discover_adapters` helper: static capability roster + dynamic detection pass.
+//! Inherits the `Discovery` contract — metadata only, never user memory content.
+//! Non-admin; the action half (register/import) stays admin-gated elsewhere.
+//! `home_override` threads through both `DetectOpts` AND per-detector `.with_home()`.
 
 use std::path::Path;
 
@@ -44,39 +20,22 @@ use anamnesis_adapter_tdai::TdaiDetector;
 use anamnesis_core::discovery::{DetectOpts, DetectedSource, Discovery, SourceDetector};
 use serde_json::{json, Value};
 
-/// One row in the static capability roster returned alongside the
-/// dynamic detection results. Tells an MCP agent "this adapter is
-/// compiled in; here's how to point it at data."
-///
-/// Kept as a private struct (we render directly to `serde_json`) so
-/// the wire shape stays in one place — the MCP layer is the source
-/// of truth, not a derived `Serialize`.
+/// One capability row. Private; rendered directly to JSON.
 struct AdapterCapability {
-    /// Stable adapter id (matches `SourceDescriptor.adapter`).
+    /// Adapter id (`SourceDescriptor.adapter`).
     id: &'static str,
-    /// Whether this adapter has a `SourceDetector` registered.
-    /// `false` means the adapter is usable but requires the
-    /// operator to register a source manually (e.g. `generic-mcp`
-    /// needs a URL).
+    /// `false` = no detector; operator registers manually (e.g. `generic-mcp`).
     detectable: bool,
-    /// Human-readable hint about where this adapter usually finds
-    /// its data — e.g. `"~/.claude/projects"`, `"~/.codex"`.
-    /// `None` for adapters with no canonical default location.
+    /// Canonical default location hint, or `None`.
     default_location_hint: Option<&'static str>,
-    /// On-disk / wire format hint (e.g. `"sqlite"`, `"jsonl"`,
-    /// `"markdown"`, `"mcp-http"`). Free-form; meant for human
-    /// rendering only.
+    /// On-disk / wire format (`sqlite`, `jsonl`, `markdown`, `mcp-http`).
     format: &'static str,
-    /// One-line hint for how an agent / operator would register
-    /// this adapter. Example: `"anamnesis source add claude-code
-    /// --path ~/.claude/projects"`.
+    /// Suggested registration command.
     registration_hint: &'static str,
 }
 
-/// The full compile-time roster. **Single source of truth** for the
-/// adapter catalogue surfaced by `discover_adapters`. Adding a new
-/// adapter requires editing this list AND
-/// [`registered_detectors`] below.
+/// Compile-time adapter roster — single source of truth.
+/// New adapter: edit this list AND [`registered_detectors`].
 fn adapter_roster() -> Vec<AdapterCapability> {
     vec![
         AdapterCapability {
@@ -173,26 +132,15 @@ fn adapter_roster() -> Vec<AdapterCapability> {
     ]
 }
 
-/// Build the live detector orchestrator. Mirrors the CLI
-/// [`run_all_detectors`] roster — keeping these in sync is the same
-/// maintenance burden as the adapter catalogue, but cheaper than a
-/// trait-objects-of-detector-factories indirection.
-///
-/// `home_override`, when supplied, is threaded into the
-/// per-detector builder for the adapters that ship `.with_home()`.
-/// Adapters that don't expose `.with_home()` already read
-/// `DetectOpts.home_override` directly, so passing the same path
-/// through `detect_all` covers them.
+/// Build the detector orchestrator. Mirror of CLI `run_all_detectors`.
+/// Adapters with `.with_home()` get `home_override` threaded; others
+/// read `DetectOpts.home_override` in `build_discover_adapters_payload`.
 fn registered_detectors(home_override: Option<&Path>) -> Discovery {
     let mut d = Discovery::new()
         .register(Box::new(ClaudeCodeDetector::new()))
         .register(Box::new(Mem0SqliteDetector::new()))
         .register(Box::new(CodexDetector::new()));
     let with_home = |det: Box<dyn SourceDetector>| -> Box<dyn SourceDetector> { det };
-    // The adapters below expose a `.with_home(PathBuf)` builder.
-    // We thread the server-supplied override so tests can scope a
-    // fresh tempdir without touching the real `$HOME`. (Adapters
-    // without a builder read `DetectOpts.home_override`.)
     let h = home_override.map(|p| p.to_path_buf());
     let letta = LettaSqliteDetector::new();
     let letta: Box<dyn SourceDetector> = match h.clone() {
@@ -250,10 +198,7 @@ fn registered_detectors(home_override: Option<&Path>) -> Discovery {
     d.register(with_home(memary))
 }
 
-/// Run the full discovery pass and return the structured payload
-/// the MCP `discover_adapters` tool emits. `home_override` is
-/// supplied by `AnamnesisServer` and threaded through detectors
-/// per the contract above.
+/// Run the discovery pass and assemble the `discover_adapters` MCP payload.
 pub async fn build_discover_adapters_payload(home_override: Option<&Path>) -> Value {
     let roster = adapter_roster();
     let discovery = registered_detectors(home_override);
@@ -318,10 +263,7 @@ pub async fn build_discover_adapters_payload(home_override: Option<&Path>) -> Va
 mod tests {
     use super::*;
 
-    /// The catalogue must be in sync with the adapter crates listed
-    /// in `Cargo.toml`. If you add a new adapter crate, you must
-    /// also add it to [`adapter_roster`] (and, if it has a
-    /// detector, to [`registered_detectors`]).
+    /// Catalogue must match adapter crates in Cargo.toml.
     #[test]
     fn adapter_roster_lists_thirteen_adapters() {
         let roster = adapter_roster();
@@ -349,10 +291,7 @@ mod tests {
         }
     }
 
-    /// `generic-mcp` is the only non-detectable adapter (it needs a
-    /// URL the operator types). Pinning this invariant catches a
-    /// future bug where someone marks it `detectable: true` without
-    /// also writing a `SourceDetector` for it.
+    /// `generic-mcp` is the only non-detectable adapter (needs explicit URL).
     #[test]
     fn generic_mcp_is_the_only_non_detectable_adapter() {
         let roster = adapter_roster();
@@ -364,9 +303,7 @@ mod tests {
         assert_eq!(non_detectable, vec!["generic-mcp"]);
     }
 
-    /// Empty `home_override` (a fresh tempdir) returns zero
-    /// `detected[]` but the roster + stats are still populated.
-    /// The detector_count matches the roster's `detectable` count.
+    /// Empty home: zero detections but roster + stats still populated.
     #[tokio::test]
     async fn discover_adapters_empty_home_returns_capability_roster_with_zero_detections() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -383,16 +320,10 @@ mod tests {
         );
     }
 
-    /// When the `home_override` actually contains a detectable
-    /// layout, the detection pass picks it up and the `detected[]`
-    /// row mirrors the `DetectedSource` shape.
+    /// `home_override` with a planted Letta layout fires the detector.
     #[tokio::test]
     async fn discover_adapters_picks_up_letta_sqlite_under_home_override() {
         let tempdir = tempfile::tempdir().unwrap();
-        // Seed a `~/.letta/letta.db` file shape so the Letta
-        // detector's path probe fires. We don't need a real schema
-        // — the detector reports a finding off path existence; the
-        // file just has to exist.
         let letta_dir = tempdir.path().join(".letta");
         std::fs::create_dir_all(&letta_dir).unwrap();
         std::fs::write(letta_dir.join("letta.db"), b"").unwrap();
@@ -409,9 +340,7 @@ mod tests {
         );
     }
 
-    /// The summary string is human-readable and references the
-    /// three numbers the MCP client cares about — keeps the
-    /// summary line stable for an agent that grepf's the string.
+    /// Summary string is stable for grepping by MCP clients.
     #[tokio::test]
     async fn discover_adapters_summary_mentions_counts() {
         let tempdir = tempfile::tempdir().unwrap();
