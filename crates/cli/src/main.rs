@@ -320,6 +320,44 @@ enum Command {
         include_near_self: bool,
     },
 
+    /// Round 135 (PR-78bd): list cross-adapter `native_id`
+    /// content conflicts — multiple adapters claiming the same
+    /// upstream record but disagreeing on what it says. A
+    /// different question from `dedupe`: dedupe answers
+    /// "are these the same memory?" (raw_hash or near-dup);
+    /// `conflicts` answers "do these adapters disagree about the
+    /// same identity?".
+    ///
+    /// Read-only, NOT admin-gated. The action half stays the
+    /// existing `forget` workflow — surface a conflict, let the
+    /// operator decide which variant to drop.
+    Conflicts {
+        /// Restrict to groups containing ≥1 record from a given
+        /// adapter (`mem0`, `claude-code`). Comma-separated OR
+        /// list also accepted, same grammar as `dedupe --source`.
+        /// Groups stay whole — siblings outside the filter still
+        /// appear so the operator sees the full disagreement set.
+        #[arg(long)]
+        source: Option<String>,
+        /// Restrict to groups containing ≥1 record from a given
+        /// instance. Comma-separated OR list also accepted.
+        /// Combines as AND with `--source`.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Max number of groups to return. Default 20, cap 100.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+        /// Include a short `content_preview` per record (capped
+        /// at 240 chars) so an operator can disambiguate variants
+        /// without round-tripping `get-record`. Default off —
+        /// keeps the surface redacted by default.
+        #[arg(long)]
+        include_content: bool,
+    },
+
     /// Remove a tombstone so the source can resurrect the memory
     /// on its next import. Does NOT recreate the record itself —
     /// the tombstone only stored provenance, so "stay forgotten"
@@ -1146,6 +1184,20 @@ async fn run() -> Result<()> {
             include_counts,
             csv,
             include_near_self,
+        ),
+        Command::Conflicts {
+            source,
+            instance,
+            limit,
+            json,
+            include_content,
+        } => cmd_conflicts(
+            &data_dir,
+            source.as_deref(),
+            instance.as_deref(),
+            limit,
+            json,
+            include_content,
         ),
         Command::Unforget {
             record_id,
@@ -3170,6 +3222,147 @@ fn print_human_search_trace(
         vh = t.counts.vec_hits,
         rc = t.counts.ranked_chunks,
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// conflicts (Round 135 PR-78bd)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis conflicts` — list groups of records that share the
+/// same `provenance.native_id` across adapters but disagree on
+/// `content`. Distinct from `dedupe`: dedupe surfaces "same memory
+/// captured twice" (raw_hash or near-dup); conflicts surface
+/// "same identity, different content".
+///
+/// Read-only. Default output is redacted — `content_preview` is
+/// only attached when the operator passes `--include-content`.
+fn cmd_conflicts(
+    data_dir: &std::path::Path,
+    source: Option<&str>,
+    instance: Option<&str>,
+    limit: u32,
+    json: bool,
+    include_content: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let filter = anamnesis_store::NativeConflictFilter {
+        source: source.map(str::to_owned),
+        instance: instance.map(str::to_owned),
+        limit,
+        include_content,
+    };
+    let groups = store.list_native_content_conflicts_filtered(&filter)?;
+    let effective_limit = limit.clamp(1, anamnesis_store::LIST_NATIVE_CONFLICTS_MAX_LIMIT);
+
+    if json {
+        let source_tokens = anamnesis_core::parse_csv_filter(source);
+        let instance_tokens = anamnesis_core::parse_csv_filter(instance);
+        let source_clause = if source_tokens.is_empty() {
+            "source filter: all sources".to_string()
+        } else {
+            format!("source filter: {}", source_tokens.join(" OR "))
+        };
+        let instance_clause = if instance_tokens.is_empty() {
+            "instance filter: all instances".to_string()
+        } else {
+            format!("instance filter: {}", instance_tokens.join(" OR "))
+        };
+        let summary = format!(
+            "{} cross-adapter `native_id` content conflict group(s) returned; limit {}; {}; {}; content_preview: {}.",
+            groups.len(),
+            effective_limit,
+            source_clause,
+            instance_clause,
+            if include_content { "included" } else { "redacted" },
+        );
+
+        let payload = serde_json::json!({
+            "summary":            summary,
+            "format":             "json",
+            "count":              groups.len(),
+            "limit":              effective_limit,
+            "content_included":   include_content,
+            "filter": {
+                "source":   source,
+                "instance": instance,
+            },
+            "groups": groups.iter().map(|g| serde_json::json!({
+                "native_id":             g.native_id,
+                "record_count":          g.records.len(),
+                "content_variant_count": g.content_variant_count,
+                "records": g.records.iter().map(|r| {
+                    let mut row = serde_json::json!({
+                        "record_id":       r.record_id.0,
+                        "adapter":         r.adapter,
+                        "instance":        if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
+                        "native_id":       r.native_id,
+                        "created_at":      r.created_at,
+                        "updated_at":      r.updated_at,
+                        "has_native_path": r.has_native_path,
+                        "content_variant": r.content_variant,
+                    });
+                    if let Some(prev) = &r.content_preview {
+                        row["content_preview"] = serde_json::json!(prev);
+                    }
+                    row
+                }).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if groups.is_empty() {
+        let scope = filter_label(source, instance);
+        if scope.is_empty() {
+            println!("no cross-adapter `native_id` content conflicts");
+        } else {
+            println!("no cross-adapter `native_id` content conflicts (filter: {scope})");
+        }
+        return Ok(());
+    }
+    let scope = filter_label(source, instance);
+    let scope_suffix = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(" (filter: {scope})")
+    };
+    println!(
+        "{} conflict group(s){} (cross-adapter `native_id` disagreement)",
+        groups.len(),
+        scope_suffix,
+    );
+    for (idx, g) in groups.iter().enumerate() {
+        println!(
+            "[{rank}] native_id={nid}  variants={vc}  record_count={n}",
+            rank = idx + 1,
+            nid = g.native_id,
+            vc = g.content_variant_count,
+            n = g.records.len(),
+        );
+        for r in &g.records {
+            let inst = if r.instance.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", r.instance)
+            };
+            println!(
+                "    variant {v}: {} ({}{inst}, created_at={})",
+                r.record_id.0,
+                r.adapter,
+                r.created_at,
+                v = r.content_variant,
+            );
+            if let Some(prev) = &r.content_preview {
+                println!("       preview: {prev}");
+            }
+        }
+        println!();
+    }
+    println!(
+        "Resolve a conflict by picking which variant to keep, then `anamnesis forget <record_id>` the others."
+    );
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

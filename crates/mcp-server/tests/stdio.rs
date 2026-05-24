@@ -91,9 +91,10 @@ fn binary_responds_to_initialize_and_tools_list() {
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
     // Round 77 added `dedupe` to the non-admin catalogue (5 → 6).
+    // Round 135 added `list_conflicts` (6 → 7).
     assert_eq!(
         names.len(),
-        6,
+        7,
         "import_source should be hidden by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source".to_string()));
