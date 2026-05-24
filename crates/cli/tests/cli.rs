@@ -1077,6 +1077,38 @@ fn search_trace_json_emits_stage_breakdown() {
     );
 }
 
+/// Round 136 (PR-78be): the new adaptive candidate-pool policy
+/// (`anamnesis_search::candidate_pool_for_limit`) applies uniformly
+/// to every search entry point. With `--limit 1` the old `limit * 4`
+/// heuristic would have produced pool=4; the new floor (64) protects
+/// recall on tiny-limit queries. Pinning the value here catches a
+/// future regression where someone reintroduces the bespoke
+/// `(limit * 4).max(limit)` calculation at the CLI seam.
+#[test]
+fn search_trace_candidate_pool_honours_central_policy_floor() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let output = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "search", "anything", "--mode", "fulltext", "--limit", "1", "--json", "--trace",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(output.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pool = v["trace"]["candidate_pool"].as_u64().unwrap();
+    assert_eq!(
+        pool,
+        u64::from(anamnesis_search::CANDIDATE_POOL_FLOOR),
+        "limit=1 must clamp UP to the central candidate-pool floor"
+    );
+}
+
 /// Privacy guard: the trace sub-object must not carry user-typed
 /// content. Same contract as the R71 MCP test. Note: the top-level
 /// CLI JSON intentionally already exposes `query` / `snippet` /

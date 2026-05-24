@@ -1081,11 +1081,9 @@ impl AnamnesisServer {
         };
 
         let store = &self.store;
-        let opts = HybridOpts {
-            limit,
-            candidate_pool: (limit * 4).max(limit),
-            mode,
-        };
+        // Round 136 (PR-78be): central candidate-pool policy
+        // (see `anamnesis_search::candidate_pool_for_limit`).
+        let opts = HybridOpts::for_limit(limit, mode);
         // Always go through the traced primitive so the live search
         // and the trace can never drift. The `trace` field on the
         // response is only included when the caller asked — keeping
@@ -3456,11 +3454,8 @@ impl AnamnesisServer {
         };
 
         let store = &self.store;
-        let opts = HybridOpts {
-            limit,
-            candidate_pool: (limit * 4).max(limit),
-            mode: SearchMode::Hybrid,
-        };
+        // Round 136 (PR-78be): central candidate-pool policy.
+        let opts = HybridOpts::for_limit(limit, SearchMode::Hybrid);
         let hits = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
                 .search_filtered(store, text, &filter, &opts)

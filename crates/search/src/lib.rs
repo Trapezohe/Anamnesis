@@ -18,7 +18,8 @@ pub use eval::{
     RankedRecordRef,
 };
 pub use hybrid::{
-    ChunkScoreExplain, HybridOpts, HybridSearcher, RankedChunk, SearchMode, SearchStageCounts,
-    SearchStageTimings, SearchTrace, StageScore, TracedSearchResult,
+    candidate_pool_for_limit, ChunkScoreExplain, HybridOpts, HybridSearcher, RankedChunk,
+    SearchMode, SearchStageCounts, SearchStageTimings, SearchTrace, StageScore, TracedSearchResult,
+    CANDIDATE_POOL_CEIL, CANDIDATE_POOL_FLOOR,
 };
 pub use packer::{pack, ContextBudget, PackedRecord, RecordScoreExplain};
