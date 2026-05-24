@@ -751,6 +751,239 @@ fn export_csv_includes_header_and_rows() {
     assert!(body.contains("\"tea, and, biscuits\""));
 }
 
+// ─── Round 138 PR-78bg: export --format mem0-sqlite ─────────────────
+
+/// Helper: seed Anamnesis with a known mem0 fixture so the export
+/// path has predictable input. Returns the data dir + the source
+/// mem0 row count.
+fn seed_for_mem0_export(dir: &std::path::Path) -> usize {
+    use rusqlite::Connection;
+    let mem0_db = dir.join("mem0_src.sqlite");
+    let conn = Connection::open(&mem0_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories(id TEXT PRIMARY KEY, memory TEXT NOT NULL, \
+            user_id TEXT, agent_id TEXT, run_id TEXT, metadata TEXT, \
+            created_at TEXT, updated_at TEXT, hash TEXT);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories(id, memory, metadata) VALUES \
+            ('a','first memory body','{\"original_tag\":\"alpha\"}'), \
+            ('b','second memory body','{}'), \
+            ('c','third memory body',NULL)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir)
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir)
+        .args([
+            "import",
+            "mem0",
+            "--no-embed",
+            "--path",
+            mem0_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    3
+}
+
+/// Happy path: import a 3-row mem0 fixture, export to
+/// `--format mem0-sqlite`, then verify the output DB matches the
+/// schema mem0's own reader expects (`memories` table with the
+/// canonical columns).
+#[test]
+fn export_mem0_sqlite_writes_canonical_schema_and_rows() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let expected = seed_for_mem0_export(dir.path());
+
+    let out_path = dir.path().join("exported.sqlite");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "mem0-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // The exported file must exist and contain the canonical
+    // `memories` schema.
+    let conn = Connection::open(&out_path).unwrap();
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(memories)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for expected_col in [
+        "id",
+        "memory",
+        "user_id",
+        "agent_id",
+        "run_id",
+        "metadata",
+        "created_at",
+        "updated_at",
+        "hash",
+    ] {
+        assert!(
+            cols.iter().any(|c| c == expected_col),
+            "missing column {expected_col}: got {cols:?}"
+        );
+    }
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n as usize, expected);
+}
+
+/// Each exported row must carry the operator's original adapter
+/// metadata PLUS a provenance block under `anamnesis_*` keys, so a
+/// re-import preserves which source originally produced it. The
+/// `hash` column must match the record's `provenance.raw_hash`.
+#[test]
+fn export_mem0_sqlite_preserves_provenance_in_metadata() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    seed_for_mem0_export(dir.path());
+
+    let out_path = dir.path().join("exported.sqlite");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "mem0-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let conn = Connection::open(&out_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, memory, metadata, hash FROM memories ORDER BY memory")
+        .unwrap();
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // Every row carries non-empty metadata JSON with the
+    // `anamnesis_source_adapter == "mem0"` backlink.
+    for (id, _mem, metadata, hash) in &rows {
+        let meta_str = metadata
+            .as_ref()
+            .unwrap_or_else(|| panic!("row {id} must carry metadata"));
+        let meta: serde_json::Value = serde_json::from_str(meta_str).unwrap();
+        assert_eq!(
+            meta["anamnesis_source_adapter"], "mem0",
+            "row {id} provenance backlink missing"
+        );
+        assert!(meta["anamnesis_kind"].is_string());
+        assert!(meta["anamnesis_tags"].is_array());
+        assert!(meta["anamnesis_native_id"].is_string());
+        // `hash` is the record's raw_hash; mem0 import sets it from
+        // a stable hash of the source row, so it must be non-empty.
+        assert!(
+            hash.as_ref().map(|h| !h.is_empty()).unwrap_or(false),
+            "row {id} missing raw_hash"
+        );
+    }
+
+    // Round-trip canary: row 'a' had a pre-existing
+    // `original_tag` metadata key — exporting must NOT clobber it.
+    let row_a = rows
+        .iter()
+        .find(|(_, m, _, _)| m == "first memory body")
+        .unwrap();
+    let meta_a: serde_json::Value = serde_json::from_str(row_a.2.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        meta_a["original_tag"], "alpha",
+        "operator's original metadata key must survive: {meta_a}"
+    );
+}
+
+/// Negative: `--format mem0-sqlite` without `--out` must fail
+/// loudly. SQLite output cannot stream into stdout — silently
+/// falling back would produce nothing useful.
+#[test]
+fn export_mem0_sqlite_requires_out_path() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["export", "--format", "mem0-sqlite"])
+        .output()
+        .expect("run cli");
+    assert!(!out.status.success(), "must fail without --out");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires --out"),
+        "must explain the missing arg: {stderr}"
+    );
+}
+
+/// Negative: the export refuses to overwrite an existing file.
+/// Protects against an operator typoing their real
+/// `~/.mem0/history.db` as the target — without this guard,
+/// a single mistake would clobber upstream memory.
+#[test]
+fn export_mem0_sqlite_refuses_to_overwrite_existing_file() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out_path = dir.path().join("already_there.sqlite");
+    std::fs::write(&out_path, b"do not clobber me").unwrap();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "mem0-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run cli");
+    assert!(!out.status.success(), "must fail when target exists");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite"),
+        "must explain the overwrite refusal: {stderr}"
+    );
+    // The file was NOT clobbered.
+    assert_eq!(
+        std::fs::read(&out_path).unwrap(),
+        b"do not clobber me",
+        "pre-existing file must be untouched"
+    );
+}
+
 #[test]
 fn verify_reports_healthy_on_fresh_db() {
     let dir = tmp_dir();
