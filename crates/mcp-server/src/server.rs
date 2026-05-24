@@ -325,6 +325,49 @@ fn render_unforget_cascade_preview_json(
     })
 }
 
+/// Per-group `merge_preview` block: keeper id, forget candidates,
+/// proposed `derived_from` edges loser→keeper, and the full ranking.
+/// Privacy: tag *counts* only, never names; never reads content.
+fn render_merge_preview(preview: &anamnesis_store::GroupMergePreview<'_>) -> Value {
+    let ranking: Vec<Value> = preview
+        .ranking
+        .iter()
+        .map(|r| {
+            json!({
+                "rank":             r.rank,
+                "record_id":        r.record.record_id.0,
+                "adapter":          r.record.adapter,
+                "instance":         if r.record.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(r.record.instance.clone())
+                },
+                "native_id":        r.record.native_id,
+                "user_tag_count":   r.user_tag_count,
+                "effective_at":     r.effective_at,
+                "has_native_path":  r.has_native_path,
+                "decision":         r.decision,
+            })
+        })
+        .collect();
+    let proposed_derived_from: Vec<Value> = preview
+        .forget_record_ids
+        .iter()
+        .map(|loser| {
+            json!({
+                "from": loser.0,
+                "to":   preview.keep_record_id.0,
+            })
+        })
+        .collect();
+    json!({
+        "keep_record_id":         preview.keep_record_id.0,
+        "forget_record_ids":      preview.forget_record_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "proposed_derived_from":  proposed_derived_from,
+        "ranking":                ranking,
+    })
+}
+
 /// Flat CSV for `dedupe { mode: "near", csv: true }`. Redacted
 /// (no `raw_hash`/`native_path` — enforced at the type level).
 /// `min_similarity` + `max_distance` columns for in-spreadsheet ranking.
@@ -2575,6 +2618,11 @@ impl AnamnesisServer {
             .get("include_near_self")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Near-only merge-preview (deterministic keep/forget ranking).
+        let merge_preview = args
+            .get("merge_preview")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if matches!(mode, DedupeMode::Near) && include_sensitive {
             return Err(
                 "dedupe: `mode: \"near\"` and `include_sensitive: true` are mutually exclusive — \
@@ -2598,11 +2646,32 @@ impl AnamnesisServer {
                     .to_string(),
             );
         }
+        if merge_preview && matches!(mode, DedupeMode::Exact) {
+            return Err(
+                "dedupe: `merge_preview: true` requires `mode: \"near\"` — the exact path has no \
+                 per-group ranking to propose."
+                    .to_string(),
+            );
+        }
+        if merge_preview && csv_requested {
+            return Err(
+                "dedupe: `merge_preview: true` and `csv: true` are mutually exclusive — the \
+                 per-group ranking draft is a nested object that doesn't flatten safely."
+                    .to_string(),
+            );
+        }
 
         if matches!(mode, DedupeMode::Near) {
             // Near branch carries extra per-group + filter fields.
             return self
-                .tool_dedupe_near(source, instance, limit, csv_requested, include_near_self)
+                .tool_dedupe_near(
+                    source,
+                    instance,
+                    limit,
+                    csv_requested,
+                    include_near_self,
+                    merge_preview,
+                )
                 .await;
         }
 
@@ -2727,6 +2796,9 @@ impl AnamnesisServer {
 
     /// MCP `dedupe { mode: "near" }` — same redaction as exact, plus
     /// per-group `min_similarity` + `max_distance` for ranking.
+    /// `merge_preview: true` attaches the deterministic keep/forget
+    /// ranker (counts only — no tag names; reuses
+    /// `anamnesis_store::build_merge_preview` shared with the CLI).
     async fn tool_dedupe_near(
         &self,
         source: Option<String>,
@@ -2734,6 +2806,7 @@ impl AnamnesisServer {
         limit: u32,
         csv_requested: bool,
         include_near_self: bool,
+        merge_preview: bool,
     ) -> Result<Value, String> {
         let filter = anamnesis_store::NearDuplicateFilter {
             source: source.clone(),
@@ -2761,22 +2834,44 @@ impl AnamnesisServer {
             }));
         }
 
+        // Batched user-tag count lookup (1 round-trip, not N) for
+        // the merge-preview ranker. Always computed when requested.
+        let tag_counts: std::collections::HashMap<String, u32> = if merge_preview {
+            let ids: Vec<anamnesis_core::model::RecordId> = groups
+                .iter()
+                .flat_map(|g| g.records.iter().map(|r| r.record_id.clone()))
+                .collect();
+            if ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                self.store
+                    .user_tags_by_ids(&ids)
+                    .map_err(|e| format!("dedupe near merge_preview: {e}"))?
+                    .into_iter()
+                    .map(|(id, tags)| (id.0, tags.len() as u32))
+                    .collect()
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let source_tokens = anamnesis_core::parse_csv_filter(source.as_deref());
         let instance_tokens = anamnesis_core::parse_csv_filter(instance.as_deref());
         let summary = format!(
             "{} near-duplicate group(s) returned (mode=near); limit {}; {}; {}; \
-             cross-source-only: {}.",
+             cross-source-only: {}; merge_preview: {}.",
             groups.len(),
             effective_limit,
             render_filter_clause("source", &source_tokens),
             render_filter_clause("instance", &instance_tokens),
             !include_near_self,
+            if merge_preview { "included" } else { "omitted" },
         );
 
         let payload_groups: Vec<Value> = groups
             .iter()
             .map(|g| {
-                json!({
+                let mut group = json!({
                     "record_count":   g.records.len(),
                     "min_similarity": g.min_similarity,
                     "max_distance":   g.max_distance,
@@ -2789,7 +2884,13 @@ impl AnamnesisServer {
                         "updated_at":      r.updated_at,
                         "has_native_path": r.has_native_path,
                     })).collect::<Vec<_>>(),
-                })
+                });
+                if merge_preview {
+                    if let Some(preview) = anamnesis_store::build_merge_preview(g, &tag_counts) {
+                        group["merge_preview"] = render_merge_preview(&preview);
+                    }
+                }
+                group
             })
             .collect();
 
@@ -2798,6 +2899,7 @@ impl AnamnesisServer {
             "format":  "json",
             "mode":    "near",
             "limit":   effective_limit,
+            "merge_preview_included": merge_preview,
             "summary": summary,
             "filter": {
                 "source":               source,
@@ -4261,6 +4363,19 @@ fn tools_list_payload_all() -> Value {
                             "default": false,
                             "description": "`mode: \"near\"` only — opt out of the cross-source filter and \
                                             also surface within-adapter near-dups. Refused under `exact`."
+                        },
+                        "merge_preview": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "`mode: \"near\"` only — attach a deterministic keep/forget \
+                                            ranking per group. Read-only proposal; never writes \
+                                            tombstones or `derived_from`. Each group gets `merge_preview.\
+                                            {keep_record_id, forget_record_ids, proposed_derived_from, \
+                                            ranking[]}` where `ranking[]` carries `decision`, \
+                                            `user_tag_count` (counts only — never tag names), \
+                                            `effective_at`, `has_native_path`. Refused under `mode: \
+                                            \"exact\"` and under `csv: true` (nested object doesn't \
+                                            flatten). Top-level `merge_preview_included` echoes the flag."
                         }
                     }
                 }

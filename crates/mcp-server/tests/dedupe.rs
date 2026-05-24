@@ -1151,3 +1151,210 @@ async fn dedupe_tools_list_advertises_mode_enum_and_include_near_self() {
     assert_eq!(enum_values, vec!["exact", "near"]);
     assert_eq!(props["include_near_self"]["type"], "boolean");
 }
+
+// ─── R143: `dedupe { mode: "near", merge_preview: true }` ────────────
+
+/// Seed a cross-adapter near-duplicate pair where the older record
+/// (mem0) carries a user tag; merge_preview must keep that one and
+/// propose the newer untagged sibling as `forget`.
+async fn build_bundle_near_with_tag() -> (AnamnesisServer, tempfile::TempDir) {
+    use anamnesis_store::UserTagOperation;
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let older = Utc::now() - chrono::Duration::hours(1);
+    let mk = |adapter: &str, native: &str, content: &str, when, raw: &str| AnamnesisRecord {
+        id: RecordId::from_parts(adapter, None, native),
+        source: SourceDescriptor {
+            adapter: adapter.into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: content.into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: when,
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/{adapter}/{native}.md")),
+            captured_at: when,
+            raw_hash: raw.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let mem = mk(
+        "mem0",
+        "rec-tagged",
+        "The user prefers thorough error handling in Rust code and \
+         writes comprehensive integration tests with real fixtures \
+         and never uses mocks for critical paths.",
+        older,
+        "secretRawMerge1",
+    );
+    let cc = mk(
+        "claude-code",
+        "rec-untagged",
+        "User prefers thorough error handling in Rust code; \
+         comprehensive integration tests with real fixtures; \
+         no mocks on critical paths.",
+        Utc::now(),
+        "secretRawMerge2",
+    );
+    for r in [&mem, &cc] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(r, &chunks, None).unwrap();
+    }
+    // Tag the OLDER mem0 record so user_tag_count dominates recency.
+    store
+        .tag_record(&mem.id, &["keep-forever".into()], UserTagOperation::Add)
+        .expect("tag mem0 record");
+    let server =
+        AnamnesisServer::new(store, None, data_dir.path().to_path_buf()).with_admin_tools(false);
+    (server, data_dir)
+}
+
+/// `dedupe { mode: "near", merge_preview: true }` keeps the tagged
+/// (older) mem0 record and proposes the untagged claude-code sibling
+/// as `forget`. Verifies the ranker rides through the MCP shape.
+#[tokio::test]
+async fn dedupe_near_merge_preview_keeps_tagged_record() {
+    let (server, _data) = build_bundle_near_with_tag().await;
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"mode": "near", "merge_preview": true}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["mode"], "near");
+    assert_eq!(payload["merge_preview_included"], true);
+    let group = &payload["groups"][0];
+    let preview = &group["merge_preview"];
+    assert!(preview.is_object(), "merge_preview block must exist");
+    let keep_id = preview["keep_record_id"].as_str().unwrap();
+    let mem_id = anamnesis_core::model::RecordId::from_parts("mem0", None, "rec-tagged").0;
+    assert_eq!(keep_id, mem_id, "tagged mem0 record must win");
+    let forget = preview["forget_record_ids"].as_array().unwrap();
+    assert_eq!(forget.len(), 1);
+    let proposed = preview["proposed_derived_from"].as_array().unwrap();
+    assert_eq!(proposed.len(), 1);
+    assert_eq!(proposed[0]["to"].as_str().unwrap(), keep_id);
+    // Ranking carries decision labels.
+    let ranking = preview["ranking"].as_array().unwrap();
+    assert_eq!(ranking.len(), 2);
+    assert_eq!(ranking[0]["decision"], "keep");
+    assert_eq!(ranking[1]["decision"], "forget");
+    // user_tag_count surfaces but the tag NAME ("keep-forever") must not.
+    assert_eq!(ranking[0]["user_tag_count"].as_u64().unwrap(), 1);
+}
+
+/// Privacy: merge_preview must NEVER surface tag names, content,
+/// raw_hash, or native_path even when the heuristic uses tag counts.
+#[tokio::test]
+async fn dedupe_near_merge_preview_never_leaks_tag_names_or_secrets() {
+    let (server, _data) = build_bundle_near_with_tag().await;
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"mode": "near", "merge_preview": true}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    let serialised = serde_json::to_string(&payload).unwrap();
+    for forbidden in [
+        "keep-forever",
+        "thorough error handling",
+        "no mocks",
+        "secretRawMerge1",
+        "secretRawMerge2",
+        "/tmp/mem0/rec-tagged.md",
+        "/tmp/claude-code/rec-untagged.md",
+        "\"raw_hash\"",
+        "\"native_path\"",
+    ] {
+        assert!(
+            !serialised.contains(forbidden),
+            "merge_preview payload must not leak {forbidden:?}: {serialised}"
+        );
+    }
+}
+
+/// Back-compat: omitted `merge_preview` flag keeps the wire shape
+/// additive — top-level `merge_preview_included: false`, no per-group
+/// `merge_preview` field.
+#[tokio::test]
+async fn dedupe_near_default_omits_merge_preview() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call("dedupe", json!({"mode": "near"})))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["merge_preview_included"], false);
+    assert!(
+        payload["groups"][0].get("merge_preview").is_none(),
+        "no merge_preview without the flag"
+    );
+}
+
+/// `merge_preview: true` + `mode: "exact"` is a fast-fail (no
+/// per-group ranking on the exact path).
+#[tokio::test]
+async fn dedupe_merge_preview_requires_near() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call("dedupe", json!({"merge_preview": true})))
+        .await;
+    assert!(resp.error.is_some());
+    let msg = resp.error.unwrap().message;
+    assert!(
+        msg.contains("requires `mode: \"near\"`"),
+        "must point at correct mode: {msg}"
+    );
+}
+
+/// `merge_preview: true` + `csv: true` is rejected — the nested
+/// ranking draft doesn't flatten safely into a flat row format.
+#[tokio::test]
+async fn dedupe_near_merge_preview_rejects_csv() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"mode": "near", "merge_preview": true, "csv": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some());
+    assert!(
+        resp.error.unwrap().message.contains("mutually exclusive"),
+        "must surface csv/merge_preview conflict"
+    );
+}
+
+/// `tools/list` advertises the new `merge_preview` flag on `dedupe`
+/// so MCP clients can build the UI without probing.
+#[tokio::test]
+async fn dedupe_tools_list_advertises_merge_preview() {
+    let (server, _data) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let dedupe = tools
+        .iter()
+        .find(|t| t["name"] == "dedupe")
+        .expect("dedupe in tools/list");
+    let props = &dedupe["inputSchema"]["properties"];
+    let mp = &props["merge_preview"];
+    assert_eq!(mp["type"], "boolean");
+    assert_eq!(mp["default"], false);
+}

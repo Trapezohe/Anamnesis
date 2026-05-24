@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod cjk;
+pub mod near_merge_preview;
 pub mod semantic_dedupe;
 mod vec_ext;
 
@@ -28,6 +29,7 @@ pub use api::{
     MAX_LIST_LIMIT, MCP_METRICS_CAP, NATIVE_CONFLICT_PREVIEW_CHARS, TAG_RECORD_MAX_BATCH,
     USER_TAG_MAX_LEN,
 };
+pub use near_merge_preview::{build_merge_preview, GroupMergePreview, RankedRecord};
 pub use semantic_dedupe::{
     list_near_duplicates, NearDedupeScanRow, NearDuplicateFilter, NearDuplicateGroup,
     NearDuplicateRecord, MAX_LIMIT as NEAR_DEDUPE_MAX_LIMIT,
