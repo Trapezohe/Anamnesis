@@ -202,6 +202,51 @@ async fn export_memories_letta_sqlite_is_letta_adapter_readable() {
 }
 
 #[tokio::test]
+async fn export_memories_memos_dir_is_memos_adapter_readable() {
+    use anamnesis_adapter_memos::scanner::scan_memos;
+    let (server, data) = build_server(true);
+    let out = data.path().join("memos_cube");
+    let resp = server
+        .handle(tool_call(
+            "export_memories",
+            json!({"format": "memos-dir", "out": out.to_str().unwrap()}),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "memos-dir");
+    assert_eq!(payload["records"], 3);
+    assert!(out.is_dir());
+    assert!(out.join("textual_memory.json").is_file());
+
+    // MemOS scanner round-trips the exported MemCube.
+    let scan = scan_memos(&out);
+    assert_eq!(scan.total(), 3, "memos adapter reads back the export");
+    assert_eq!(
+        scan.parse_errors.len(),
+        0,
+        "no parse errors: {:?}",
+        scan.parse_errors
+    );
+}
+
+#[tokio::test]
+async fn export_memories_memos_dir_refuses_to_overwrite_existing_dir() {
+    let (server, data) = build_server(true);
+    let out = data.path().join("memos_existing");
+    std::fs::create_dir_all(&out).unwrap();
+    let resp = server
+        .handle(tool_call(
+            "export_memories",
+            json!({"format": "memos-dir", "out": out.to_str().unwrap()}),
+        ))
+        .await;
+    assert!(resp.error.is_some());
+    let msg = resp.error.unwrap().message;
+    assert!(msg.contains("refusing to overwrite"), "{msg}");
+}
+
+#[tokio::test]
 async fn export_memories_missing_out_errors() {
     let (server, _data) = build_server(true);
     let resp = server
@@ -277,6 +322,6 @@ async fn export_memories_schema_advertises_required_fields() {
         .collect();
     assert_eq!(
         format_enum,
-        vec!["jsonl", "csv", "mem0-sqlite", "letta-sqlite"]
+        vec!["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"]
     );
 }

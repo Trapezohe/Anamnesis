@@ -453,17 +453,17 @@ enum Command {
     #[command(subcommand)]
     Audit(AuditCmd),
 
-    /// Export records as `jsonl`, `csv`, `mem0-sqlite`, or
-    /// `letta-sqlite` (fresh files, refuses to overwrite).
-    /// SQLite formats let mem0/Letta read normalised/deduped data
-    /// back through their own readers.
+    /// Export records as `jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`,
+    /// or `memos-dir` (a fresh MemOS MemCube directory). All non-text
+    /// formats refuse to overwrite an existing target.
     Export {
-        /// Output path. `jsonl`/`csv`: defaults to stdout.
-        /// SQLite formats: required (can't stream).
+        /// Output path. `jsonl`/`csv`: defaults to stdout. Other formats:
+        /// required (can't stream); the path must not already exist.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// `jsonl` (default), `csv`, `mem0-sqlite`, or `letta-sqlite`.
-        /// Letta-origin records round-trip native `block` columns.
+        /// `jsonl` (default), `csv`, `mem0-sqlite`, `letta-sqlite`,
+        /// or `memos-dir`. Letta-origin records round-trip native `block`
+        /// columns; MemOS-origin records round-trip `memory_type`.
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// Restrict to one source (adapter id).

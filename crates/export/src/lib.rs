@@ -1,4 +1,4 @@
-//! Shared exporters (`jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`).
+//! Shared exporters (`jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`, `memos-dir`).
 //!
 //! Single source of truth for the format catalogue, filter shape, and the
 //! `anamnesis_*` provenance metadata on SQLite exports. Used by the CLI's
@@ -24,6 +24,8 @@ pub enum ExportFormat {
     Mem0Sqlite,
     /// Fresh SQLite DB with Letta's `block` table.
     LettaSqlite,
+    /// Fresh directory containing a MemOS `textual_memory.json` MemCube.
+    MemosDir,
 }
 
 impl ExportFormat {
@@ -34,6 +36,7 @@ impl ExportFormat {
             "csv" => Ok(Self::Csv),
             "mem0-sqlite" => Ok(Self::Mem0Sqlite),
             "letta-sqlite" => Ok(Self::LettaSqlite),
+            "memos-dir" => Ok(Self::MemosDir),
             other => Err(ExportError::UnknownFormat(other.to_owned())),
         }
     }
@@ -45,12 +48,13 @@ impl ExportFormat {
             Self::Csv => "csv",
             Self::Mem0Sqlite => "mem0-sqlite",
             Self::LettaSqlite => "letta-sqlite",
+            Self::MemosDir => "memos-dir",
         }
     }
 
-    /// SQLite formats can't stream → caller MUST supply `out`.
+    /// Non-streaming formats need an explicit `out` (SQLite or directory).
     pub fn requires_out_path(self) -> bool {
-        matches!(self, Self::Mem0Sqlite | Self::LettaSqlite)
+        matches!(self, Self::Mem0Sqlite | Self::LettaSqlite | Self::MemosDir)
     }
 }
 
@@ -70,7 +74,7 @@ pub struct ExportFilter {
 #[derive(Debug, Error)]
 pub enum ExportError {
     /// Format token unknown.
-    #[error("unsupported format: {0} (try jsonl, csv, mem0-sqlite, or letta-sqlite)")]
+    #[error("unsupported format: {0} (try jsonl, csv, mem0-sqlite, letta-sqlite, or memos-dir)")]
     UnknownFormat(String),
     /// SQLite format requested without `--out`.
     #[error("--format {format} requires --out <path>: SQLite output cannot stream to stdout")]
@@ -172,6 +176,21 @@ pub fn validate_sqlite_output(
     Ok(p)
 }
 
+/// Same contract as [`validate_sqlite_output`] but for directory-based
+/// formats (`memos-dir`). Refuses overwrite so a typo can't clobber
+/// an existing MemOS MemCube.
+pub fn validate_dir_output(format: ExportFormat, out: Option<&Path>) -> Result<&Path, ExportError> {
+    let Some(p) = out else {
+        return Err(ExportError::OutPathRequired {
+            format: format.as_token(),
+        });
+    };
+    if p.exists() {
+        return Err(ExportError::OutputAlreadyExists(p.to_path_buf()));
+    }
+    Ok(p)
+}
+
 /// One-line filter summary for audit/MCP. Empty fields render as `all *`.
 pub fn render_filter_summary(filter: &ExportFilter) -> String {
     let src = filter
@@ -195,9 +214,11 @@ pub fn render_filter_summary(filter: &ExportFilter) -> String {
     format!("{src}; {inst}; {kind}")
 }
 
+mod memos_exporter;
 mod sqlite_exporters;
 mod text_exporters;
 
+pub use memos_exporter::export_memos_dir;
 pub use sqlite_exporters::{export_letta_sqlite, export_mem0_sqlite};
 pub use text_exporters::{export_csv, export_jsonl};
 
@@ -254,6 +275,19 @@ pub fn run_export(
                 bytes,
             })
         }
+        ExportFormat::MemosDir => {
+            let p = validate_dir_output(format, out)?;
+            export_memos_dir(store, &ids, p)?;
+            let bytes = std::fs::metadata(p.join("textual_memory.json"))
+                .ok()
+                .map(|m| m.len());
+            Ok(ExportOutcome {
+                format,
+                out: Some(p.to_path_buf()),
+                records: ids.len() as u64,
+                bytes,
+            })
+        }
     }
 }
 
@@ -280,6 +314,7 @@ mod tests {
             ("csv", ExportFormat::Csv),
             ("mem0-sqlite", ExportFormat::Mem0Sqlite),
             ("letta-sqlite", ExportFormat::LettaSqlite),
+            ("memos-dir", ExportFormat::MemosDir),
         ] {
             assert_eq!(ExportFormat::parse(token).unwrap(), expected);
             assert_eq!(expected.as_token(), token);
@@ -293,11 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn requires_out_path_only_for_sqlite_formats() {
+    fn requires_out_path_only_for_non_streaming_formats() {
         assert!(!ExportFormat::Jsonl.requires_out_path());
         assert!(!ExportFormat::Csv.requires_out_path());
         assert!(ExportFormat::Mem0Sqlite.requires_out_path());
         assert!(ExportFormat::LettaSqlite.requires_out_path());
+        assert!(ExportFormat::MemosDir.requires_out_path());
     }
 
     #[test]
