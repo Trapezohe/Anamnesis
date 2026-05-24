@@ -14,12 +14,13 @@ pub mod semantic_dedupe;
 mod vec_ext;
 
 pub use api::{
-    normalize_user_tag_name, ChunkHit, ChunkLookup, DerivedForgetPreview, DerivedForgetRecord,
-    DerivedUnforgetPreview, DerivedUnforgetRecord, DuplicateRawHashCounts, DuplicateRawHashFilter,
-    DuplicateRawHashGroup, DuplicateRawHashRecord, DuplicateRawHashSourceCount,
-    ForgetCascadeCounts, ForgetCascadeOptions, ForgetCascadeOutcome, ForgetCascadePreview,
-    ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview, ForgottenRecord,
-    ForgottenSourceCount, LineageChain, ListForgottenFilter, McpRequestMetric,
+    normalize_user_tag_name, AcceptConflictDescendant, AcceptConflictOptions,
+    AcceptConflictOutcome, AcceptConflictRecord, AcceptConflictSelector, ChunkHit, ChunkLookup,
+    DerivedForgetPreview, DerivedForgetRecord, DerivedUnforgetPreview, DerivedUnforgetRecord,
+    DuplicateRawHashCounts, DuplicateRawHashFilter, DuplicateRawHashGroup, DuplicateRawHashRecord,
+    DuplicateRawHashSourceCount, ForgetCascadeCounts, ForgetCascadeOptions, ForgetCascadeOutcome,
+    ForgetCascadePreview, ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview,
+    ForgottenRecord, ForgottenSourceCount, LineageChain, ListForgottenFilter, McpRequestMetric,
     McpToolMetricSummary, NativeConflictFilter, NativeConflictGroup, NativeConflictRecord,
     PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter, SourceRow, SourceWithCounts,
     StoreStats, SummarizePreferencesRow, UnforgetCascadeOptions, UnforgetCascadeOutcome,

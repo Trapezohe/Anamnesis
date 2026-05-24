@@ -303,6 +303,36 @@ enum Command {
         include_content: bool,
     },
 
+    /// Resolve a cross-adapter `native_id` content conflict surfaced
+    /// by `conflicts`: keep one variant, tombstone the losers.
+    /// Dry-run by default; pass `--apply` to commit in one tx.
+    AcceptConflict {
+        /// `native_id` of the conflict group (from `conflicts`).
+        #[arg(long)]
+        native_id: String,
+        /// 1-based variant index to keep. Mutually exclusive with
+        /// `--keep-record-id`.
+        #[arg(long, conflicts_with = "keep_record_id")]
+        keep_variant: Option<u32>,
+        /// Specific record id to keep (siblings sharing its content
+        /// stay live). Mutually exclusive with `--keep-variant`.
+        #[arg(long)]
+        keep_record_id: Option<String>,
+        /// Commit the tombstones (default is dry-run preview).
+        #[arg(long)]
+        apply: bool,
+        /// Also tombstone every loser's `provenance.derived_from`
+        /// descendants. Kept records' descendants are never touched.
+        #[arg(long)]
+        cascade_derived: bool,
+        /// Reason recorded on each loser tombstone + the audit entry.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Emit JSON instead of the human one-liner.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Remove a tombstone so the source can resurrect the memory on
     /// its next import. Does NOT recreate the record — the tombstone
     /// only stored provenance. Unknown id exits non-zero.
@@ -1098,6 +1128,24 @@ async fn run() -> Result<()> {
             limit,
             json,
             include_content,
+        ),
+        Command::AcceptConflict {
+            native_id,
+            keep_variant,
+            keep_record_id,
+            apply,
+            cascade_derived,
+            reason,
+            json,
+        } => cmd_accept_conflict(
+            &data_dir,
+            &native_id,
+            keep_variant,
+            keep_record_id.as_deref(),
+            apply,
+            cascade_derived,
+            reason.as_deref(),
+            json,
         ),
         Command::Unforget {
             record_id,
@@ -3214,8 +3262,140 @@ fn cmd_conflicts(
         println!();
     }
     println!(
-        "Resolve a conflict by picking which variant to keep, then `anamnesis forget <record_id>` the others."
+        "Resolve a conflict with `anamnesis accept-conflict --native-id <native_id> \
+         --keep-variant <n>` (dry-run; add `--apply` to commit)."
     );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// accept-conflict (R144)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis accept-conflict` — resolve one cross-adapter `native_id`
+/// content conflict surfaced by `conflicts`. Dry-run by default;
+/// `--apply` commits the loser tombstones in one IMMEDIATE tx.
+#[allow(clippy::too_many_arguments)]
+fn cmd_accept_conflict(
+    data_dir: &std::path::Path,
+    native_id: &str,
+    keep_variant: Option<u32>,
+    keep_record_id: Option<&str>,
+    apply: bool,
+    cascade_derived: bool,
+    reason: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let selector = match (keep_variant, keep_record_id) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "--keep-variant and --keep-record-id are mutually exclusive"
+            ));
+        }
+        (Some(v), None) => anamnesis_store::AcceptConflictSelector::KeepVariant(v),
+        (None, Some(id)) => anamnesis_store::AcceptConflictSelector::KeepRecordId(
+            anamnesis_core::model::RecordId(id.to_string()),
+        ),
+        (None, None) => {
+            return Err(anyhow!(
+                "pass either --keep-variant (1-based) or --keep-record-id"
+            ));
+        }
+    };
+    let store = Store::open(db_path(data_dir))?;
+    let opts = anamnesis_store::AcceptConflictOptions {
+        native_id: native_id.to_string(),
+        selector,
+        reason: reason.map(str::to_owned),
+        cascade_derived,
+    };
+    let outcome = if apply {
+        store.accept_native_conflict_variant(&opts)?
+    } else {
+        store.preview_accept_native_conflict_variant(&opts)?
+    };
+    if apply {
+        audit(data_dir).record(anamnesis_core::AuditEntry::new(
+            "accept_conflict_variant",
+            serde_json::json!({
+                "native_id":         native_id,
+                "keep_variant":      outcome.keep_variant,
+                "keep_record_ids":   outcome.keep_records.iter().map(|r| r.record_id.0.clone()).collect::<Vec<_>>(),
+                "forget_record_ids": outcome.forget_records.iter().map(|r| r.record_id.0.clone()).collect::<Vec<_>>(),
+                "cascade_derived":   cascade_derived,
+                "reason":            reason,
+            }),
+        ));
+    }
+
+    if json {
+        let render = |r: &anamnesis_store::AcceptConflictRecord| {
+            serde_json::json!({
+                "record_id":       r.record_id.0,
+                "adapter":         r.adapter,
+                "instance":        if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
+                "native_id":       r.native_id,
+                "content_variant": r.content_variant,
+                "decision":        r.decision,
+            })
+        };
+        let cascade: Vec<serde_json::Value> = outcome
+            .cascade_derived
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "record_id":             d.record_id.0,
+                    "adapter":               d.adapter,
+                    "instance":              if d.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(d.instance.clone()) },
+                    "native_id":             d.native_id,
+                    "forgotten_at":          d.forgotten_at,
+                    "was_already_forgotten": d.was_already_forgotten,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "status":          if outcome.dry_run { "would-accept" } else { "accepted" },
+            "dry_run":         outcome.dry_run,
+            "native_id":       outcome.native_id,
+            "keep_variant":    outcome.keep_variant,
+            "keep_records":    outcome.keep_records.iter().map(render).collect::<Vec<_>>(),
+            "forget_records":  outcome.forget_records.iter().map(render).collect::<Vec<_>>(),
+            "cascade_derived": cascade_derived,
+            "cascade":         cascade,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let verb = if outcome.dry_run {
+            "would accept"
+        } else {
+            "accepted"
+        };
+        println!(
+            "{verb} variant {v} for native_id={nid} — keep {k} record(s), \
+             tombstone {f} record(s){cascade_label}",
+            v = outcome.keep_variant,
+            nid = outcome.native_id,
+            k = outcome.keep_records.len(),
+            f = outcome.forget_records.len(),
+            cascade_label = if cascade_derived {
+                format!(
+                    " (cascade: {} descendant(s))",
+                    outcome.cascade_derived.len()
+                )
+            } else {
+                String::new()
+            },
+        );
+        for r in &outcome.keep_records {
+            println!("  keep   {} ({})", r.record_id.0, r.adapter);
+        }
+        for r in &outcome.forget_records {
+            println!("  forget {} ({})", r.record_id.0, r.adapter);
+        }
+        if outcome.dry_run {
+            println!("Dry-run; no writes. Re-run with `--apply` to commit the tombstones.");
+        }
+    }
     Ok(())
 }
 
