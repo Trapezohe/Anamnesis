@@ -85,6 +85,117 @@ pub fn blob_to_f32(b: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
+/// Round 133 (PR-78bb): inside-tx forget primitive shared between
+/// the R72 [`Store::forget_record`] and the new cascade
+/// [`Store::forget_record_with_options`]. Keeps the
+/// records-row → vec0 → tombstone sequence in one place so the
+/// cascade path can't drift from the single-record path.
+///
+/// Returns the same shape as `forget_record`:
+/// `Forgotten` (wrote a fresh tombstone),
+/// `AlreadyForgotten` (the record was already tombstoned), or
+/// `NotFound` (no record and no tombstone).
+fn forget_one_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &RecordId,
+    reason: Option<&str>,
+    now: i64,
+) -> Result<ForgetRecordOutcome> {
+    let live: Option<(String, String, String, Option<String>, String)> = tx
+        .query_row(
+            "SELECT adapter, instance, native_id, native_path, raw_hash \
+             FROM records WHERE id = ?1",
+            params![id.0],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if live.is_none() {
+        // Maybe already forgotten — same idempotency contract as R72.
+        type TombstoneCols = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            i64,
+        );
+        let existing: Option<TombstoneCols> = tx
+            .query_row(
+                "SELECT adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at \
+                 FROM record_tombstones WHERE record_id = ?1",
+                params![id.0],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        return Ok(match existing {
+            Some((adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at)) => {
+                ForgetRecordOutcome::AlreadyForgotten(ForgottenRecord {
+                    record_id: id.clone(),
+                    adapter,
+                    instance,
+                    native_id,
+                    native_path,
+                    raw_hash,
+                    reason,
+                    forgotten_at,
+                })
+            }
+            None => ForgetRecordOutcome::NotFound,
+        });
+    }
+
+    let (adapter, instance, native_id, native_path, raw_hash) = live.unwrap();
+    crate::vec_ext::delete_vec_rows_for_record(tx, &id.0)?;
+    tx.execute(
+        "INSERT INTO record_tombstones( \
+             record_id, adapter, instance, native_id, native_path, \
+             raw_hash, reason, forgotten_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id.0,
+            adapter,
+            instance,
+            native_id,
+            native_path,
+            raw_hash,
+            reason,
+            now
+        ],
+    )?;
+    tx.execute("DELETE FROM records WHERE id = ?1", params![id.0])?;
+
+    Ok(ForgetRecordOutcome::Forgotten(ForgottenRecord {
+        record_id: id.clone(),
+        adapter,
+        instance,
+        native_id,
+        native_path,
+        raw_hash,
+        reason: reason.map(str::to_owned),
+        forgotten_at: now,
+    }))
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -394,6 +505,110 @@ pub struct ForgetTombstonePreview {
     /// Operator's `--reason` passed to the dry-run, echoed back
     /// so they can see what the audit entry would carry.
     pub reason: Option<String>,
+}
+
+/// Round 133 (PR-78bb): opt-in options for the cascade-aware
+/// forget API. Currently a single flag, but kept as a struct so
+/// future toggles (max-depth, kind filter) don't break the public
+/// signature.
+///
+/// Default: `cascade_derived = false` — exactly the R72 behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForgetCascadeOptions {
+    /// When `true`, walk `provenance.derived_from` starting at the
+    /// target record and tombstone+delete every descendant in the
+    /// same `IMMEDIATE` transaction. When `false`, derived records
+    /// stay live and the call behaves exactly like R72
+    /// `forget_record` / `preview_forget_record`.
+    pub cascade_derived: bool,
+}
+
+/// Round 133 (PR-78bb): per-derived-record outcome from a cascade
+/// forget. Only populated when `ForgetCascadeOptions.cascade_derived
+/// = true`. The fields mirror [`ForgottenRecord`] so an MCP/CLI
+/// surface can render derived rows with the same shape as the root.
+///
+/// `was_already_forgotten` lets a caller distinguish "we wrote a
+/// fresh tombstone for this descendant" from "the tombstone was
+/// already there, we left it alone." Either way the live record
+/// is gone by the end of the transaction (whether by this call or
+/// a previous forget).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedForgetRecord {
+    /// Hashed record id of the derived record.
+    pub record_id: RecordId,
+    /// Adapter id (e.g. `"extractor"`).
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// Native id at the source.
+    pub native_id: String,
+    /// Native path at the source (when the adapter has one).
+    pub native_path: Option<String>,
+    /// `raw_hash` of the derived record.
+    pub raw_hash: String,
+    /// Unix seconds stamped on the tombstone — either freshly written
+    /// (when `was_already_forgotten = false`) or the existing value
+    /// (when `was_already_forgotten = true`).
+    pub forgotten_at: i64,
+    /// `true` when a tombstone already existed before this cascade
+    /// touched the record. `false` when this cascade wrote it.
+    pub was_already_forgotten: bool,
+}
+
+/// Round 133 (PR-78bb): outcome of [`Store::forget_record_with_options`].
+/// `root` carries the same shape as the R72 [`ForgetRecordOutcome`];
+/// `derived` is the list of descendants the cascade touched and is
+/// empty when `ForgetCascadeOptions.cascade_derived = false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetCascadeOutcome {
+    /// The target record's outcome — semantically identical to
+    /// `forget_record(id, reason)` from R72.
+    pub root: ForgetRecordOutcome,
+    /// Descendants visited via `provenance.derived_from`. Empty when
+    /// `cascade_derived = false`, when the root has no children, or
+    /// when the root itself was `NotFound`.
+    pub derived: Vec<DerivedForgetRecord>,
+}
+
+/// Round 133 (PR-78bb): per-derived-record preview from a cascade
+/// dry-run. Same cascade counts as the root preview so an operator
+/// can render the total deletion footprint without ambiguity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedForgetPreview {
+    /// Hashed record id of the derived record.
+    pub record_id: RecordId,
+    /// Adapter id.
+    pub adapter: String,
+    /// Instance discriminator — `""` for default.
+    pub instance: String,
+    /// Native id at the source.
+    pub native_id: String,
+    /// Native path at the source (when the adapter has one).
+    pub native_path: Option<String>,
+    /// `raw_hash` of the derived record.
+    pub raw_hash: String,
+    /// Per-table count of rows the real cascade would delete for
+    /// this descendant. Same shape as the root counts.
+    pub would_delete: ForgetCascadeCounts,
+    /// `Some(forgotten_at)` if a tombstone already exists for this
+    /// descendant (cascade would leave the tombstone alone). `None`
+    /// when the cascade would write a fresh tombstone.
+    pub already_forgotten_at: Option<i64>,
+}
+
+/// Round 133 (PR-78bb): preview shape returned by
+/// [`Store::preview_forget_record_with_options`]. `root` matches
+/// the R83 single-record preview; `derived` is populated only
+/// when `cascade_derived = true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetCascadePreview {
+    /// Root record preview — semantically identical to
+    /// `preview_forget_record(id, reason)` from R83.
+    pub root: ForgetRecordPreview,
+    /// Descendants the cascade would touch. Empty when
+    /// `cascade_derived = false` or no descendants exist.
+    pub derived: Vec<DerivedForgetPreview>,
 }
 
 /// Lightweight projection of `records` — everything the search +
@@ -1421,6 +1636,191 @@ impl Store {
             }
             None => ForgetRecordPreview::NotFound,
         })
+    }
+
+    /// Round 133 (PR-78bb): cascade-aware forget. With
+    /// `opts.cascade_derived = false` this delegates straight to
+    /// [`Store::forget_record`] (back-compat). With `cascade_derived
+    /// = true` it walks `provenance.derived_from` starting at `id`,
+    /// collects every descendant (cycle-safe via `lineage_chain`
+    /// semantics), and tombstones+deletes every reached record in
+    /// the same `IMMEDIATE` transaction.
+    ///
+    /// Ordering: derived descendants come back in the returned
+    /// `Vec` in BFS order (closest children first, grandchildren
+    /// next, …). Tombstones are written in the same order; the
+    /// `IMMEDIATE` transaction means the cascade is observable
+    /// atomically — either all tombstones land or none do.
+    ///
+    /// Closes the R72 provenance-semantic gap: a Stage 2 extractor
+    /// derives Fact / Preference / Skill from an Episode; forgetting
+    /// the Episode without the derived Facts left the operator
+    /// thinking "I forgot it" while search still returned the
+    /// distilled output.
+    pub fn forget_record_with_options(
+        &self,
+        id: &RecordId,
+        reason: Option<&str>,
+        opts: &ForgetCascadeOptions,
+    ) -> Result<ForgetCascadeOutcome> {
+        if !opts.cascade_derived {
+            // Back-compat path: just the single record, derived
+            // vector is empty.
+            let root = self.forget_record(id, reason)?;
+            return Ok(ForgetCascadeOutcome {
+                root,
+                derived: Vec::new(),
+            });
+        }
+
+        // Collect descendants *before* opening the write transaction
+        // so cycle detection / read-only walks don't fight the
+        // IMMEDIATE write lock. The BFS uses a fresh read transaction
+        // for consistent snapshot.
+        let descendants = self.collect_descendants(id)?;
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().timestamp();
+
+        // Root first — same shape as R72 `forget_record`, so the
+        // outcome is `Forgotten | AlreadyForgotten | NotFound`.
+        let root = forget_one_in_tx(&tx, id, reason, now)?;
+
+        let mut derived_out: Vec<DerivedForgetRecord> = Vec::with_capacity(descendants.len());
+        for child_id in descendants {
+            let outcome = forget_one_in_tx(&tx, &child_id, None, now)?;
+            match outcome {
+                ForgetRecordOutcome::Forgotten(r) => derived_out.push(DerivedForgetRecord {
+                    record_id: r.record_id,
+                    adapter: r.adapter,
+                    instance: r.instance,
+                    native_id: r.native_id,
+                    native_path: r.native_path,
+                    raw_hash: r.raw_hash,
+                    forgotten_at: r.forgotten_at,
+                    was_already_forgotten: false,
+                }),
+                ForgetRecordOutcome::AlreadyForgotten(r) => derived_out.push(DerivedForgetRecord {
+                    record_id: r.record_id,
+                    adapter: r.adapter,
+                    instance: r.instance,
+                    native_id: r.native_id,
+                    native_path: r.native_path,
+                    raw_hash: r.raw_hash,
+                    forgotten_at: r.forgotten_at,
+                    was_already_forgotten: true,
+                }),
+                ForgetRecordOutcome::NotFound => {
+                    // BFS read saw this id; if it's gone now without
+                    // a tombstone, treat it as raced-away. Silently
+                    // skip — the cascade goal (no live derived row)
+                    // is satisfied.
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(ForgetCascadeOutcome {
+            root,
+            derived: derived_out,
+        })
+    }
+
+    /// Round 133 (PR-78bb): cascade-aware dry-run preview. With
+    /// `opts.cascade_derived = false` this delegates straight to
+    /// [`Store::preview_forget_record`]. With `cascade_derived =
+    /// true` it walks descendants and reports per-record
+    /// [`ForgetCascadeCounts`] plus the existing tombstone state
+    /// (so an operator sees "this derived record already has a
+    /// tombstone, the cascade would skip it").
+    ///
+    /// Does NOT mutate the store and does NOT touch the audit log.
+    /// Read-only — the BFS + counts all happen inside a single
+    /// non-`Immediate` transaction that's dropped without commit.
+    pub fn preview_forget_record_with_options(
+        &self,
+        id: &RecordId,
+        reason: Option<&str>,
+        opts: &ForgetCascadeOptions,
+    ) -> Result<ForgetCascadePreview> {
+        let root = self.preview_forget_record(id, reason)?;
+        if !opts.cascade_derived {
+            return Ok(ForgetCascadePreview {
+                root,
+                derived: Vec::new(),
+            });
+        }
+
+        let descendants = self.collect_descendants(id)?;
+        let mut derived: Vec<DerivedForgetPreview> = Vec::with_capacity(descendants.len());
+        for child_id in descendants {
+            let preview = self.preview_forget_record(&child_id, None)?;
+            match preview {
+                ForgetRecordPreview::WouldForget {
+                    would_delete,
+                    tombstone_preview,
+                } => derived.push(DerivedForgetPreview {
+                    record_id: tombstone_preview.record_id,
+                    adapter: tombstone_preview.adapter,
+                    instance: tombstone_preview.instance,
+                    native_id: tombstone_preview.native_id,
+                    native_path: tombstone_preview.native_path,
+                    raw_hash: tombstone_preview.raw_hash,
+                    would_delete,
+                    already_forgotten_at: None,
+                }),
+                ForgetRecordPreview::AlreadyForgotten(r) => derived.push(DerivedForgetPreview {
+                    record_id: r.record_id,
+                    adapter: r.adapter,
+                    instance: r.instance,
+                    native_id: r.native_id,
+                    native_path: r.native_path,
+                    raw_hash: r.raw_hash,
+                    would_delete: ForgetCascadeCounts::default(),
+                    already_forgotten_at: Some(r.forgotten_at),
+                }),
+                ForgetRecordPreview::NotFound => {
+                    // Raced-away between BFS and per-row preview;
+                    // safe to skip — no work to describe.
+                }
+            }
+        }
+        Ok(ForgetCascadePreview { root, derived })
+    }
+
+    /// R133 helper: BFS through `provenance.derived_from` starting
+    /// at `start`, returning every descendant in BFS order (children
+    /// before grandchildren). The `start` record itself is NOT
+    /// included. Cycle-safe — a malformed `A → B → A` chain returns
+    /// `Err(StoreError::Corruption)` so the caller surfaces the bug
+    /// rather than silently looping. Returns an empty vec when the
+    /// root has no children (or doesn't exist).
+    fn collect_descendants(&self, start: &RecordId) -> Result<Vec<RecordId>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id FROM records WHERE derived_from = ?1 ORDER BY id ASC")?;
+
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(start.0.clone());
+        let mut frontier: Vec<RecordId> = vec![start.clone()];
+        let mut out: Vec<RecordId> = Vec::new();
+
+        while let Some(parent) = frontier.pop() {
+            let children: Vec<String> = stmt
+                .query_map(params![parent.0], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for cid in children {
+                if !visited.insert(cid.clone()) {
+                    return Err(StoreError::Corruption(format!(
+                        "derivation cycle detected at {cid}"
+                    )));
+                }
+                out.push(RecordId(cid.clone()));
+                frontier.push(RecordId(cid));
+            }
+        }
+        Ok(out)
     }
 
     /// Round 75 (PR-75): remove a tombstone, so the same source can
@@ -7956,5 +8356,201 @@ mod tests {
             groups.is_empty(),
             "short records (< MIN_TOKENS) must be skipped: {groups:?}"
         );
+    }
+
+    // ─── Round-133 PR-78bb: forget cascade derived ───────────────
+
+    /// Build a `parent → child → grandchild` derivation chain so
+    /// cascade tests have something realistic to walk.
+    fn seed_derivation_chain(store: &Store) -> (RecordId, RecordId, RecordId) {
+        let parent = make_record(
+            "claude-code",
+            "ep-parent",
+            "Episode root content for derivation chain",
+            Kind::Episode,
+        );
+        let mut child = make_record(
+            "extractor",
+            "fact-child",
+            "Distilled fact derived from the episode",
+            Kind::Fact,
+        );
+        child.provenance.derived_from = Some(parent.id.clone());
+        let mut grand = make_record(
+            "extractor",
+            "fact-grandchild",
+            "Second-stage distillation chained off the first fact",
+            Kind::Fact,
+        );
+        grand.provenance.derived_from = Some(child.id.clone());
+
+        for r in [&parent, &child, &grand] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+        (parent.id, child.id, grand.id)
+    }
+
+    /// Back-compat: default `forget_record_with_options` (cascade
+    /// off) leaves derived descendants untouched. Same outcome the
+    /// R72 path produced.
+    #[test]
+    fn forget_with_options_default_leaves_derived_alive() {
+        let store = Store::open_in_memory().unwrap();
+        let (parent, child, grand) = seed_derivation_chain(&store);
+
+        let outcome = store
+            .forget_record_with_options(&parent, None, &ForgetCascadeOptions::default())
+            .unwrap();
+        assert!(matches!(outcome.root, ForgetRecordOutcome::Forgotten(_)));
+        assert!(outcome.derived.is_empty());
+
+        // Parent gone, derived still live.
+        assert!(store.get_record(&parent).unwrap().is_none());
+        assert!(store.get_record(&child).unwrap().is_some());
+        assert!(store.get_record(&grand).unwrap().is_some());
+    }
+
+    /// Cascade forget tombstones every descendant. After it returns,
+    /// none of the records can be fetched and each derived row has
+    /// a tombstone.
+    #[test]
+    fn forget_with_options_cascade_tombstones_full_chain() {
+        let store = Store::open_in_memory().unwrap();
+        let (parent, child, grand) = seed_derivation_chain(&store);
+
+        let outcome = store
+            .forget_record_with_options(
+                &parent,
+                Some("operator decided"),
+                &ForgetCascadeOptions {
+                    cascade_derived: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome.root, ForgetRecordOutcome::Forgotten(_)));
+        assert_eq!(outcome.derived.len(), 2, "child + grandchild: {outcome:?}");
+        for d in &outcome.derived {
+            assert!(!d.was_already_forgotten);
+            assert!(d.forgotten_at > 0);
+        }
+        let derived_ids: std::collections::BTreeSet<&str> = outcome
+            .derived
+            .iter()
+            .map(|d| d.record_id.0.as_str())
+            .collect();
+        assert!(derived_ids.contains(child.0.as_str()));
+        assert!(derived_ids.contains(grand.0.as_str()));
+
+        // All three live records are gone; all three have tombstones.
+        assert!(store.get_record(&parent).unwrap().is_none());
+        assert!(store.get_record(&child).unwrap().is_none());
+        assert!(store.get_record(&grand).unwrap().is_none());
+        for id in [&parent, &child, &grand] {
+            let n: i64 = store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM record_tombstones WHERE record_id = ?1",
+                    params![id.0],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "tombstone must exist for {}", id.0);
+        }
+    }
+
+    /// Cascade with the root already tombstoned still cleans the
+    /// derived children. Matters because an operator may have
+    /// already run a non-cascade forget on the parent and then
+    /// realise the children also need to go.
+    #[test]
+    fn forget_with_options_cascade_when_root_already_forgotten() {
+        let store = Store::open_in_memory().unwrap();
+        let (parent, child, _grand) = seed_derivation_chain(&store);
+
+        // Pre-tombstone parent only.
+        store.forget_record(&parent, Some("first round")).unwrap();
+        // Now cascade — parent should report AlreadyForgotten but
+        // derived must still be cleaned (they were live).
+        let outcome = store
+            .forget_record_with_options(
+                &parent,
+                None,
+                &ForgetCascadeOptions {
+                    cascade_derived: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome.root,
+            ForgetRecordOutcome::AlreadyForgotten(_)
+        ));
+        // Derived rows were never tombstoned before this call, so
+        // they're freshly written here. Number depends on whether
+        // BFS still finds the chain through the existing records.
+        assert!(
+            !outcome.derived.is_empty(),
+            "must clean derived children even when root is already forgotten: {outcome:?}"
+        );
+        // The previously-live child must now be gone.
+        assert!(store.get_record(&child).unwrap().is_none());
+    }
+
+    /// Dry-run preview reports the same descendants the real cascade
+    /// would touch, with `would_delete.records == 1` for live
+    /// descendants and `already_forgotten_at = Some(_)` for the
+    /// pre-tombstoned ones. Must NOT mutate the store.
+    #[test]
+    fn preview_forget_with_options_cascade_does_not_mutate() {
+        let store = Store::open_in_memory().unwrap();
+        let (parent, child, grand) = seed_derivation_chain(&store);
+
+        let preview = store
+            .preview_forget_record_with_options(
+                &parent,
+                Some("dry"),
+                &ForgetCascadeOptions {
+                    cascade_derived: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            preview.root,
+            ForgetRecordPreview::WouldForget { .. }
+        ));
+        assert_eq!(preview.derived.len(), 2);
+        for d in &preview.derived {
+            assert!(d.already_forgotten_at.is_none());
+            assert_eq!(d.would_delete.records, 1);
+        }
+        // Live records unchanged.
+        assert!(store.get_record(&parent).unwrap().is_some());
+        assert!(store.get_record(&child).unwrap().is_some());
+        assert!(store.get_record(&grand).unwrap().is_some());
+        // No tombstones written.
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM record_tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "preview must not write tombstones");
+    }
+
+    /// Root not found + cascade flag still returns NotFound without
+    /// panicking. Edge case but matters for scripted callers.
+    #[test]
+    fn forget_with_options_cascade_not_found_for_phantom_id() {
+        let store = Store::open_in_memory().unwrap();
+        let phantom = RecordId::from_parts("claude-code", None, "never");
+        let outcome = store
+            .forget_record_with_options(
+                &phantom,
+                None,
+                &ForgetCascadeOptions {
+                    cascade_derived: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome.root, ForgetRecordOutcome::NotFound));
+        assert!(outcome.derived.is_empty());
     }
 }

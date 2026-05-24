@@ -14,9 +14,10 @@ pub mod semantic_dedupe;
 mod vec_ext;
 
 pub use api::{
-    normalize_user_tag_name, ChunkHit, ChunkLookup, DuplicateRawHashCounts, DuplicateRawHashFilter,
-    DuplicateRawHashGroup, DuplicateRawHashRecord, DuplicateRawHashSourceCount,
-    ForgetCascadeCounts, ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview,
+    normalize_user_tag_name, ChunkHit, ChunkLookup, DerivedForgetPreview, DerivedForgetRecord,
+    DuplicateRawHashCounts, DuplicateRawHashFilter, DuplicateRawHashGroup, DuplicateRawHashRecord,
+    DuplicateRawHashSourceCount, ForgetCascadeCounts, ForgetCascadeOptions, ForgetCascadeOutcome,
+    ForgetCascadePreview, ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview,
     ForgottenRecord, ForgottenSourceCount, LineageChain, ListForgottenFilter, McpRequestMetric,
     McpToolMetricSummary, PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter,
     SourceRow, SourceWithCounts, StoreStats, SummarizePreferencesRow, UnforgetRecordOutcome,

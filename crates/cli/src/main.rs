@@ -423,6 +423,14 @@ enum Command {
         /// the audit log is **not** appended.
         #[arg(long)]
         dry_run: bool,
+        /// Round 133 (PR-78bb): also forget every record that
+        /// transitively claims this one in `provenance.derived_from`.
+        /// Closes the R72 gap where forgetting an Episode left
+        /// Stage-2-extracted Facts / Preferences / Skills live.
+        /// Off by default — back-compat. Combine with `--dry-run`
+        /// to see the full cascade footprint without writing.
+        #[arg(long)]
+        cascade_derived: bool,
     },
 
     /// Score retrieval quality (MRR@k / nDCG@k) over a judged query
@@ -1159,7 +1167,15 @@ async fn run() -> Result<()> {
             reason,
             json,
             dry_run,
-        } => cmd_forget(&data_dir, &record_id, reason.as_deref(), json, dry_run),
+            cascade_derived,
+        } => cmd_forget(
+            &data_dir,
+            &record_id,
+            reason.as_deref(),
+            json,
+            dry_run,
+            cascade_derived,
+        ),
         Command::EvalQuality {
             judgments,
             mode,
@@ -3164,32 +3180,43 @@ fn cmd_forget(
     reason: Option<&str>,
     json: bool,
     dry_run: bool,
+    cascade_derived: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let id = anamnesis_core::model::RecordId(record_id.to_string());
     if dry_run {
-        return cmd_forget_dry_run(&store, record_id, &id, reason, json);
+        return cmd_forget_dry_run(&store, record_id, &id, reason, json, cascade_derived);
     }
-    let outcome = store.forget_record(&id, reason)?;
+    let opts = anamnesis_store::ForgetCascadeOptions { cascade_derived };
+    let cascade_outcome = store.forget_record_with_options(&id, reason, &opts)?;
+    let outcome = cascade_outcome.root;
+    let derived = cascade_outcome.derived;
 
     // §-1.5 PR-6 audit: every state-mutating CLI action lands in
     // the stage-2 audit log so `anamnesis audit` can reconstruct
-    // who-forgot-what-when.
-    audit(data_dir).record(anamnesis_core::AuditEntry::new(
-        "forget",
-        serde_json::json!({
-            "record_id": record_id,
-            "reason": reason,
-            "outcome": match &outcome {
-                anamnesis_store::ForgetRecordOutcome::Forgotten(_) => "forgotten",
-                anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(_) => "already-forgotten",
-                anamnesis_store::ForgetRecordOutcome::NotFound => "not-found",
-            },
-        }),
-    ));
+    // who-forgot-what-when. Round 133 adds `cascade_derived` +
+    // the derived record ids so the audit chain captures the full
+    // blast radius (not just the named root).
+    let mut audit_detail = serde_json::json!({
+        "record_id": record_id,
+        "reason": reason,
+        "outcome": match &outcome {
+            anamnesis_store::ForgetRecordOutcome::Forgotten(_) => "forgotten",
+            anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(_) => "already-forgotten",
+            anamnesis_store::ForgetRecordOutcome::NotFound => "not-found",
+        },
+    });
+    if cascade_derived {
+        audit_detail["cascade_derived"] = serde_json::json!(true);
+        audit_detail["derived_record_ids"] = serde_json::json!(derived
+            .iter()
+            .map(|d| d.record_id.0.clone())
+            .collect::<Vec<_>>());
+    }
+    audit(data_dir).record(anamnesis_core::AuditEntry::new("forget", audit_detail));
 
     if json {
-        let payload = match &outcome {
+        let mut payload = match &outcome {
             anamnesis_store::ForgetRecordOutcome::Forgotten(r)
             | anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(r) => serde_json::json!({
                 "status": match outcome {
@@ -3209,6 +3236,13 @@ fn cmd_forget(
                 "record_id": record_id,
             }),
         };
+        if cascade_derived {
+            // R133: always emit `cascade` when the flag was set,
+            // even with `derived: []` so a script can distinguish
+            // "I asked for cascade and there were no derivations"
+            // from "cascade was never asked."
+            payload["cascade"] = render_forget_cascade_json(&derived);
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         match &outcome {
@@ -3234,6 +3268,9 @@ fn cmd_forget(
             }
             anamnesis_store::ForgetRecordOutcome::NotFound => {}
         }
+        if cascade_derived {
+            print_forget_cascade_human(&derived);
+        }
     }
 
     if matches!(outcome, anamnesis_store::ForgetRecordOutcome::NotFound) {
@@ -3242,6 +3279,64 @@ fn cmd_forget(
         ));
     }
     Ok(())
+}
+
+/// Round 133 (PR-78bb): render the derived-records block of a
+/// cascade forget as the `cascade` JSON object on `forget --json`.
+/// `derived_count` is the cardinality the audit log mirrors; the
+/// per-row shape carries adapter/instance/native_id so an operator
+/// can confirm "yes, those were the extractor-derived facts."
+fn render_forget_cascade_json(
+    derived: &[anamnesis_store::DerivedForgetRecord],
+) -> serde_json::Value {
+    let derived_records: Vec<serde_json::Value> = derived
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "record_id":            d.record_id.0,
+                "adapter":              d.adapter,
+                "instance":             if d.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(d.instance.clone())
+                },
+                "native_id":            d.native_id,
+                "forgotten_at":         d.forgotten_at,
+                "was_already_forgotten": d.was_already_forgotten,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "derived_count":      derived.len(),
+        "derived_records":    derived_records,
+    })
+}
+
+/// R133: human one-liner per derived record beneath the root
+/// summary. Mirrors the structured `cascade` JSON shape so an
+/// operator gets the same information without `--json`.
+fn print_forget_cascade_human(derived: &[anamnesis_store::DerivedForgetRecord]) {
+    if derived.is_empty() {
+        println!("  cascade-derived: no descendants");
+        return;
+    }
+    println!("  cascade-derived: forgot {} descendant(s)", derived.len());
+    for d in derived {
+        let inst = if d.instance.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", d.instance)
+        };
+        let state = if d.was_already_forgotten {
+            " (was already forgotten)"
+        } else {
+            ""
+        };
+        println!(
+            "    {} ({}{inst}, native_id={}){state}",
+            d.record_id.0, d.adapter, d.native_id
+        );
+    }
 }
 
 /// Round 83 (PR-78e): `anamnesis forget --dry-run` — preview the
@@ -3254,11 +3349,15 @@ fn cmd_forget_dry_run(
     id: &anamnesis_core::model::RecordId,
     reason: Option<&str>,
     json: bool,
+    cascade_derived: bool,
 ) -> Result<()> {
-    let preview = store.preview_forget_record(id, reason)?;
+    let opts = anamnesis_store::ForgetCascadeOptions { cascade_derived };
+    let cascade_preview = store.preview_forget_record_with_options(id, reason, &opts)?;
+    let preview = cascade_preview.root;
+    let derived = cascade_preview.derived;
 
     if json {
-        let payload = match &preview {
+        let mut payload = match &preview {
             anamnesis_store::ForgetRecordPreview::WouldForget {
                 would_delete,
                 tombstone_preview,
@@ -3327,6 +3426,13 @@ fn cmd_forget_dry_run(
                 "record_id": record_id,
             }),
         };
+        if cascade_derived {
+            // Mirror the real-run cascade JSON shape on dry-run so a
+            // script can preview the full blast radius before
+            // committing. `would_*` counts inside per-derived rows
+            // keep the preview self-describing.
+            payload["cascade"] = render_forget_cascade_preview_json(&derived);
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         match &preview {
@@ -3371,6 +3477,9 @@ fn cmd_forget_dry_run(
             }
             anamnesis_store::ForgetRecordPreview::NotFound => {}
         }
+        if cascade_derived {
+            print_forget_cascade_preview_human(&derived);
+        }
     }
 
     if matches!(preview, anamnesis_store::ForgetRecordPreview::NotFound) {
@@ -3379,6 +3488,78 @@ fn cmd_forget_dry_run(
         ));
     }
     Ok(())
+}
+
+/// R133: render the cascade preview block on `forget --dry-run
+/// --cascade-derived --json`. Each per-row entry carries
+/// `would_delete` (the same per-table count shape as the root) and
+/// `already_forgotten_at` (`null` = cascade would write a fresh
+/// tombstone, integer = tombstone already exists).
+fn render_forget_cascade_preview_json(
+    derived: &[anamnesis_store::DerivedForgetPreview],
+) -> serde_json::Value {
+    let derived_records: Vec<serde_json::Value> = derived
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "record_id":             d.record_id.0,
+                "adapter":               d.adapter,
+                "instance":              if d.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(d.instance.clone())
+                },
+                "native_id":             d.native_id,
+                "would_delete": {
+                    "records":          d.would_delete.records,
+                    "raw_artifacts":    d.would_delete.raw_artifacts,
+                    "record_chunks":    d.would_delete.record_chunks,
+                    "chunk_embeddings": d.would_delete.chunk_embeddings,
+                    "embedding_jobs":   d.would_delete.embedding_jobs,
+                    "user_record_tags": d.would_delete.user_record_tags,
+                    "vec0_rows":        d.would_delete.vec0_rows,
+                },
+                "already_forgotten_at": d.already_forgotten_at,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
+/// R133: human cascade preview lines under the root summary.
+fn print_forget_cascade_preview_human(derived: &[anamnesis_store::DerivedForgetPreview]) {
+    if derived.is_empty() {
+        println!("  cascade-derived (DRY-RUN): no descendants");
+        return;
+    }
+    println!(
+        "  cascade-derived (DRY-RUN): would touch {} descendant(s)",
+        derived.len()
+    );
+    for d in derived {
+        let inst = if d.instance.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", d.instance)
+        };
+        match d.already_forgotten_at {
+            Some(ts) => println!(
+                "    {} ({}{inst}, native_id={}) — already forgotten at {ts}",
+                d.record_id.0, d.adapter, d.native_id
+            ),
+            None => println!(
+                "    {} ({}{inst}, native_id={}) — would write tombstone (cascade-delete {} chunks, {} vec0 rows)",
+                d.record_id.0,
+                d.adapter,
+                d.native_id,
+                d.would_delete.record_chunks,
+                d.would_delete.vec0_rows,
+            ),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -772,3 +772,236 @@ async fn unforget_record_tools_list_schema_advertises_dry_run() {
         "unforget_record must advertise dry_run: {unforget}"
     );
 }
+
+// ─── Round 133 PR-78bb: forget_record cascade_derived ───────────────
+
+/// Build an admin-on bundle with a parent + derived child so the
+/// cascade walk has something to find.
+fn build_bundle_with_derivation() -> (TestBundle, RecordId, RecordId) {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db_path = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db_path).expect("open store");
+
+    let parent_id = RecordId::from_parts("claude-code", None, "ep-parent-mcp");
+    let child_id = RecordId::from_parts("extractor", None, "fact-child-mcp");
+    let parent = AnamnesisRecord {
+        id: parent_id.clone(),
+        source: SourceDescriptor {
+            adapter: "claude-code".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "Episode root content used as cascade derivation parent".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Episode,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "ep-parent-mcp".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "raw-parent-mcp".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    let child = AnamnesisRecord {
+        id: child_id.clone(),
+        source: SourceDescriptor {
+            adapter: "extractor".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "Distilled fact derived from parent episode".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "fact-child-mcp".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "raw-child-mcp".into(),
+            derived_from: Some(parent_id.clone()),
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [&parent, &child] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(r, &chunks, None).unwrap();
+    }
+
+    let server =
+        AnamnesisServer::new(store, None, data_dir.path().to_path_buf()).with_admin_tools(true);
+    let audit_dir = data_dir.path().to_path_buf();
+    (
+        TestBundle {
+            server,
+            _data_dir: data_dir,
+            audit_dir,
+        },
+        parent_id,
+        child_id,
+    )
+}
+
+/// `forget_record { cascade_derived: true }` returns a `cascade`
+/// block listing the derived child and tombstones both records.
+#[tokio::test]
+async fn forget_record_cascade_derived_tombstones_child() {
+    let (bundle, parent_id, child_id) = build_bundle_with_derivation();
+    let req = tool_call(
+        "forget_record",
+        json!({
+            "record_id": parent_id.0,
+            "cascade_derived": true,
+        }),
+    );
+    let resp = bundle.server.handle(req).await;
+    assert!(
+        resp.error.is_none(),
+        "cascade must succeed: {:?}",
+        resp.error
+    );
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["outcome"], "forgotten");
+    let cascade = &payload["cascade"];
+    assert_eq!(cascade["derived_count"], 1);
+    let row = &cascade["derived_records"][0];
+    assert_eq!(row["record_id"], child_id.0);
+    assert_eq!(row["adapter"], "extractor");
+    assert_eq!(row["was_already_forgotten"], false);
+    // Admin tool — raw_hash + native_path stay available.
+    assert_eq!(row["raw_hash"], "raw-child-mcp");
+}
+
+/// Default `forget_record { record_id: parent }` (no cascade) leaves
+/// child live AND omits the `cascade` block. Back-compat canary.
+#[tokio::test]
+async fn forget_record_default_omits_cascade_block_and_leaves_child_live() {
+    let (bundle, parent_id, child_id) = build_bundle_with_derivation();
+    let req = tool_call(
+        "forget_record",
+        json!({
+            "record_id": parent_id.0,
+        }),
+    );
+    let resp = bundle.server.handle(req).await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["outcome"], "forgotten");
+    assert!(
+        payload.get("cascade").is_none(),
+        "no cascade flag → no cascade block: {payload}"
+    );
+
+    // Verify child is still live by calling get_record. The tool
+    // returns JSON null when the record is missing; a populated
+    // object otherwise. The wire shape carries `record_id` per the
+    // R11 normalised payload.
+    let req = tool_call("get_record", json!({"id": child_id.0}));
+    let resp = bundle.server.handle(req).await;
+    let payload = extract_payload(&resp);
+    assert!(
+        !payload.is_null(),
+        "child must remain live (got null payload)"
+    );
+    assert_eq!(
+        payload["record_id"], child_id.0,
+        "payload should carry child record_id: {payload}"
+    );
+}
+
+/// `cascade_derived: true, dry_run: true` returns the cascade
+/// preview block without writing tombstones.
+#[tokio::test]
+async fn forget_record_dry_run_cascade_derived_does_not_mutate() {
+    let (bundle, parent_id, _child_id) = build_bundle_with_derivation();
+    let req = tool_call(
+        "forget_record",
+        json!({
+            "record_id": parent_id.0,
+            "dry_run": true,
+            "cascade_derived": true,
+        }),
+    );
+    let resp = bundle.server.handle(req).await;
+    let payload = extract_payload(&resp);
+    // Dry-run uses `status: "would-forget"` (per R83), not
+    // `outcome` (which only the post-commit shape uses).
+    assert_eq!(payload["status"], "would-forget");
+    assert_eq!(payload["dry_run"], true);
+    let cascade = &payload["cascade"];
+    assert_eq!(cascade["derived_count"], 1);
+    let row = &cascade["derived_records"][0];
+    assert!(
+        row["already_forgotten_at"].is_null(),
+        "child has no tombstone yet"
+    );
+    assert_eq!(row["would_delete"]["records"], 1);
+
+    // Confirm nothing was tombstoned — list_forgotten returns empty.
+    let req = tool_call("list_forgotten", json!({}));
+    let resp = bundle.server.handle(req).await;
+    let lp = extract_payload(&resp);
+    assert_eq!(lp["rows"].as_array().unwrap().len(), 0);
+}
+
+/// Audit-log entry for cascade forget includes `cascade_derived:
+/// true` + `derived_record_ids`. Future `audit_tail` consumers
+/// rely on this to render "this forget cascaded".
+#[tokio::test]
+async fn forget_record_cascade_audit_carries_derived_ids() {
+    let (bundle, parent_id, child_id) = build_bundle_with_derivation();
+    let req = tool_call(
+        "forget_record",
+        json!({
+            "record_id": parent_id.0,
+            "cascade_derived": true,
+        }),
+    );
+    bundle.server.handle(req).await;
+
+    // The audit log lives at <data_dir>/audit.log per Audit::new.
+    let log_path = bundle.audit_dir.join("audit.log");
+    let raw = std::fs::read_to_string(&log_path).expect("audit log");
+    let last = raw.lines().last().expect("at least one entry");
+    let entry: serde_json::Value = serde_json::from_str(last).unwrap();
+    assert_eq!(entry["action"], "forget");
+    assert_eq!(entry["detail"]["cascade_derived"], true);
+    let ids: Vec<&str> = entry["detail"]["derived_record_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&child_id.0.as_str()));
+    assert_eq!(entry["detail"]["via"], "mcp");
+}
+
+/// `tools/list` schema for `forget_record` advertises the new
+/// `cascade_derived` boolean field so MCP clients can build the UI.
+#[tokio::test]
+async fn forget_record_tools_list_advertises_cascade_derived() {
+    let (bundle, _parent, _child) = build_bundle_with_derivation();
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let forget = tools
+        .iter()
+        .find(|t| t["name"] == "forget_record")
+        .expect("forget_record in admin tools/list");
+    let props = &forget["inputSchema"]["properties"];
+    assert_eq!(props["cascade_derived"]["type"], "boolean");
+    assert_eq!(props["cascade_derived"]["default"], false);
+}
