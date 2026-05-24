@@ -779,3 +779,408 @@ fn dedupe_csv_and_json_are_mutually_exclusive() {
         .assert()
         .failure();
 }
+
+// ─── Round 132 PR-78ba: dedupe --mode near ───────────────────────────
+
+/// Plant a mem0+claude-code paraphrase pair (different `raw_hash`
+/// but lexically near-identical), plus an unrelated codex record,
+/// so the R131 algorithm has the canonical positive + negative
+/// case under one fixture. Reuses the same prose family as the
+/// store-side `near_dedupe_groups_cross_adapter_paraphrases` test
+/// — important because the SimHash / Jaccard thresholds are
+/// calibrated against this exact wording.
+fn seed_near_dup_paraphrases(data_dir: &Path) {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    let db = data_dir.join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+
+    let mk = |adapter: &str, native: &str, content: &str, raw: &str| AnamnesisRecord {
+        id: RecordId::from_parts(adapter, None, native),
+        source: SourceDescriptor {
+            adapter: adapter.into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: content.into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/{adapter}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: raw.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+
+    for r in [
+        mk(
+            "mem0",
+            "rec-a",
+            "The user prefers thorough error handling in Rust code and \
+             writes comprehensive integration tests with real fixtures \
+             and never uses mocks for critical paths.",
+            "near-raw-mem0",
+        ),
+        mk(
+            "claude-code",
+            "rec-b",
+            "User prefers thorough error handling in Rust code; \
+             comprehensive integration tests with real fixtures; \
+             no mocks on critical paths.",
+            "near-raw-cc",
+        ),
+        mk(
+            "codex",
+            "rec-c",
+            "Configure the database connection pool to recycle stale \
+             connections after sixty seconds and enable TLS for all \
+             outbound traffic through the corporate proxy.",
+            "near-raw-codex-unrelated",
+        ),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+}
+
+/// Default `dedupe --json` (no `--mode`) stays at the exact path
+/// and now carries the new `mode: "exact"` discriminator without
+/// breaking any earlier wire shape. Back-compat canary.
+#[test]
+fn dedupe_default_mode_is_exact_and_carries_mode_field() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_duplicates(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["mode"], "exact", "default mode must be exact: {v}");
+    // Old fields still present.
+    assert_eq!(v["format"], "json");
+    assert_eq!(v["count"], 1);
+    // No new R132 fields leaking into exact response.
+    assert!(
+        v["filter"].get("require_cross_source").is_none(),
+        "require_cross_source belongs to near-only filter"
+    );
+}
+
+/// `dedupe --mode near --json` finds the cross-adapter paraphrase
+/// pair and surfaces `min_similarity` + `max_distance` per group.
+/// Unrelated codex record never joins. This is the core R132
+/// happy-path: R131's algorithm reached the CLI surface.
+#[test]
+fn dedupe_near_json_groups_cross_adapter_paraphrases() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["mode"], "near");
+    assert_eq!(v["format"], "json");
+    assert_eq!(
+        v["count"], 1,
+        "must find the mem0+claude-code near-dup group: {stdout}"
+    );
+    assert_eq!(v["filter"]["require_cross_source"], true);
+    let summary = v["summary"]
+        .as_str()
+        .expect("near --json must carry top-level summary");
+    assert!(
+        summary.contains("near-duplicate group(s) returned (mode=near)"),
+        "near summary must declare mode: {summary}"
+    );
+    let group = &v["groups"][0];
+    assert_eq!(group["record_count"], 2);
+    let sim = group["min_similarity"].as_f64().unwrap();
+    assert!(
+        sim >= 0.6,
+        "min_similarity must be >= Jaccard threshold: {sim}"
+    );
+    let dist = group["max_distance"].as_u64().unwrap();
+    assert!(
+        dist <= 8,
+        "max_distance must be within Hamming threshold: {dist}"
+    );
+    let adapters: std::collections::BTreeSet<String> = group["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["adapter"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        adapters,
+        ["claude-code", "mem0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    );
+}
+
+/// Privacy canary: `--mode near --json` must not leak any record
+/// content, raw_hash, or native_path. The algorithm reads content
+/// in-memory only; never returns it. Same discipline as R107/R125
+/// summary surfaces.
+#[test]
+fn dedupe_near_json_never_leaks_content_or_paths() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for forbidden in [
+        "thorough error handling",
+        "integration tests",
+        "no mocks",
+        "near-raw-mem0",
+        "near-raw-cc",
+        "/tmp/mem0/rec-a.md",
+        "/tmp/claude-code/rec-b.md",
+        "raw_hash",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "near payload must not leak {forbidden:?}: {stdout}"
+        );
+    }
+    // has_native_path must still be reported as a boolean.
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let row = &v["groups"][0]["records"][0];
+    assert!(row["has_native_path"].is_boolean());
+    assert!(row.get("native_path").is_none());
+}
+
+/// `--mode near --csv` emits the R107-style flat header plus the
+/// new `min_similarity` and `max_distance` columns. Empty store
+/// still prints the header so scripts can branch uniformly.
+#[test]
+fn dedupe_near_csv_carries_similarity_columns() {
+    let data = tmp_dir();
+    init_db(data.path());
+
+    // Empty case → header only.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let header = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        header.trim(),
+        "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count,min_similarity,max_distance"
+    );
+
+    seed_near_dup_paraphrases(data.path());
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "header + 2 rows for the dup pair: {stdout}");
+    // First row of the (only) group has group_index 0.
+    assert!(lines[1].starts_with("0,"));
+    // No raw_hash / native_path leak in CSV either.
+    for forbidden in [
+        "near-raw-mem0",
+        "near-raw-cc",
+        "/tmp/mem0/rec-a.md",
+        "/tmp/claude-code/rec-b.md",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "near CSV must not leak {forbidden:?}: {stdout}"
+        );
+    }
+}
+
+/// `--mode near --include-sensitive` is refused — the near surface
+/// has no `raw_hash` / `native_path` to reveal, so a passing flag
+/// would silently no-op and mislead the operator.
+#[test]
+fn dedupe_near_rejects_include_sensitive() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--include-sensitive"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "must surface the conflict: {stderr}"
+    );
+}
+
+/// `--mode near --include-counts` is refused — the counts
+/// aggregate is exact-dedupe specific (raw_hash-by-source
+/// breakdown). Group cardinality is already in each near group.
+#[test]
+fn dedupe_near_rejects_include_counts() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--include-counts"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "must surface the conflict: {stderr}"
+    );
+}
+
+/// `--include-near-self` only applies under `--mode near`. Passing
+/// it on `--mode exact` is a fast-fail so an operator notices
+/// they meant `--mode near`.
+#[test]
+fn dedupe_exact_rejects_include_near_self() {
+    let data = tmp_dir();
+    init_db(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--include-near-self"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--mode near"),
+        "must point at the right mode: {stderr}"
+    );
+}
+
+/// `--mode near --include-near-self` opts out of the cross-source
+/// filter — within-adapter near-dups surface too. Verifies the
+/// R131 `require_cross_source` toggle is plumbed through.
+#[test]
+fn dedupe_near_include_near_self_surfaces_within_adapter_groups() {
+    let data = tmp_dir();
+    init_db(data.path());
+
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+    let db = data.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+
+    // Two mem0 records with effectively the same content — the
+    // R131 default filter drops them because there's only one
+    // adapter; `--include-near-self` should bring them back.
+    let mk = |native: &str, content: &str, raw: &str| AnamnesisRecord {
+        id: RecordId::from_parts("mem0", None, native),
+        source: SourceDescriptor {
+            adapter: "mem0".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: content.into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: raw.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        mk(
+            "self-a",
+            "User prefers thorough error handling in Rust code with comprehensive integration tests and real fixtures.",
+            "raw-self-a",
+        ),
+        mk(
+            "self-b",
+            "User prefers thorough error handling in Rust code with comprehensive integration tests and real fixtures.",
+            "raw-self-b",
+        ),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+
+    // Default cross-source filter drops the pair.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["count"], 0, "default filter must drop within-adapter");
+
+    // With opt-out, the pair surfaces.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--include-near-self", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["count"], 1, "opt-out must surface within-adapter pair");
+    assert_eq!(v["filter"]["require_cross_source"], false);
+}
+
+/// Empty store + `--mode near` prints the no-groups headline so
+/// operators don't think they hit a stack-trace path. Same UX
+/// shape as the exact branch's "no duplicate raw_hash groups".
+#[test]
+fn dedupe_near_empty_store_says_so() {
+    let data = tmp_dir();
+    init_db(data.path());
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near"])
+        .assert()
+        .success()
+        .stdout(contains("no near-duplicate groups"));
+}

@@ -794,3 +794,360 @@ async fn dedupe_csv_response_has_no_summary_field() {
         "CSV payload must not carry `summary`; got {payload}"
     );
 }
+
+// ─── Round 132 PR-78ba: dedupe mode: near (MCP) ─────────────────────
+
+/// Seed a mem0+claude-code paraphrase pair (different `raw_hash`
+/// but lexically near-identical) + an unrelated codex record. Same
+/// prose used in the store-side R131 test so SimHash/Jaccard
+/// thresholds are honoured. The MCP-side server bundles a fresh
+/// data dir; this helper builds the whole pair.
+fn build_bundle_near_paraphrases() -> (AnamnesisServer, tempfile::TempDir) {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+
+    let mk = |adapter: &str, native: &str, content: &str, raw: &str| AnamnesisRecord {
+        id: RecordId::from_parts(adapter, None, native),
+        source: SourceDescriptor {
+            adapter: adapter.into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: content.into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: Some(format!("/tmp/{adapter}/{native}.md")),
+            captured_at: Utc::now(),
+            raw_hash: raw.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+
+    for r in [
+        mk(
+            "mem0",
+            "rec-a",
+            "The user prefers thorough error handling in Rust code and \
+             writes comprehensive integration tests with real fixtures \
+             and never uses mocks for critical paths.",
+            "secretNearRawMem0",
+        ),
+        mk(
+            "claude-code",
+            "rec-b",
+            "User prefers thorough error handling in Rust code; \
+             comprehensive integration tests with real fixtures; \
+             no mocks on critical paths.",
+            "secretNearRawCc",
+        ),
+        mk(
+            "codex",
+            "rec-c",
+            "Configure the database connection pool to recycle stale \
+             connections after sixty seconds and enable TLS for all \
+             outbound traffic through the corporate proxy.",
+            "secretNearRawCodex",
+        ),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+
+    let server =
+        AnamnesisServer::new(store, None, data_dir.path().to_path_buf()).with_admin_tools(false);
+    (server, data_dir)
+}
+
+/// Default `dedupe {}` carries the new `mode: "exact"` discriminator
+/// without breaking the back-compat wire shape. Back-compat canary.
+#[tokio::test]
+async fn dedupe_default_mode_is_exact_and_carries_mode_field() {
+    let (server, _data) = build_bundle(false);
+    let resp = server.handle(tool_call("dedupe", json!({}))).await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["mode"], "exact");
+    assert_eq!(payload["format"], "json");
+    assert_eq!(payload["count"], 1);
+    assert!(
+        payload["filter"].get("require_cross_source").is_none(),
+        "exact mode must NOT carry require_cross_source field"
+    );
+}
+
+/// `dedupe { mode: "near" }` finds the cross-adapter paraphrase
+/// pair and surfaces `min_similarity` + `max_distance` per group.
+/// This is the load-bearing R132 round-trip from MCP wire to R131
+/// algorithm. Filter echoes `require_cross_source: true` (the new
+/// near-only field).
+#[tokio::test]
+async fn dedupe_near_groups_cross_adapter_paraphrases() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call("dedupe", json!({"mode": "near"})))
+        .await;
+    assert!(resp.error.is_none(), "near must succeed: {:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["mode"], "near");
+    assert_eq!(payload["format"], "json");
+    assert_eq!(payload["count"], 1, "must group the paraphrase pair");
+    assert_eq!(payload["filter"]["require_cross_source"], true);
+    let summary = payload["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("near-duplicate group(s) returned (mode=near)"),
+        "summary must declare mode: {summary}"
+    );
+    let group = &payload["groups"][0];
+    assert_eq!(group["record_count"], 2);
+    let sim = group["min_similarity"].as_f64().unwrap();
+    assert!(sim >= 0.6, "min_similarity >= Jaccard threshold: {sim}");
+    let dist = group["max_distance"].as_u64().unwrap();
+    assert!(dist <= 8, "max_distance <= Hamming threshold: {dist}");
+    let adapters: std::collections::BTreeSet<&str> = group["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["adapter"].as_str().unwrap())
+        .collect();
+    assert_eq!(adapters, ["claude-code", "mem0"].into_iter().collect());
+}
+
+/// Privacy canary: `mode: "near"` must NEVER leak content,
+/// raw_hash, or native_path. Run the wire-shape serialisation and
+/// scrape for the marker strings planted in the fixture.
+#[tokio::test]
+async fn dedupe_near_never_leaks_content_or_raw_hash_or_paths() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call("dedupe", json!({"mode": "near"})))
+        .await;
+    let payload = extract_payload(&resp);
+    let serialised = serde_json::to_string(&payload).unwrap();
+    for forbidden in [
+        "thorough error handling",
+        "integration tests",
+        "no mocks",
+        "secretNearRawMem0",
+        "secretNearRawCc",
+        "secretNearRawCodex",
+        "/tmp/mem0/rec-a.md",
+        "/tmp/claude-code/rec-b.md",
+        "raw_hash",
+    ] {
+        assert!(
+            !serialised.contains(forbidden),
+            "near payload must not leak {forbidden:?}: {serialised}"
+        );
+    }
+    let row = &payload["groups"][0]["records"][0];
+    assert!(row["has_native_path"].is_boolean());
+    assert!(row.get("native_path").is_none());
+}
+
+/// Unknown `mode` is a fast-fail rather than a silent fallback,
+/// matching the same policy `tag_record.operation` uses.
+#[tokio::test]
+async fn dedupe_unknown_mode_is_an_error() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call("dedupe", json!({"mode": "fuzzy"})))
+        .await;
+    assert!(resp.error.is_some(), "unknown mode must error");
+    let msg = resp.error.unwrap().message;
+    assert!(
+        msg.contains("\"exact\""),
+        "error must list valid options: {msg}"
+    );
+    assert!(
+        msg.contains("\"near\""),
+        "error must list valid options: {msg}"
+    );
+}
+
+/// `mode: "near", include_sensitive: true` is refused (near surface
+/// has no `raw_hash`/`native_path`, the flag would silently no-op).
+#[tokio::test]
+async fn dedupe_near_rejects_include_sensitive() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"mode": "near", "include_sensitive": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some());
+    assert!(
+        resp.error.unwrap().message.contains("mutually exclusive"),
+        "must surface conflict"
+    );
+}
+
+/// `mode: "near", include_counts: true` is refused — counts are
+/// the raw_hash-by-source breakdown specific to exact dedupe.
+#[tokio::test]
+async fn dedupe_near_rejects_include_counts() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"mode": "near", "include_counts": true}),
+        ))
+        .await;
+    assert!(resp.error.is_some());
+    assert!(
+        resp.error.unwrap().message.contains("mutually exclusive"),
+        "must surface conflict"
+    );
+}
+
+/// `include_near_self: true` on exact mode is a fast-fail (it has
+/// no cross-source filter to opt out of).
+#[tokio::test]
+async fn dedupe_exact_rejects_include_near_self() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call("dedupe", json!({"include_near_self": true})))
+        .await;
+    assert!(resp.error.is_some());
+    assert!(
+        resp.error.unwrap().message.contains("mode: \"near\""),
+        "must point at correct mode"
+    );
+}
+
+/// `mode: "near", csv: true` returns the R107-style flat CSV plus
+/// the new `min_similarity` and `max_distance` columns.
+#[tokio::test]
+async fn dedupe_near_csv_carries_similarity_columns() {
+    let (server, _data) = build_bundle_near_paraphrases();
+    let resp = server
+        .handle(tool_call("dedupe", json!({"mode": "near", "csv": true})))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "csv");
+    assert_eq!(payload["mode"], "near");
+    assert_eq!(payload["filter"]["require_cross_source"], true);
+    let csv = payload["csv"].as_str().unwrap();
+    assert!(
+        csv.lines()
+            .next()
+            .unwrap()
+            .ends_with(",min_similarity,max_distance"),
+        "header must include similarity cols: {csv}"
+    );
+    // Privacy canary inside CSV.
+    for forbidden in ["secretNearRawMem0", "secretNearRawCc", "/tmp/mem0/rec-a.md"] {
+        assert!(
+            !csv.contains(forbidden),
+            "near CSV must not leak {forbidden:?}: {csv}"
+        );
+    }
+}
+
+/// `mode: "near", include_near_self: true` opts out of the
+/// cross-source filter, surfacing within-adapter near-dups.
+#[tokio::test]
+async fn dedupe_near_include_near_self_surfaces_within_adapter_groups() {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let db = data_dir.path().join("anamnesis.sqlite");
+    let store = Store::open(&db).expect("open store");
+    let mk = |native: &str, content: &str, raw: &str| AnamnesisRecord {
+        id: RecordId::from_parts("mem0", None, native),
+        source: SourceDescriptor {
+            adapter: "mem0".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: content.into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: native.into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: raw.into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    for r in [
+        mk(
+            "self-a",
+            "User prefers thorough error handling in Rust code with comprehensive integration tests and real fixtures.",
+            "raw-self-a",
+        ),
+        mk(
+            "self-b",
+            "User prefers thorough error handling in Rust code with comprehensive integration tests and real fixtures.",
+            "raw-self-b",
+        ),
+    ] {
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+    }
+    let server =
+        AnamnesisServer::new(store, None, data_dir.path().to_path_buf()).with_admin_tools(false);
+
+    // Default filter drops single-adapter group.
+    let resp = server
+        .handle(tool_call("dedupe", json!({"mode": "near"})))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 0);
+
+    // Opt-out surfaces it.
+    let resp = server
+        .handle(tool_call(
+            "dedupe",
+            json!({"mode": "near", "include_near_self": true}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["filter"]["require_cross_source"], false);
+}
+
+/// `tools/list` advertises the new `mode` enum on `dedupe` so MCP
+/// clients can build a UI picker without probing.
+#[tokio::test]
+async fn dedupe_tools_list_advertises_mode_enum_and_include_near_self() {
+    let (server, _data) = build_bundle(false);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let dedupe = tools
+        .iter()
+        .find(|t| t["name"] == "dedupe")
+        .expect("dedupe in tools/list");
+    let props = &dedupe["inputSchema"]["properties"];
+    let mode = &props["mode"];
+    assert_eq!(mode["type"], "string");
+    assert_eq!(mode["default"], "exact");
+    let enum_values: Vec<&str> = mode["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(enum_values, vec!["exact", "near"]);
+    assert_eq!(props["include_near_self"]["type"], "boolean");
+}
