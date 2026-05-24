@@ -1005,3 +1005,210 @@ async fn forget_record_tools_list_advertises_cascade_derived() {
     assert_eq!(props["cascade_derived"]["type"], "boolean");
     assert_eq!(props["cascade_derived"]["default"], false);
 }
+
+// ─── Round 134 PR-78bc: unforget_record cascade_derived ─────────────
+
+/// End-to-end: forget the parent with cascade, then unforget the
+/// parent with cascade. Every descendant tombstone is removed and
+/// the response carries a `cascade` block listing them.
+#[tokio::test]
+async fn unforget_record_cascade_derived_clears_descendant_tombstones() {
+    let (bundle, parent_id, child_id) = build_bundle_with_derivation();
+    // Cascade forget so we have a parent+child tombstone subtree.
+    bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({
+                "record_id": parent_id.0,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+
+    // Cascade unforget should remove both tombstones.
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({
+                "record_id": parent_id.0,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "cascade unforget: {:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["outcome"], "unforgotten");
+    let cascade = &payload["cascade"];
+    assert_eq!(cascade["derived_count"], 1);
+    let row = &cascade["derived_records"][0];
+    assert_eq!(row["record_id"], child_id.0);
+    // Admin tool — raw_hash stays available in the cascade row.
+    assert_eq!(row["raw_hash"], "raw-child-mcp");
+
+    // list_forgotten now empty.
+    let lp = extract_payload(
+        &bundle
+            .server
+            .handle(tool_call("list_forgotten", json!({})))
+            .await,
+    );
+    assert_eq!(lp["rows"].as_array().unwrap().len(), 0);
+}
+
+/// Default `unforget_record {}` (no cascade) only removes the root
+/// tombstone AND omits the `cascade` block. Back-compat canary.
+#[tokio::test]
+async fn unforget_record_default_omits_cascade_block_and_leaves_descendants() {
+    let (bundle, parent_id, child_id) = build_bundle_with_derivation();
+    bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({
+                "record_id": parent_id.0,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({"record_id": parent_id.0}),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["outcome"], "unforgotten");
+    assert!(
+        payload.get("cascade").is_none(),
+        "no cascade flag → no cascade block: {payload}"
+    );
+
+    // Child tombstone must still be there.
+    let lp = extract_payload(
+        &bundle
+            .server
+            .handle(tool_call("list_forgotten", json!({})))
+            .await,
+    );
+    let ids: std::collections::BTreeSet<String> = lp["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["record_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!ids.contains(&parent_id.0));
+    assert!(ids.contains(&child_id.0));
+}
+
+/// `cascade_derived: true, dry_run: true` reports descendants
+/// without removing tombstones.
+#[tokio::test]
+async fn unforget_record_dry_run_cascade_derived_does_not_mutate() {
+    let (bundle, parent_id, _child_id) = build_bundle_with_derivation();
+    bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({
+                "record_id": parent_id.0,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+
+    let resp = bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({
+                "record_id": parent_id.0,
+                "dry_run": true,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["outcome"], "would-unforget");
+    assert_eq!(payload["dry_run"], true);
+    let cascade = &payload["cascade"];
+    assert_eq!(cascade["derived_count"], 1);
+
+    // Tombstones still present.
+    let lp = extract_payload(
+        &bundle
+            .server
+            .handle(tool_call("list_forgotten", json!({})))
+            .await,
+    );
+    assert_eq!(lp["rows"].as_array().unwrap().len(), 2);
+}
+
+/// Audit-log entry for cascade unforget includes `cascade_derived:
+/// true` + `derived_record_ids`. Matches R133 forget audit shape.
+#[tokio::test]
+async fn unforget_record_cascade_audit_carries_derived_ids() {
+    let (bundle, parent_id, child_id) = build_bundle_with_derivation();
+    bundle
+        .server
+        .handle(tool_call(
+            "forget_record",
+            json!({
+                "record_id": parent_id.0,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+    bundle
+        .server
+        .handle(tool_call(
+            "unforget_record",
+            json!({
+                "record_id": parent_id.0,
+                "cascade_derived": true,
+            }),
+        ))
+        .await;
+
+    let lines = read_audit_lines(&bundle.audit_dir);
+    // Find the most recent unforget entry.
+    let entry = lines
+        .iter()
+        .rev()
+        .find(|e| e["action"] == "unforget")
+        .expect("unforget audit entry present");
+    assert_eq!(entry["detail"]["cascade_derived"], true);
+    let ids: Vec<&str> = entry["detail"]["derived_record_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&child_id.0.as_str()));
+    assert_eq!(entry["detail"]["via"], "mcp");
+}
+
+/// `tools/list` schema for `unforget_record` advertises the new
+/// `cascade_derived` boolean field.
+#[tokio::test]
+async fn unforget_record_tools_list_advertises_cascade_derived() {
+    let (bundle, _p, _c) = build_bundle_with_derivation();
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let unforget = tools
+        .iter()
+        .find(|t| t["name"] == "unforget_record")
+        .expect("unforget_record in admin tools/list");
+    let props = &unforget["inputSchema"]["properties"];
+    assert_eq!(props["cascade_derived"]["type"], "boolean");
+    assert_eq!(props["cascade_derived"]["default"], false);
+}

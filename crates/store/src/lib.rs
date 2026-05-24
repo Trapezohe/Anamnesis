@@ -15,15 +15,16 @@ mod vec_ext;
 
 pub use api::{
     normalize_user_tag_name, ChunkHit, ChunkLookup, DerivedForgetPreview, DerivedForgetRecord,
-    DuplicateRawHashCounts, DuplicateRawHashFilter, DuplicateRawHashGroup, DuplicateRawHashRecord,
-    DuplicateRawHashSourceCount, ForgetCascadeCounts, ForgetCascadeOptions, ForgetCascadeOutcome,
-    ForgetCascadePreview, ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview,
-    ForgottenRecord, ForgottenSourceCount, LineageChain, ListForgottenFilter, McpRequestMetric,
+    DerivedUnforgetPreview, DerivedUnforgetRecord, DuplicateRawHashCounts, DuplicateRawHashFilter,
+    DuplicateRawHashGroup, DuplicateRawHashRecord, DuplicateRawHashSourceCount,
+    ForgetCascadeCounts, ForgetCascadeOptions, ForgetCascadeOutcome, ForgetCascadePreview,
+    ForgetRecordOutcome, ForgetRecordPreview, ForgetTombstonePreview, ForgottenRecord,
+    ForgottenSourceCount, LineageChain, ListForgottenFilter, McpRequestMetric,
     McpToolMetricSummary, PendingEmbeddingJob, RecordHeader, RecordSummary, SearchFilter,
-    SourceRow, SourceWithCounts, StoreStats, SummarizePreferencesRow, UnforgetRecordOutcome,
-    UserTagMutation, UserTagOperation, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT,
-    LIST_FORGOTTEN_MAX_LIMIT, MAX_LIST_LIMIT, MCP_METRICS_CAP, TAG_RECORD_MAX_BATCH,
-    USER_TAG_MAX_LEN,
+    SourceRow, SourceWithCounts, StoreStats, SummarizePreferencesRow, UnforgetCascadeOptions,
+    UnforgetCascadeOutcome, UnforgetCascadePreview, UnforgetRecordOutcome, UserTagMutation,
+    UserTagOperation, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT, LIST_FORGOTTEN_MAX_LIMIT,
+    MAX_LIST_LIMIT, MCP_METRICS_CAP, TAG_RECORD_MAX_BATCH, USER_TAG_MAX_LEN,
 };
 pub use semantic_dedupe::{
     list_near_duplicates, NearDedupeScanRow, NearDuplicateFilter, NearDuplicateGroup,
@@ -69,6 +70,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0010_vec_record_id_metadata",
         include_str!("migrations/0010_vec_record_id_metadata.sql"),
+    ),
+    (
+        "0011_tombstone_derived_from",
+        include_str!("migrations/0011_tombstone_derived_from.sql"),
     ),
 ];
 
@@ -276,7 +281,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
     }
 
     #[test]

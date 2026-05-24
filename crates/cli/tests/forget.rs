@@ -1070,3 +1070,195 @@ fn forget_cascade_derived_with_no_children_emits_empty_block() {
     assert_eq!(cascade["derived_count"], 0);
     assert!(cascade["derived_records"].as_array().unwrap().is_empty());
 }
+
+// ─── Round 134 PR-78bc: unforget --cascade-derived ───────────────────
+
+/// `forget --cascade-derived`, then `unforget --cascade-derived
+/// --json` clears every tombstone in the subtree in one call.
+/// End-to-end round-trip of the R133 + R134 cascade pair through
+/// the CLI.
+#[test]
+fn unforget_cascade_derived_clears_all_tombstones() {
+    let data = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let (parent_id, child_id) = seed_parent_and_derived(data.path());
+
+    // Cascade-forget so we have a 2-row tombstone subtree.
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &parent_id, "--cascade-derived", "--json"])
+        .output()
+        .unwrap();
+
+    // Sanity: list-forgotten shows both.
+    let list = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["rows"].as_array().unwrap().len(), 2);
+
+    // Cascade-unforget the root — both tombstones should be gone.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &parent_id, "--cascade-derived", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cascade unforget must succeed: {out:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "unforgotten");
+    let cascade = &v["cascade"];
+    assert_eq!(cascade["derived_count"], 1);
+    let row = &cascade["derived_records"][0];
+    assert_eq!(row["record_id"], child_id);
+    assert_eq!(row["adapter"], "extractor");
+
+    // list-forgotten now shows nothing.
+    let list = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(
+        lv["rows"].as_array().unwrap().len(),
+        0,
+        "cascade unforget must clear every descendant tombstone"
+    );
+}
+
+/// Default `unforget --json` (no cascade flag) only deletes the
+/// root tombstone, AND omits the `cascade` block — back-compat
+/// canary for the R75 wire shape.
+#[test]
+fn unforget_default_only_clears_root_tombstone() {
+    let data = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let (parent_id, child_id) = seed_parent_and_derived(data.path());
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &parent_id, "--cascade-derived", "--json"])
+        .output()
+        .unwrap();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &parent_id, "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "unforgotten");
+    assert!(
+        v.get("cascade").is_none(),
+        "default unforget must omit cascade block: {v}"
+    );
+
+    // Only the parent tombstone was removed; the child remains.
+    let list = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let ids: std::collections::BTreeSet<String> = lv["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["record_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!ids.contains(&parent_id), "parent tombstone should be gone");
+    assert!(
+        ids.contains(&child_id),
+        "child tombstone must remain without cascade: {ids:?}"
+    );
+}
+
+/// `unforget --dry-run --cascade-derived --json` reports descendants
+/// without removing any tombstone.
+#[test]
+fn unforget_dry_run_cascade_derived_does_not_mutate() {
+    let data = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let (parent_id, _child_id) = seed_parent_and_derived(data.path());
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &parent_id, "--cascade-derived", "--json"])
+        .output()
+        .unwrap();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "unforget",
+            &parent_id,
+            "--dry-run",
+            "--cascade-derived",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["status"], "would-unforget");
+    let cascade = &v["cascade"];
+    assert_eq!(cascade["derived_count"], 1);
+
+    // Tombstones still present.
+    let list = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["list-forgotten", "--json"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(
+        lv["rows"].as_array().unwrap().len(),
+        2,
+        "dry-run must not remove tombstones"
+    );
+}
+
+/// `unforget --cascade-derived` with no descendants emits an empty
+/// `cascade.derived_records[]` block — distinguishes "asked,
+/// nothing to do" from "didn't ask." Scripted callers depend on it.
+#[test]
+fn unforget_cascade_derived_with_no_descendants_emits_empty_block() {
+    let data = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let (_parent_id, child_id) = seed_parent_and_derived(data.path());
+    // Forget only the child (leaf — no further derivations).
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["forget", &child_id, "--json"])
+        .output()
+        .unwrap();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["unforget", &child_id, "--cascade-derived", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let cascade = &v["cascade"];
+    assert_eq!(cascade["derived_count"], 0);
+    assert!(cascade["derived_records"].as_array().unwrap().is_empty());
+}
