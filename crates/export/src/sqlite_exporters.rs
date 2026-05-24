@@ -1,24 +1,8 @@
 //! SQLite-format exporters (`mem0-sqlite`, `letta-sqlite`).
 //!
-//! R138 / R139 introduced these inline in the CLI; R140 lifts them
-//! into the shared crate so MCP `export_memories` reuses the exact
-//! same write paths, the same provenance metadata convention, and
-//! the same fresh-file safety contract.
-//!
-//! ## Provenance metadata convention
-//!
-//! Every SQLite-output row carries an `anamnesis_*` block inside
-//! its `metadata` / `metadata_` column so a downstream re-import
-//! preserves which source originally produced each row. Shared
-//! across both exporters via [`anamnesis_provenance_block`].
-//!
-//! ## Safety
-//!
-//! These functions trust the caller has already validated `out`
-//! via [`crate::validate_sqlite_output`] — they will NOT refuse
-//! to overwrite an existing file on their own. The contract is
-//! enforced at the entry point so the failure mode surfaces
-//! before any work happens.
+//! Every row's `metadata` carries an `anamnesis_*` provenance block so
+//! a re-import preserves lineage. Callers MUST validate `out` via
+//! `crate::validate_sqlite_output` first — these fns won't refuse overwrite.
 
 use std::path::Path;
 
@@ -28,10 +12,8 @@ use serde_json::Value;
 
 use crate::ExportError;
 
-/// Build the `anamnesis_*` provenance JSON block stored in every
-/// SQLite-output row's `metadata` column. Shared by both
-/// mem0-sqlite and letta-sqlite exporters so the round-trip
-/// contract stays uniform.
+/// `anamnesis_*` provenance keys layered onto the record's metadata.
+/// Shared by both SQLite exporters so the round-trip contract stays uniform.
 fn anamnesis_provenance_block(
     rec: &anamnesis_core::AnamnesisRecord,
 ) -> serde_json::Map<String, Value> {
@@ -72,9 +54,7 @@ fn anamnesis_provenance_block(
     meta
 }
 
-/// Export to a fresh SQLite DB matching mem0's canonical
-/// `memories` table (the schema `adapter-mem0/src/scanner.rs`
-/// probes). See [`crate::ExportFormat::Mem0Sqlite`].
+/// Write `memories` table matching mem0's scanner probe.
 pub fn export_mem0_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<(), ExportError> {
     let conn = rusqlite::Connection::open(out)?;
     conn.execute_batch(
@@ -122,12 +102,9 @@ pub fn export_mem0_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<(
     Ok(())
 }
 
-/// Export to a fresh SQLite DB matching Letta's canonical `block`
-/// table. For Letta-origin rows, reconstructs the native
-/// `label` / `description` / `template_name` from metadata; for
-/// foreign-origin rows, falls back to a stable
-/// `anamnesis/<adapter>` label. See
-/// [`crate::ExportFormat::LettaSqlite`].
+/// Write `block` table matching Letta's scanner probe. Letta-origin rows
+/// restore native label/description/template_name from metadata; foreign
+/// rows get `anamnesis/<adapter>` as label.
 pub fn export_letta_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<(), ExportError> {
     let conn = rusqlite::Connection::open(out)?;
     conn.execute_batch(

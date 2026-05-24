@@ -5,17 +5,7 @@
 // inlined idents — clippy's literal-format-arg lint isn't load-bearing here.
 #![allow(clippy::print_literal)]
 
-// Round 140 (PR-78bi): R138/R139 introduced `mem0-sqlite` and
-// `letta-sqlite` exporters inline in the CLI. R140 lifted the
-// whole format catalogue into `anamnesis-export` so the CLI's
-// `anamnesis export` and the new MCP `export_memories` tool share
-// one implementation. The CLI is now just clap-parsing + audit
-// glue around `anamnesis_export::run_export`.
-
-// Round 141 (PR-78bj): `dedupe --mode near --merge-preview` —
-// operator-decision tooling that closes the loop on R131/R132's
-// detector. Picks a winner per group with a deterministic
-// ranking heuristic; preview-only.
+// `dedupe --mode near --merge-preview` ranking heuristic (preview-only).
 mod near_merge_preview;
 
 use std::path::PathBuf;
@@ -40,21 +30,13 @@ use anamnesis_store::Store;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// Round 132 (PR-78ba): pick the dedupe detector. `exact` is the
-/// R77 byte-equal `raw_hash` grouper (default, fully back-compat).
-/// `near` is the R131 SimHash + LSH + Jaccard cross-adapter
-/// near-duplicate detector. Default-on cross-source filter keeps
-/// near surfaces aligned with the interoperability mission.
+/// Detector picker for `dedupe`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum DedupeMode {
-    /// R77 raw_hash byte-equal grouping. Catches only identical
-    /// source payloads; misses cross-adapter paraphrases.
+    /// Byte-equal `raw_hash` grouping (default).
     Exact,
-    /// R131 SimHash + LSH + Jaccard. Catches cross-adapter
-    /// paraphrases (mem0 vs claude-code on the same memory)
-    /// that `exact` can't see. Defaults to cross-source-only
-    /// groups; pass `--include-near-self` to also surface
-    /// within-adapter near-dups.
+    /// SimHash + LSH + Jaccard near-duplicate detection;
+    /// defaults to cross-source-only groups.
     Near,
 }
 
@@ -260,157 +242,82 @@ enum Command {
     /// are omitted; only reported as `has_*` booleans (JSON) /
     /// hidden (human). Pass `--include-sensitive` to reveal.
     ///
-    /// Two modes (Round 132): `--mode exact` (default, R77
-    /// `raw_hash` byte-equal) and `--mode near` (R131
-    /// SimHash + LSH + Jaccard cross-adapter near-duplicate
-    /// detection). Near defaults to cross-source-only groups —
-    /// the interop-relevant case raw_hash can't catch because
-    /// adapters differ in punctuation / prefixes / tokenization.
+    /// `--mode exact` (raw_hash byte-equal, default) or `--mode near`
+    /// (SimHash + LSH + Jaccard, cross-source-only by default).
     Dedupe {
-        /// Round 132 (PR-78ba): pick the detector. `exact` is
-        /// the R77 raw_hash byte-equal grouper (default, fully
-        /// back-compat). `near` is the R131 SimHash + LSH +
-        /// Jaccard cross-adapter near-duplicate detector and
-        /// defaults to cross-source-only groups (the interop-
-        /// relevant case raw_hash can't catch).
+        /// Detector: `exact` (default) or `near`.
         #[arg(long, value_enum, default_value_t = DedupeMode::Exact)]
         mode: DedupeMode,
-        /// Scope to duplicate groups that include ≥1 record from
-        /// this adapter (e.g. `mem0`, `claude-code`). Round 104:
-        /// also accepts a comma-separated OR list
-        /// (`--source mem0,claude-code`) — groups whose members
-        /// include at least one record from any listed adapter
-        /// stay eligible. Tokens are trimmed and empty tokens
-        /// dropped, so `--source mem0, , claude-code` is the
-        /// same as `--source mem0,claude-code`. The full sibling
-        /// set is still returned so you can see which
-        /// non-matching records share the same `raw_hash`.
+        /// Adapter or comma-separated OR list; siblings outside the
+        /// filter still appear in matched groups.
         #[arg(long)]
         source: Option<String>,
-        /// Scope to duplicate groups that include ≥1 record from
-        /// this instance. Round 115: comma-separated list is also
-        /// accepted (`--instance prod,dev`) for an OR filter.
-        /// Combines as AND with `--source` when both are set.
+        /// Instance or comma-separated OR list (AND with `--source`).
         #[arg(long)]
         instance: Option<String>,
-        /// Max number of groups to return. Default 20, cap 100.
+        /// Max groups to return (default 20, cap 100).
         #[arg(long, default_value_t = 20)]
         limit: u32,
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
-        /// Reveal `raw_hash` and `native_path` fields. Default off.
+        /// Reveal `raw_hash` and `native_path` (default off).
         #[arg(long)]
         include_sensitive: bool,
-        /// Round 97: append a `counts` block reporting filter-
-        /// scoped totals — `total_groups` (duplicate groups
-        /// matching the filter, ignoring `--limit`),
-        /// `total_records` (sum of live records across those
-        /// whole groups), and `by_source[]` (per-`(adapter,
-        /// instance)` record breakdown). Counts respect the
-        /// same `--source` / `--instance` filter as the row
-        /// list but reflect the full matching set, not the
-        /// current page. Default off — back-compat.
+        /// Append a `counts` block (filter-scoped, ignores `--limit`).
         #[arg(long)]
         include_counts: bool,
-        /// Round 107: emit redacted CSV. Third tabular-redaction
-        /// surface, mirrors R91 `audit tail --csv` + R106
-        /// `list-forgotten --csv`. Mutually exclusive with
-        /// --json (clap) and --include-sensitive /
-        /// --include-counts (runtime). Same privacy contract:
-        /// `raw_hash` and `native_path` never appear; the
-        /// row's `group_index` carries duplicate-group
-        /// membership without leaking the hash.
+        /// Emit redacted CSV (mutually exclusive with --json
+        /// and `--include-sensitive` / `--include-counts`).
         #[arg(long, conflicts_with = "json")]
         csv: bool,
-        /// Round 132 (PR-78ba): `--mode near` only — opt out of
-        /// the default cross-source filter and surface
-        /// within-adapter near-duplicates too. Equivalent to
-        /// `NearDuplicateFilter::require_cross_source = false`.
-        /// Ignored under `--mode exact` (raw_hash detection
-        /// has no cross-source notion).
+        /// `--mode near` only — also surface within-adapter near-dups.
         #[arg(long)]
         include_near_self: bool,
-        /// Round 141 (PR-78bj): `--mode near` only — augment
-        /// each group with a deterministic ranking heuristic
-        /// proposing which record to keep, which to forget, and
-        /// the `provenance.derived_from` edge a future merge
-        /// would write. Read-only: ranks on existing metadata
-        /// (user-tag count, effective_at, has_native_path,
-        /// adapter, id) — never reads record content. Operator
-        /// action stays `anamnesis forget <record_id>`.
-        /// `--csv` + `--merge-preview` is rejected (nested
-        /// decision draft doesn't flatten safely).
+        /// `--mode near` only — augment each group with a
+        /// deterministic keep/forget proposal. Rejected with `--csv`.
         #[arg(long)]
         merge_preview: bool,
     },
 
-    /// Round 135 (PR-78bd): list cross-adapter `native_id`
-    /// content conflicts — multiple adapters claiming the same
-    /// upstream record but disagreeing on what it says. A
-    /// different question from `dedupe`: dedupe answers
-    /// "are these the same memory?" (raw_hash or near-dup);
-    /// `conflicts` answers "do these adapters disagree about the
-    /// same identity?".
-    ///
-    /// Read-only, NOT admin-gated. The action half stays the
-    /// existing `forget` workflow — surface a conflict, let the
-    /// operator decide which variant to drop.
+    /// Cross-adapter `native_id` content conflicts: adapters claiming
+    /// the same upstream record but disagreeing on its content.
+    /// Distinct from `dedupe` (same memory?) — this answers
+    /// "do these adapters disagree about the same identity?".
+    /// Read-only, not admin-gated.
     Conflicts {
-        /// Restrict to groups containing ≥1 record from a given
-        /// adapter (`mem0`, `claude-code`). Comma-separated OR
-        /// list also accepted, same grammar as `dedupe --source`.
-        /// Groups stay whole — siblings outside the filter still
-        /// appear so the operator sees the full disagreement set.
+        /// Adapter or comma-separated OR list; siblings stay whole.
         #[arg(long)]
         source: Option<String>,
-        /// Restrict to groups containing ≥1 record from a given
-        /// instance. Comma-separated OR list also accepted.
-        /// Combines as AND with `--source`.
+        /// Instance or comma-separated OR list (AND with `--source`).
         #[arg(long)]
         instance: Option<String>,
-        /// Max number of groups to return. Default 20, cap 100.
+        /// Max groups to return (default 20, cap 100).
         #[arg(long, default_value_t = 20)]
         limit: u32,
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
-        /// Include a short `content_preview` per record (capped
-        /// at 240 chars) so an operator can disambiguate variants
-        /// without round-tripping `get-record`. Default off —
-        /// keeps the surface redacted by default.
+        /// Include short `content_preview` (cap 240 chars). Default off.
         #[arg(long)]
         include_content: bool,
     },
 
-    /// Remove a tombstone so the source can resurrect the memory
-    /// on its next import. Does NOT recreate the record itself —
-    /// the tombstone only stored provenance, so "stay forgotten"
-    /// becomes "allowed to come back if the source re-emits."
-    ///
-    /// Idempotency: a typo or unknown id exits non-zero
-    /// (`no tombstone for id ... nothing to unforget`) so silent
-    /// "success" can't hide a paste mistake from
-    /// `list-forgotten`.
+    /// Remove a tombstone so the source can resurrect the memory on
+    /// its next import. Does NOT recreate the record — the tombstone
+    /// only stored provenance. Unknown id exits non-zero.
     Unforget {
-        /// Record id to unforget — same shape as
-        /// `list-forgotten.rows[].record_id`.
+        /// Record id to unforget.
         record_id: String,
         /// Emit JSON instead of the human one-liner.
         #[arg(long)]
         json: bool,
-        /// Round 95: don't actually unforget — print the existing
-        /// tombstone, the would-write audit entry count, and exit
-        /// 0. The tombstone is NOT deleted and `audit.log` is NOT
-        /// appended. Symmetric with R83's `forget --dry-run`.
+        /// Preview only: prints the tombstone and would-write audit
+        /// count, no deletion, exits 0.
         #[arg(long)]
         dry_run: bool,
-        /// Round 134 (PR-78bc): also unforget every record that
-        /// `provenance.derived_from` of this one. Symmetric with
-        /// R133 `forget --cascade-derived`. Note: this only deletes
-        /// tombstones, never resurrects live records — the
-        /// source's re-import (or re-extract for derived rows) is
-        /// what actually brings the data back.
+        /// Also unforget every record `provenance.derived_from` this one.
+        /// Tombstone-only — re-importing is what brings the data back.
         #[arg(long)]
         cascade_derived: bool,
     },
@@ -438,79 +345,46 @@ enum Command {
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
-        /// Include `native_path`, `raw_hash`, and `reason` fields
-        /// in the output. Default off — these may carry user-
-        /// supplied or source-derived content and shouldn't appear
-        /// in a casual audit dump.
+        /// Reveal `native_path`, `raw_hash`, `reason` (default off).
         #[arg(long)]
         include_sensitive: bool,
-        /// Round 90: also report `counts.total` and
-        /// `counts.by_source` (per-`(adapter, instance)`
-        /// tombstone totals). Counts respect the same
-        /// `--source` / `--instance` filter as the row list,
-        /// but they reflect the **full** matching set — not
-        /// just the current page — so an operator can see the
-        /// real shape of the tombstone table at a glance.
+        /// Append `counts.total` + `counts.by_source` (filter-scoped,
+        /// ignores `--limit`).
         #[arg(long)]
         include_counts: bool,
-        /// Round 106: emit redacted CSV (mirrors R91/R92
-        /// `audit tail --csv`). Mutually exclusive with --json
-        /// (clap) and with --include-sensitive /
-        /// --include-counts (runtime check). Re-enabled after
-        /// R106 fixed the Windows main-thread stack so CLI
-        /// args can grow again.
+        /// Emit redacted CSV (mutually exclusive with --json
+        /// and `--include-sensitive` / `--include-counts`).
         #[arg(long, conflicts_with = "json")]
         csv: bool,
     },
 
-    /// Forget a record permanently.
-    ///
-    /// Writes a tombstone (`record_tombstones`) keyed on
-    /// `(adapter, instance, native_id)` and removes the live record
-    /// row + its chunks / embeddings / raw artifact. Re-importing
-    /// the same source will *not* resurrect this record — the
-    /// tombstone gate suppresses it inside `upsert_record` /
-    /// `upsert_records_batch` before any chunking work runs.
-    ///
-    /// Idempotent: re-running on an already-forgotten id exits 0
-    /// with `status: already-forgotten`. An id that never existed
-    /// exits non-zero with `status: not-found` so a typo in
-    /// scripted usage is loud.
+    /// Forget a record permanently: writes a `(adapter, instance,
+    /// native_id)` tombstone and deletes the live record + chunks +
+    /// embeddings + raw artifact. Re-importing the same source will
+    /// NOT resurrect the record (tombstone gate). Idempotent:
+    /// re-running on an already-forgotten id exits 0 with
+    /// `status: already-forgotten`; unknown id exits non-zero.
     Forget {
-        /// Record id (e.g. `claude-code:default:session-42`'s
-        /// hashed form, as printed by `anamnesis search`).
+        /// Record id (the hashed form printed by `anamnesis search`).
         record_id: String,
-        /// Optional operator-supplied reason — stored on the
-        /// tombstone for the future `list_forgotten` view.
+        /// Optional reason — stored on the tombstone.
         #[arg(long)]
         reason: Option<String>,
         /// Emit JSON instead of the human one-liner.
         #[arg(long)]
         json: bool,
-        /// Round 83: don't actually forget — print a preview
-        /// showing how many rows would be deleted, what the
-        /// tombstone would carry, and that one audit entry
-        /// would be written. The store is **not** touched and
-        /// the audit log is **not** appended.
+        /// Preview only: no writes, no audit append.
         #[arg(long)]
         dry_run: bool,
-        /// Round 133 (PR-78bb): also forget every record that
-        /// transitively claims this one in `provenance.derived_from`.
-        /// Closes the R72 gap where forgetting an Episode left
-        /// Stage-2-extracted Facts / Preferences / Skills live.
-        /// Off by default — back-compat. Combine with `--dry-run`
-        /// to see the full cascade footprint without writing.
+        /// Also forget every record `provenance.derived_from` this one
+        /// (closes the R72 gap on Stage-2 extracts). Combine with
+        /// `--dry-run` to see the cascade footprint.
         #[arg(long)]
         cascade_derived: bool,
     },
 
-    /// Score retrieval quality (MRR@k / nDCG@k) over a judged query
-    /// set and gate the result on configurable thresholds.
-    ///
-    /// Round 70: this is the *measurement* primitive — it runs the
-    /// same `HybridSearcher` + `pack` path that `search` and the
-    /// MCP server use, then scores the ranked records against a
-    /// JSONL judgment file. Read-only; never writes to the store.
+    /// MRR@k / nDCG@k over a JSONL judgment set; same retrieval path
+    /// as `search` and the MCP server. Read-only.
     EvalQuality {
         /// JSONL judgments file. One [`anamnesis_search::JudgedQuery`]
         /// per line; see the docstring on that type for the schema.
@@ -549,33 +423,17 @@ enum Command {
     #[command(subcommand)]
     Audit(AuditCmd),
 
-    /// Export records as JSONL, CSV, or a mem0-/letta-readable
-    /// SQLite DB.
-    ///
-    /// Round 138 (PR-78bg) added `mem0-sqlite` and R139 (PR-78bh)
-    /// added `letta-sqlite` — both close the bidirectional interop
-    /// loop: an operator can import → normalise/dedupe/consolidate
-    /// in Anamnesis → export back into the schema the original
-    /// framework itself reads. Exported DBs are fresh files; we
-    /// refuse to overwrite an existing path so a typo can't
-    /// clobber the user's real `~/.mem0/history.db` or
-    /// `~/.letta/letta.db`.
+    /// Export records as `jsonl`, `csv`, `mem0-sqlite`, or
+    /// `letta-sqlite` (fresh files, refuses to overwrite).
+    /// SQLite formats let mem0/Letta read normalised/deduped data
+    /// back through their own readers.
     Export {
-        /// Output file path. For `jsonl` / `csv`: defaults to
-        /// stdout. For `mem0-sqlite` / `letta-sqlite`: REQUIRED
-        /// — SQLite output can't stream, so we always materialise
-        /// a file path.
+        /// Output path. `jsonl`/`csv`: defaults to stdout.
+        /// SQLite formats: required (can't stream).
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Format: `jsonl` (one AnamnesisRecord per line), `csv`,
-        /// `mem0-sqlite` (R138 — fresh SQLite DB with the
-        /// `memories` table mem0 itself reads), or `letta-sqlite`
-        /// (R139 — fresh SQLite DB with the `block` table the
-        /// Letta SQLite adapter reads). Letta-origin records
-        /// round-trip their native `block` columns
-        /// (label/description/template_name) from the metadata
-        /// the Letta adapter stashed at import time; non-Letta
-        /// origins get a stable `anamnesis/<adapter>` label.
+        /// `jsonl` (default), `csv`, `mem0-sqlite`, or `letta-sqlite`.
+        /// Letta-origin records round-trip native `block` columns.
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// Restrict to one source (adapter id).
@@ -772,14 +630,8 @@ enum Command {
         /// source is stale per `--since`. No effect without `--since`.
         #[arg(long)]
         strict_staleness: bool,
-        /// Round 130: emit an enriched JSON envelope
-        /// `{ summary, filters, sources, request_metrics }`
-        /// instead of the bare-array `--json`. Mutually
-        /// exclusive with `--json`. The bare-array shape is
-        /// preserved for back-compat — scripts that pin it
-        /// keep working; scripts that want operator-facing
-        /// counts / filter echo / metrics window opt into
-        /// the envelope here.
+        /// Enriched JSON envelope `{ summary, filters, sources,
+        /// request_metrics }` (replaces the bare-array `--json`).
         #[arg(long, conflicts_with = "json")]
         json_summary: bool,
     },
@@ -2639,13 +2491,8 @@ fn audit(data_dir: &std::path::Path) -> anamnesis_core::Audit {
 // export
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Round 140 (PR-78bi): refactored to delegate to the shared
-/// `anamnesis-export` crate. Same wire behaviour as R138/R139 (CLI
-/// `--format` default `jsonl`, `out` defaults to stdout for
-/// jsonl/csv, REQUIRED for `mem0-sqlite` / `letta-sqlite`).
-/// The shared crate hosts the format dispatch, filter parsing,
-/// SQLite safety guard, and provenance metadata convention — so
-/// the MCP `export_memories` tool runs through the same writers.
+/// Delegates to the shared `anamnesis-export` crate; same writers as
+/// the MCP `export_memories` tool.
 fn cmd_export(
     data_dir: &std::path::Path,
     out: Option<&std::path::Path>,
@@ -3237,17 +3084,12 @@ fn print_human_search_trace(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// conflicts (Round 135 PR-78bd)
+// conflicts
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `anamnesis conflicts` — list groups of records that share the
-/// same `provenance.native_id` across adapters but disagree on
-/// `content`. Distinct from `dedupe`: dedupe surfaces "same memory
-/// captured twice" (raw_hash or near-dup); conflicts surface
-/// "same identity, different content".
-///
-/// Read-only. Default output is redacted — `content_preview` is
-/// only attached when the operator passes `--include-content`.
+/// `anamnesis conflicts` — groups of records sharing one `native_id`
+/// across adapters but disagreeing on content. Read-only; default
+/// redacted (`content_preview` requires `--include-content`).
 fn cmd_conflicts(
     data_dir: &std::path::Path,
     source: Option<&str>,
@@ -3406,11 +3248,8 @@ fn cmd_forget(
     let outcome = cascade_outcome.root;
     let derived = cascade_outcome.derived;
 
-    // §-1.5 PR-6 audit: every state-mutating CLI action lands in
-    // the stage-2 audit log so `anamnesis audit` can reconstruct
-    // who-forgot-what-when. Round 133 adds `cascade_derived` +
-    // the derived record ids so the audit chain captures the full
-    // blast radius (not just the named root).
+    // Audit every state-mutating CLI action. `cascade_derived` +
+    // derived ids captures the full blast radius, not just the root.
     let mut audit_detail = serde_json::json!({
         "record_id": record_id,
         "reason": reason,
@@ -3451,10 +3290,8 @@ fn cmd_forget(
             }),
         };
         if cascade_derived {
-            // R133: always emit `cascade` when the flag was set,
-            // even with `derived: []` so a script can distinguish
-            // "I asked for cascade and there were no derivations"
-            // from "cascade was never asked."
+            // Always emit `cascade` when the flag was set so scripts can
+            // distinguish "cascade asked, no derivations" from "not asked".
             payload["cascade"] = render_forget_cascade_json(&derived);
         }
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -3495,11 +3332,8 @@ fn cmd_forget(
     Ok(())
 }
 
-/// Round 133 (PR-78bb): render the derived-records block of a
-/// cascade forget as the `cascade` JSON object on `forget --json`.
-/// `derived_count` is the cardinality the audit log mirrors; the
-/// per-row shape carries adapter/instance/native_id so an operator
-/// can confirm "yes, those were the extractor-derived facts."
+/// Render derived-records block as the `cascade` JSON object on
+/// `forget --json`.
 fn render_forget_cascade_json(
     derived: &[anamnesis_store::DerivedForgetRecord],
 ) -> serde_json::Value {
@@ -3526,9 +3360,7 @@ fn render_forget_cascade_json(
     })
 }
 
-/// R133: human one-liner per derived record beneath the root
-/// summary. Mirrors the structured `cascade` JSON shape so an
-/// operator gets the same information without `--json`.
+/// Human one-liner per derived record beneath the root summary.
 fn print_forget_cascade_human(derived: &[anamnesis_store::DerivedForgetRecord]) {
     if derived.is_empty() {
         println!("  cascade-derived: no descendants");
@@ -3553,10 +3385,8 @@ fn print_forget_cascade_human(derived: &[anamnesis_store::DerivedForgetRecord]) 
     }
 }
 
-/// Round 83 (PR-78e): `anamnesis forget --dry-run` — preview the
-/// cascade without writing anything. Does NOT call
-/// `store.forget_record` and does NOT append to `audit.log`. Same
-/// exit-code policy as the real path: `NotFound` is loud.
+/// `anamnesis forget --dry-run` — preview the cascade. Never calls
+/// `store.forget_record` and never appends audit. `NotFound` is loud.
 fn cmd_forget_dry_run(
     store: &Store,
     record_id: &str,
@@ -3704,11 +3534,8 @@ fn cmd_forget_dry_run(
     Ok(())
 }
 
-/// R133: render the cascade preview block on `forget --dry-run
-/// --cascade-derived --json`. Each per-row entry carries
-/// `would_delete` (the same per-table count shape as the root) and
-/// `already_forgotten_at` (`null` = cascade would write a fresh
-/// tombstone, integer = tombstone already exists).
+/// Cascade preview JSON for `forget --dry-run --cascade-derived --json`.
+/// `already_forgotten_at = null` means a fresh tombstone would be written.
 fn render_forget_cascade_preview_json(
     derived: &[anamnesis_store::DerivedForgetPreview],
 ) -> serde_json::Value {
@@ -3743,7 +3570,7 @@ fn render_forget_cascade_preview_json(
     })
 }
 
-/// R133: human cascade preview lines under the root summary.
+/// Human cascade preview lines under the root summary.
 fn print_forget_cascade_preview_human(derived: &[anamnesis_store::DerivedForgetPreview]) {
     if derived.is_empty() {
         println!("  cascade-derived (DRY-RUN): no descendants");
@@ -3780,19 +3607,10 @@ fn print_forget_cascade_preview_human(derived: &[anamnesis_store::DerivedForgetP
 // unforget (Round 75 PR-75)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `anamnesis unforget <record_id>` — remove a tombstone so a future
-/// import is allowed to bring the record back.
-///
-/// Critically: does NOT recreate the live record. The tombstone
-/// only stored provenance, not content, so resurrecting from it
-/// would let `unforget` synthesise data — Anamnesis is a read-only
-/// mirror of source data. The truthful design is "remove the gate;
-/// the source itself decides whether to re-emit on next import."
-///
-/// Exit codes:
-///   - 0 on `Unforgotten` (tombstone removed).
-///   - non-zero on `NotForgotten` so a paste mistake from
-///     `list-forgotten` is loud rather than silently a no-op.
+/// `anamnesis unforget <record_id>` — remove a tombstone. Does NOT
+/// recreate the live record (tombstone only stored provenance). The
+/// source itself decides whether to re-emit on next import.
+/// `NotForgotten` exits non-zero so paste mistakes are loud.
 fn cmd_unforget(
     data_dir: &std::path::Path,
     record_id: &str,
@@ -3879,12 +3697,8 @@ fn cmd_unforget(
     Ok(())
 }
 
-/// Round 134 (PR-78bc): render the cascade block on `unforget --json`.
-/// Mirrors the R133 `forget` cascade renderer — `derived_count` +
-/// per-row record snapshot (record_id / adapter / instance /
-/// native_id / forgotten_at). Pre-R134 tombstones with NULL
-/// `derived_from` produce an empty list, but the empty `cascade`
-/// block still distinguishes "I asked for cascade" from "I didn't."
+/// Render cascade block on `unforget --json`. Empty list still emitted
+/// so scripts distinguish "cascade asked" from "not asked".
 fn render_unforget_cascade_json(
     derived: &[anamnesis_store::DerivedUnforgetRecord],
 ) -> serde_json::Value {
@@ -3910,9 +3724,7 @@ fn render_unforget_cascade_json(
     })
 }
 
-/// R134: human one-liner per descendant tombstone beneath the root
-/// summary. Mirrors the structured cascade JSON shape so operators
-/// get the same information without `--json`.
+/// Human one-liner per descendant tombstone beneath the root summary.
 fn print_unforget_cascade_human(derived: &[anamnesis_store::DerivedUnforgetRecord]) {
     if derived.is_empty() {
         println!("  cascade-derived: no descendant tombstones");
@@ -3935,11 +3747,9 @@ fn print_unforget_cascade_human(derived: &[anamnesis_store::DerivedUnforgetRecor
     }
 }
 
-/// Round 95 (PR-78q): `anamnesis unforget --dry-run` — preview
-/// the tombstone the real `unforget` would remove. Does NOT
-/// call `store.unforget_record` and does NOT append to
-/// `audit.log`. Same exit-code policy as the real path:
-/// missing tombstone exits non-zero so a typo'd id stays loud.
+/// `anamnesis unforget --dry-run` — preview the tombstone removal.
+/// Never calls `store.unforget_record`; never appends audit.
+/// Missing tombstone exits non-zero.
 fn cmd_unforget_dry_run(
     store: &Store,
     record_id: &str,
@@ -4008,10 +3818,7 @@ fn cmd_unforget_dry_run(
     Ok(())
 }
 
-/// R134: render the cascade-preview block on `unforget --dry-run
-/// --cascade-derived --json`. Same per-row shape as the post-commit
-/// renderer; no `would_delete` counts here (descendants are one-row
-/// tombstone DELETEs each).
+/// Cascade-preview JSON for `unforget --dry-run --cascade-derived --json`.
 fn render_unforget_cascade_preview_json(
     derived: &[anamnesis_store::DerivedUnforgetPreview],
 ) -> serde_json::Value {
@@ -4037,7 +3844,7 @@ fn render_unforget_cascade_preview_json(
     })
 }
 
-/// R134: human cascade-preview lines under the root summary.
+/// Human cascade-preview lines under the root summary.
 fn print_unforget_cascade_preview_human(derived: &[anamnesis_store::DerivedUnforgetPreview]) {
     if derived.is_empty() {
         println!("  cascade-derived (DRY-RUN): no descendant tombstones");
@@ -4201,10 +4008,7 @@ fn cmd_dedupe(
     include_near_self: bool,
     merge_preview: bool,
 ) -> Result<()> {
-    // Round 141 (PR-78bj): `--merge-preview` is near-only and
-    // JSON/human-only. Refuse `exact` (no per-group ranking to
-    // propose) and refuse `csv` (the nested decision draft
-    // doesn't flatten safely into a flat row format).
+    // `--merge-preview` is near-only and JSON/human-only.
     if merge_preview && matches!(mode, DedupeMode::Exact) {
         return Err(anyhow!(
             "--merge-preview requires --mode near: the exact path has no per-group ranking to propose."
@@ -4215,12 +4019,8 @@ fn cmd_dedupe(
             "--merge-preview and --csv are mutually exclusive — the per-group ranking draft is a nested object that doesn't flatten safely. Use --merge-preview --json or omit --csv."
         ));
     }
-    // Round 132 (PR-78ba): near mode is privacy-safe by
-    // construction — it never touches raw_hash or native_path —
-    // so `--include-sensitive` and `--include-counts` have
-    // nothing meaningful to add. Refuse them loudly so an
-    // operator notices the mismatch instead of seeing a
-    // silently-ignored flag.
+    // Near mode never reads `raw_hash`/`native_path` — sensitive/counts
+    // have nothing meaningful to add, so refuse loudly.
     if matches!(mode, DedupeMode::Near) && include_sensitive {
         return Err(anyhow!(
             "--mode near and --include-sensitive are mutually exclusive — near-dedupe never reads `raw_hash` / `native_path`, so there is nothing sensitive to reveal."
@@ -4237,12 +4037,8 @@ fn cmd_dedupe(
         ));
     }
 
-    // Round 107 (PR-78ac): runtime guards for the CSV
-    // conflicts clap can't carry without flirting with the
-    // Windows stack-overflow we fixed in R106. `--csv --json`
-    // is clap-rejected; the other two combinations are checked
-    // here. CSV is the redacted-summary form — sensitive
-    // smuggling or nested counts have no place in flat rows.
+    // CSV is the redacted-summary form — neither sensitive fields
+    // nor a nested counts block belongs in flat rows.
     if csv && include_sensitive {
         return Err(anyhow!(
             "--csv and --include-sensitive are mutually exclusive — CSV is the redacted-summary form (never carries `raw_hash` / `native_path`)."
@@ -4255,9 +4051,7 @@ fn cmd_dedupe(
     }
 
     if matches!(mode, DedupeMode::Near) {
-        // Defer to the dedicated near-dedupe path — it doesn't
-        // share the raw_hash projection so we keep the branches
-        // separate rather than papering over with `if` ladders.
+        // Near has a different projection from raw_hash; keep branches separate.
         return cmd_dedupe_near(
             data_dir,
             source,
@@ -4278,8 +4072,7 @@ fn cmd_dedupe(
     };
     let groups = store.list_duplicate_raw_hashes_filtered(&filter)?;
     let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
-    // Round 97: filter-scoped aggregate. Counts reflect the
-    // full matching set; `limit` only affects `groups[]`.
+    // Counts reflect the full filtered set; `limit` only affects `groups[]`.
     let counts = if include_counts {
         Some(store.count_duplicate_raw_hashes_by_source(&filter)?)
     } else {
@@ -4287,15 +4080,9 @@ fn cmd_dedupe(
     };
 
     if csv {
-        // Round 107 (PR-78ac): CSV is the redacted-summary
-        // form, mirroring R91 `audit tail --csv` + R106
-        // `list-forgotten --csv`. Header is fixed so scripts
-        // can branch on column count; empty result still
-        // prints the header. `group_index` carries duplicate-
-        // group membership without leaking `raw_hash`: rows
-        // sharing the same index belong to the same group.
-        // `record_count` is per-group size, repeated on each
-        // row for spreadsheet-friendly downstream filtering.
+        // Redacted CSV. `group_index` carries duplicate-group membership
+        // without leaking `raw_hash`. `record_count` repeated per row
+        // for spreadsheet-friendly filtering.
         println!(
             "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count"
         );
@@ -4329,18 +4116,8 @@ fn cmd_dedupe(
     }
 
     if json {
-        // Round 108 (PR-78ad): `"format": "json"` marker
-        // mirrors R107's `"format": "csv"` on the MCP CSV
-        // path. Lets a script that supports both shapes branch
-        // on `payload.format` instead of probing for `csv` vs
-        // `groups[]`. Position is alphabetical-ish next to
-        // `count` so the structural keys cluster.
-        //
-        // Round 125 (PR-78at): top-level redacted summary
-        // mirrors MCP `dedupe` R117 + CLI `source list --json`
-        // R124 + CLI `status --json` R123. NEVER reads
-        // `raw_hash` or `native_path` — only counts, filter
-        // clauses, sensitive/counts state.
+        // `"format": "json"` discriminator + redacted top-level summary;
+        // never reads `raw_hash` / `native_path`.
         let source_tokens = anamnesis_core::parse_csv_filter(source);
         let instance_tokens = anamnesis_core::parse_csv_filter(instance);
         let source_clause = if source_tokens.is_empty() {
@@ -4375,11 +4152,7 @@ fn cmd_dedupe(
             "summary": summary,
             "count": groups.len(),
             "format": "json",
-            // Round 132 (PR-78ba): wire-shape mode discriminator
-            // pairs with the new `dedupe --mode near` branch so a
-            // script can switch on `payload.mode` without inspecting
-            // which fields are present. Always emitted; default
-            // back-compat value is `"exact"`.
+            // Always-emitted mode discriminator (`"exact"` or `"near"`).
             "mode": mode.wire_label(),
             "limit": effective_limit,
             "sensitive_included": include_sensitive,
@@ -4521,40 +4294,9 @@ fn render_dedupe_counts_json(c: &anamnesis_store::DuplicateRawHashCounts) -> ser
     })
 }
 
-/// Round 132 (PR-78ba): `anamnesis dedupe --mode near` — wraps the
-/// R131 cross-source near-duplicate algorithm (SimHash + LSH +
-/// Jaccard) in the CLI's standard redacted-summary discipline. No
-/// `--include-sensitive` / `--include-counts` paths: the algorithm
-/// never reads `raw_hash` / `native_path` and there is no
-/// raw_hash-style aggregate to surface.
-///
-/// JSON wire shape:
-/// ```text
-/// {
-///   "format": "json",
-///   "mode": "near",
-///   "summary": "<human discovery summary>",
-///   "count": <groups returned>,
-///   "limit": <clamped limit>,
-///   "filter": {
-///     "source": <raw input | null>,
-///     "instance": <raw input | null>,
-///     "require_cross_source": <bool>
-///   },
-///   "groups": [
-///     {
-///       "record_count": N,
-///       "min_similarity": <f64 in [0.6, 1.0]>,
-///       "max_distance": <u32 in [0, 8]>,
-///       "records": [{
-///         "record_id", "adapter", "instance" (null for default),
-///         "native_id", "created_at", "updated_at",
-///         "has_native_path"
-///       }, ...]
-///     }, ...
-///   ]
-/// }
-/// ```
+/// `anamnesis dedupe --mode near` — SimHash + LSH + Jaccard near-dup
+/// surface. Always redacted (never reads `raw_hash`/`native_path`);
+/// no sensitive/counts knobs.
 #[allow(clippy::too_many_arguments)]
 fn cmd_dedupe_near(
     data_dir: &std::path::Path,
@@ -4576,12 +4318,9 @@ fn cmd_dedupe_near(
     let groups = anamnesis_store::list_near_duplicates(&store, &filter)?;
     let effective_limit = limit.clamp(1, anamnesis_store::NEAR_DEDUPE_MAX_LIMIT);
 
-    // Round 141 (PR-78bj): batch-fetch user-tag counts for every
-    // record across every group. One round-trip instead of N, and
-    // the count map is what `build_merge_preview` consumes. Always
-    // computed (cheap) so the human path can also render the
-    // ranking; the JSON path attaches a `merge_preview` block per
-    // group only when the operator explicitly asked.
+    // Batch-fetch user-tag counts in one round-trip (input to ranker).
+    // Always computed (cheap); JSON path attaches per-group merge_preview
+    // only when explicitly asked.
     let all_ids: Vec<anamnesis_core::model::RecordId> = groups
         .iter()
         .flat_map(|g| g.records.iter().map(|r| r.record_id.clone()))
@@ -4597,10 +4336,8 @@ fn cmd_dedupe_near(
         .collect();
 
     if csv {
-        // R107-style flat CSV. Header carries the per-group
-        // similarity stats so a script doesn't need a second
-        // round-trip for ranking. `group_index` (not raw_hash —
-        // near-dedupe has none) keeps membership recoverable.
+        // Flat CSV; header carries per-group similarity stats.
+        // `group_index` recovers membership (near-dedupe has no raw_hash).
         println!(
             "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count,min_similarity,max_distance"
         );
@@ -5909,12 +5646,8 @@ async fn cmd_doctor(
             .collect();
 
         if json_summary {
-            // Round 130 (PR-78ay): additive enrichment
-            // envelope. The bare-array `--json` shape stays
-            // for back-compat with existing CI scripts.
-            // `summary` / `filters` NEVER read `location` or
-            // `detail` text — only counts and parsed filter
-            // tokens.
+            // Enrichment envelope; summary/filters never read
+            // `location` or `detail` text — only counts + parsed tokens.
             let total = rows.len() as u64;
             let registered_count = rows.iter().filter(|r| r.registered).count() as u64;
             let ok_count = rows.iter().filter(|r| r.ok && r.registered).count() as u64;
@@ -6921,11 +6654,7 @@ async fn run_search_traced(
     mode: SearchMode,
     provider: Option<&ProviderHandle>,
 ) -> Result<anamnesis_search::TracedSearchResult> {
-    // Round 136 (PR-78be): central candidate-pool policy. Replaces
-    // the historic `limit * 4` heuristic with a clamped 8× scale
-    // (floor 64, ceil 512) so tiny-limit queries don't starve
-    // recall and huge-limit queries don't burn ANN cycles on
-    // candidates the post-rerank top-K won't use.
+    // Candidate-pool sizing: `limit * 8`, clamped to `[64, 512]`.
     let opts = HybridOpts::for_limit(limit, mode);
     match provider {
         Some(handle) => match handle {

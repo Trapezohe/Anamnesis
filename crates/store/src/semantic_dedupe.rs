@@ -1,58 +1,13 @@
-//! Round 131 (PR-78az): cross-source near-duplicate detection.
+//! Cross-source near-duplicate detection (read-only, never mutates).
 //!
-//! Anamnesis is a cross-agent memory interoperability protocol — and the
-//! same user thought often ends up captured by multiple adapters (mem0
-//! during a chat session, claude-code in `CLAUDE.md`, generic-mcp from
-//! a sidecar tool). The R77 `dedupe` surface catches byte-identical
-//! copies via `raw_hash`, but the cross-adapter case rarely produces
-//! byte-identical bodies: punctuation, prefix tags, whitespace, and CJK
-//! tokenization differences are enough to drift the hash.
+//! Pipeline: tokenize → SimHash 64-bit → LSH banding → re-rank by
+//! Hamming ≤ `HAMMING_THRESHOLD` AND Jaccard ≥ `JACCARD_THRESHOLD` →
+//! union-find → cross-source filter (default on).
 //!
-//! This module adds a **read-only candidate detector** for that case.
-//! It never mutates the store, never writes a tombstone, never merges:
-//! it surfaces "these records are probably the same memory across
-//! sources" so an operator (or a future consolidation pipeline) can
-//! decide what to do.
-//!
-//! ## Algorithm (v1)
-//!
-//! 1. Tokenize each record's `content` via the shared
-//!    [`crate::cjk::tokenize_indexing`] helper. Skip records with fewer
-//!    than [`MIN_TOKENS`] tokens — short records carry too little
-//!    signal and over-match.
-//! 2. Compute a 64-bit SimHash per record (Charikar, 2002): each
-//!    unique token contributes ±1 per bit position based on the bits
-//!    of its blake3-derived 64-bit hash. The SimHash bit is 1 when the
-//!    accumulator is positive.
-//! 3. **LSH banding** to skip the O(n²) brute force: split the 64-bit
-//!    hash into [`SIMHASH_BANDS`] = 4 bands of [`SIMHASH_BAND_BITS`]
-//!    = 16 bits each, bucket records by `(band_index, band_value)`.
-//!    Candidate pairs share at least one band — by the birthday bound
-//!    this catches the Hamming-distance regime we care about
-//!    (distance ≤ ~6) with very high probability.
-//! 4. Re-rank each candidate pair with two independent checks:
-//!    - Hamming distance on the full 64-bit SimHash ≤ [`HAMMING_THRESHOLD`]
-//!    - Jaccard similarity on the token sets ≥ [`JACCARD_THRESHOLD`]
-//!
-//!    Both must hold. SimHash alone has false positives on
-//!    high-entropy short text; pure Jaccard alone is O(n²) without
-//!    the LSH pre-filter.
-//! 5. Union-find the surviving pairs into connected components. Each
-//!    component is one near-duplicate group.
-//! 6. **Cross-agent filter** (load-bearing for the interop mission):
-//!    by default, only return groups containing ≥2 distinct adapter
-//!    ids. The single-source case is what `raw_hash` exact dedupe
-//!    already covers; this surface is for the cross-adapter
-//!    discovery.
-//!
-//! ## Privacy
-//!
-//! The returned shape mirrors R77's `DuplicateRawHashGroup` discipline:
-//! per-record `record_id / adapter / instance / native_id /
-//! created_at / updated_at / has_native_path`. The record `content`,
-//! the tokenized form, and the SimHash itself are NEVER returned. The
-//! per-group `similarity` summary is computed from the worst pair so
-//! an operator can sort by "least similar" without re-reading bodies.
+//! Privacy: content, tokens, and SimHash are NEVER returned. Per-record
+//! shape mirrors R77 `DuplicateRawHashGroup`; per-group reports
+//! `min_similarity` / `max_distance` so callers can rank groups
+//! without re-reading bodies.
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,67 +16,39 @@ use anamnesis_core::model::{Kind, RecordId};
 use crate::cjk::tokenize_indexing;
 use crate::{Result, Store};
 
-/// Round 131: number of LSH bands. With 64-bit SimHash and an
-/// 8-bit Hamming threshold, the classic LSH recall formula
-/// `P(match) = 1 - (1 - (1-d/n)^r)^b` says we need either many
-/// narrow bands or few wide bands; **narrow bands win on recall**.
-///
-/// With `b=16`, `r=4`, Hamming `d=8`: `P ≈ 1 - (1 - 0.589)^16 ≈
-/// ~100%`. With `b=4`, `r=16`: `P ≈ 40%` — the empirical case that
-/// motivated this choice (a hand-validated cross-adapter
-/// paraphrase pair had Hamming 7 distributed across all 4 wide
-/// bands, missing every bucket).
-///
-/// Cost: 16 hash-table inserts per record per scan vs 4. For the
-/// typical operator corpus (≤ ~10k records), still well under a
-/// second.
+/// LSH bands. 16×4 chosen over 4×16: recall ≈100% vs ≈40% at Hamming≤8
+/// per `P = 1 − (1 − (1−d/n)^r)^b`. Costs 16 hash inserts/record/scan.
 const SIMHASH_BANDS: usize = 16;
-/// Bits per LSH band. `SIMHASH_BANDS * SIMHASH_BAND_BITS` must equal 64.
+/// Bits per band; `SIMHASH_BANDS * SIMHASH_BAND_BITS == 64`.
 const SIMHASH_BAND_BITS: u32 = 4;
-/// Maximum Hamming distance for a candidate pair to survive
-/// re-ranking. 8/64 corresponds to ~87% SimHash similarity —
-/// generous enough to catch realistic cross-adapter paraphrases
-/// (which differ in articles, punctuation, conjunctions) without
-/// admitting unrelated records (which routinely score > 16 in
-/// hand-validated samples).
+/// Hamming cutoff (8/64 ≈ 87% similarity); calibrated on paraphrase fixtures.
 const HAMMING_THRESHOLD: u32 = 8;
-/// Minimum Jaccard similarity on token sets for a candidate pair
-/// to survive re-ranking. Calibrated against realistic
-/// cross-adapter paraphrase pairs: prose like
-/// "User prefers X" vs "The user prefers X with extra details"
-/// scores 0.6-0.75; completely unrelated records score < 0.3 even
-/// with shared common vocabulary. 0.6 is the conservative cut.
+/// Jaccard cutoff. Paraphrases score 0.6-0.75; unrelated < 0.3.
 const JACCARD_THRESHOLD: f64 = 0.6;
-/// Records with fewer unique search tokens than this are skipped.
-/// Short records (e.g. a one-word memory) carry too little signal
-/// for SimHash + Jaccard to distinguish meaningful overlap from
-/// random vocabulary co-occurrence.
+/// Skip records below this token count to avoid false positives on tiny text.
 const MIN_TOKENS: usize = 4;
 
-/// One record inside a near-duplicate group. Same shape as R77's
-/// `DuplicateRawHashRecord` — privacy-preserving: no `content`, no
-/// `raw_hash`, no tokenized form.
+/// One record inside a near-duplicate group. Privacy-safe: no content / raw_hash / tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NearDuplicateRecord {
     /// Hashed record id.
     pub record_id: RecordId,
-    /// Adapter that produced this record.
+    /// Adapter id.
     pub adapter: String,
-    /// Instance discriminator — empty string for the default instance.
+    /// Instance — empty string for default.
     pub instance: String,
-    /// Native id at the source.
+    /// Native id at source.
     pub native_id: String,
-    /// Whether the record carries a `native_path` (the path itself
-    /// stays redacted at this surface — see module privacy notes).
+    /// `native_path` exists (path itself is never returned here).
     pub has_native_path: bool,
-    /// Record created_at, unix seconds.
+    /// Created at, unix seconds.
     pub created_at: i64,
-    /// Record updated_at, unix seconds. `None` when never updated.
+    /// Updated at, unix seconds.
     pub updated_at: Option<i64>,
 }
 
-/// A connected component of near-duplicate records discovered by
-/// SimHash + Jaccard. The per-group `min_similarity` is the smallest
+/// Connected component of near-duplicate records.
+/// `min_similarity` is the smallest
 /// pairwise Jaccard score that survived re-ranking — useful for
 /// sorting groups from "definitely duplicate" to "borderline".
 #[derive(Debug, Clone, PartialEq)]
@@ -138,24 +65,16 @@ pub struct NearDuplicateGroup {
     pub max_distance: u32,
 }
 
-/// Filter knobs for [`Store::list_near_duplicate_records`].
+/// Filter knobs for the near-duplicate scan.
 #[derive(Debug, Clone)]
 pub struct NearDuplicateFilter {
-    /// Comma-separated source filter (R104 grammar via
-    /// [`anamnesis_core::parse_csv_filter`]). Empty = all adapters.
-    /// Applied at the candidate-loading stage so the SimHash pool
-    /// never includes records outside the operator's scope.
+    /// Source filter; CSV OR grammar via `parse_csv_filter`. `None` = all.
     pub source: Option<String>,
-    /// Instance discriminator filter, same grammar. AND-combined
-    /// with `source`.
+    /// Instance filter; same grammar, AND-combined with `source`.
     pub instance: Option<String>,
-    /// When `true` (default), only groups containing ≥2 distinct
-    /// adapter ids are returned. Set `false` to also see
-    /// within-adapter near-duplicates — useful for a single source
-    /// that produces near-copies over time.
+    /// `true` (default) = only groups spanning ≥2 distinct adapters.
     pub require_cross_source: bool,
-    /// Cap on the number of groups returned. Clamped to
-    /// `[1, MAX_LIMIT]`.
+    /// Group cap, clamped to `[1, MAX_LIMIT]`.
     pub limit: u32,
 }
 
@@ -170,14 +89,10 @@ impl Default for NearDuplicateFilter {
     }
 }
 
-/// Hard cap on groups returned in one call. The detection pass walks
-/// every live record's content, so we keep the limit small enough to
-/// stay under a few seconds even on a 10k-record store.
+/// Hard cap on groups per call.
 pub const MAX_LIMIT: u32 = 100;
 
-/// Internal row carried through the algorithm. Holds the raw token
-/// set (kept only in-memory, never returned) so the second-pass
-/// Jaccard check doesn't re-tokenize.
+/// In-memory row carried through the pipeline.
 struct ScannedRecord {
     record_id: RecordId,
     adapter: String,
@@ -191,18 +106,14 @@ struct ScannedRecord {
     simhash: u64,
 }
 
-/// Test-only: expose the pure-function pipeline so unit tests can
-/// drop straight in a token set and inspect SimHash without going
-/// through the store.
+/// Test-only: SimHash a content string in isolation.
 #[cfg(test)]
 pub fn debug_simhash(content: &str) -> (u64, HashSet<String>) {
     let tokens = unique_tokens(content);
     (simhash_64(&tokens), tokens)
 }
 
-/// Public entry point — runs the full pipeline. The implementation is
-/// intentionally hostable on top of the existing read API
-/// (`Store::list_records_for_dedupe`) so we don't need a migration.
+/// Entry point: tokenize → SimHash → LSH → re-rank → union-find → filter.
 pub fn list_near_duplicates(
     store: &Store,
     filter: &NearDuplicateFilter,

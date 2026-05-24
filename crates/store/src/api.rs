@@ -87,32 +87,17 @@ pub fn blob_to_f32(b: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
-/// Round 133 (PR-78bb): inside-tx forget primitive shared between
-/// the R72 [`Store::forget_record`] and the new cascade
-/// [`Store::forget_record_with_options`]. Keeps the
-/// records-row → vec0 → tombstone sequence in one place so the
-/// cascade path can't drift from the single-record path.
-///
-/// Round 134 (PR-78bc): also captures the live record's
-/// `derived_from` into the tombstone (new column added by migration
-/// 0011), so the inverse `unforget --cascade-derived` BFS has a
-/// pointer to walk. Pre-R134 tombstones carry NULL; the unforget
-/// cascade treats those as "no descendants known".
-///
-/// Returns the same shape as `forget_record`:
-/// `Forgotten` (wrote a fresh tombstone),
-/// `AlreadyForgotten` (the record was already tombstoned), or
-/// `NotFound` (no record and no tombstone).
+/// Forget one record inside an existing tx. Shared by single-record
+/// and cascade paths. Captures `derived_from` so unforget can BFS the
+/// tombstone subtree. Returns `Forgotten` / `AlreadyForgotten` / `NotFound`.
 fn forget_one_in_tx(
     tx: &rusqlite::Transaction<'_>,
     id: &RecordId,
     reason: Option<&str>,
     now: i64,
 ) -> Result<ForgetRecordOutcome> {
-    // Round 134: snapshot now includes `derived_from` so the new
-    // record_tombstones column gets populated by the same write.
-    // Column shape: (adapter, instance, native_id, native_path,
-    // raw_hash, derived_from) — aliased to quiet clippy::type_complexity.
+    // (adapter, instance, native_id, native_path, raw_hash, derived_from).
+    // Aliased to quiet clippy::type_complexity.
     type LiveCols = (
         String,
         String,
@@ -218,11 +203,7 @@ fn forget_one_in_tx(
     }))
 }
 
-/// Round 135 (PR-78bd): char-boundary-safe truncation for the
-/// `NativeConflictRecord.content_preview` field. Returns at most
-/// `max_chars` Unicode scalar values; never splits a multi-byte
-/// codepoint. Used by `list_native_content_conflicts_filtered`
-/// when the caller opts into `include_content`.
+/// Char-boundary-safe truncation. Returns ≤ `max_chars` scalars + `…`.
 fn truncate_preview(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
@@ -238,13 +219,8 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// Round 134 (PR-78bc): inside-tx unforget primitive shared between
-/// the R75 [`Store::unforget_record`] and the new cascade
-/// [`Store::unforget_record_with_options`]. Keeps the tombstone-read
-/// → DELETE pair in one place so the cascade path can't drift from
-/// the single-record path. Returns
-/// `Unforgotten(ForgottenRecord)` when a tombstone was found and
-/// deleted; `NotForgotten` otherwise.
+/// Unforget one tombstone inside an existing tx. Shared by single-record
+/// and cascade paths. Returns `Unforgotten` / `NotForgotten`.
 fn unforget_one_in_tx(
     tx: &rusqlite::Transaction<'_>,
     id: &RecordId,
@@ -527,291 +503,198 @@ pub enum ForgetRecordOutcome {
     NotFound,
 }
 
-/// Round 83 (PR-78e): per-table cascade counts a `forget_record`
-/// **would** delete (existing rows) or insert (tombstone, audit).
-/// All fields are `u64` so callers can render large stores
-/// without arithmetic surprises.
-///
-/// Counted via the same queries the real `forget_record` runs, so
-/// the preview can't silently drift from the actual cascade:
-///   * vec0 rows go through `vec_ext::count_vec_rows_for_record`
-///     (mirror of `delete_vec_rows_for_record`)
-///   * other tables resolved via FK cascade in the SQLite schema
+/// Per-table cascade counts a `forget_record` would delete. Computed via
+/// the same queries the real cascade runs (vec0 via
+/// `vec_ext::count_vec_rows_for_record`; rest via FK cascade) so preview
+/// and reality can't drift.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForgetCascadeCounts {
-    /// The live `records` row itself (always `1` for `WouldForget`,
-    /// `0` for `AlreadyForgotten` / `NotFound`).
+    /// 1 for `WouldForget`, 0 otherwise.
     pub records: u64,
-    /// `raw_artifacts` rows attached to the record.
+    /// `raw_artifacts` rows.
     pub raw_artifacts: u64,
-    /// `record_chunks` rows (cascade source for embeddings).
+    /// `record_chunks` rows.
     pub record_chunks: u64,
-    /// `chunk_embeddings` rows. Goes via `record_chunks` cascade.
+    /// `chunk_embeddings` rows.
     pub chunk_embeddings: u64,
-    /// `embedding_jobs` rows. Goes via `record_chunks` cascade.
+    /// `embedding_jobs` rows.
     pub embedding_jobs: u64,
-    /// `user_record_tags` rows. Tags are user-curated; they get
-    /// wiped on forget by the R78 FK cascade.
+    /// `user_record_tags` rows.
     pub user_record_tags: u64,
-    /// vec0 rows — manually counted because vec0 has no FK.
+    /// Manually counted — vec0 has no FK.
     pub vec0_rows: u64,
 }
 
-/// Round 83 (PR-78e): three-state preview of what
-/// [`Store::preview_forget_record`] sees before the operator
-/// commits the real delete.
+/// Three-state result of `Store::preview_forget_record`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgetRecordPreview {
-    /// Live record exists — `forget_record` would write a
-    /// tombstone and cascade-delete the counted rows. The
-    /// `record` carries the would-be tombstone shape so the
-    /// operator sees exactly what gets recorded; `forgotten_at`
-    /// is `None` because it's stamped at commit-time, not now.
+    /// Live record exists — cascade-delete + tombstone-write previewed.
     WouldForget {
-        /// Per-table count of rows the real `forget_record` would
-        /// delete (or, for vec0, manually remove via the matching
-        /// `(chunk_id, model_id)` keys).
+        /// Per-table cascade counts.
         would_delete: ForgetCascadeCounts,
-        /// Would-be tombstone shape — same as `ForgottenRecord`
-        /// minus `forgotten_at` (which is only stamped at commit
-        /// time).
+        /// `ForgottenRecord` minus `forgotten_at` (stamped at commit time).
         tombstone_preview: ForgetTombstonePreview,
     },
-    /// A tombstone is already present — `forget_record` would
-    /// return `AlreadyForgotten`, no writes. Carries the existing
-    /// tombstone so the operator sees "you already forgot this
-    /// at <when> for reason <why>."
+    /// Tombstone already exists — no work; surfaces when/why.
     AlreadyForgotten(ForgottenRecord),
-    /// Neither record nor tombstone — operator likely typo'd
-    /// the id. CLI exits non-zero, MCP returns the same shape.
+    /// Neither row nor tombstone.
     NotFound,
 }
 
-/// Round 83: the would-be tombstone shape from a dry-run preview.
-/// Mirrors `ForgottenRecord` but with `forgotten_at` omitted (the
-/// real value is stamped only at commit time).
+/// Would-be tombstone from a dry-run preview. `ForgottenRecord` minus
+/// `forgotten_at` (stamped only on real commit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgetTombstonePreview {
-    /// The record id the operator is previewing — same shape as
-    /// the id passed to `preview_forget_record`.
-    pub record_id: RecordId,
-    /// Adapter id (e.g. `"claude-code"`) for the live record.
-    pub adapter: String,
-    /// Instance discriminator — `""` for the default instance.
-    pub instance: String,
-    /// Native id at the source.
-    pub native_id: String,
-    /// Native path at the source (when the adapter has one).
-    pub native_path: Option<String>,
-    /// `raw_hash` of the live record — the same value the real
-    /// `forget_record` would pin onto the tombstone.
-    pub raw_hash: String,
-    /// Operator's `--reason` passed to the dry-run, echoed back
-    /// so they can see what the audit entry would carry.
-    pub reason: Option<String>,
-}
-
-/// Round 133 (PR-78bb): opt-in options for the cascade-aware
-/// forget API. Currently a single flag, but kept as a struct so
-/// future toggles (max-depth, kind filter) don't break the public
-/// signature.
-///
-/// Default: `cascade_derived = false` — exactly the R72 behaviour.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ForgetCascadeOptions {
-    /// When `true`, walk `provenance.derived_from` starting at the
-    /// target record and tombstone+delete every descendant in the
-    /// same `IMMEDIATE` transaction. When `false`, derived records
-    /// stay live and the call behaves exactly like R72
-    /// `forget_record` / `preview_forget_record`.
-    pub cascade_derived: bool,
-}
-
-/// Round 133 (PR-78bb): per-derived-record outcome from a cascade
-/// forget. Only populated when `ForgetCascadeOptions.cascade_derived
-/// = true`. The fields mirror [`ForgottenRecord`] so an MCP/CLI
-/// surface can render derived rows with the same shape as the root.
-///
-/// `was_already_forgotten` lets a caller distinguish "we wrote a
-/// fresh tombstone for this descendant" from "the tombstone was
-/// already there, we left it alone." Either way the live record
-/// is gone by the end of the transaction (whether by this call or
-/// a previous forget).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedForgetRecord {
-    /// Hashed record id of the derived record.
-    pub record_id: RecordId,
-    /// Adapter id (e.g. `"extractor"`).
-    pub adapter: String,
-    /// Instance discriminator — `""` for the default instance.
-    pub instance: String,
-    /// Native id at the source.
-    pub native_id: String,
-    /// Native path at the source (when the adapter has one).
-    pub native_path: Option<String>,
-    /// `raw_hash` of the derived record.
-    pub raw_hash: String,
-    /// Unix seconds stamped on the tombstone — either freshly written
-    /// (when `was_already_forgotten = false`) or the existing value
-    /// (when `was_already_forgotten = true`).
-    pub forgotten_at: i64,
-    /// `true` when a tombstone already existed before this cascade
-    /// touched the record. `false` when this cascade wrote it.
-    pub was_already_forgotten: bool,
-}
-
-/// Round 133 (PR-78bb): outcome of [`Store::forget_record_with_options`].
-/// `root` carries the same shape as the R72 [`ForgetRecordOutcome`];
-/// `derived` is the list of descendants the cascade touched and is
-/// empty when `ForgetCascadeOptions.cascade_derived = false`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForgetCascadeOutcome {
-    /// The target record's outcome — semantically identical to
-    /// `forget_record(id, reason)` from R72.
-    pub root: ForgetRecordOutcome,
-    /// Descendants visited via `provenance.derived_from`. Empty when
-    /// `cascade_derived = false`, when the root has no children, or
-    /// when the root itself was `NotFound`.
-    pub derived: Vec<DerivedForgetRecord>,
-}
-
-/// Round 133 (PR-78bb): per-derived-record preview from a cascade
-/// dry-run. Same cascade counts as the root preview so an operator
-/// can render the total deletion footprint without ambiguity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedForgetPreview {
-    /// Hashed record id of the derived record.
+    /// Hashed record id.
     pub record_id: RecordId,
     /// Adapter id.
     pub adapter: String,
-    /// Instance discriminator — `""` for default.
+    /// Instance discriminator; `""` for default.
     pub instance: String,
     /// Native id at the source.
     pub native_id: String,
-    /// Native path at the source (when the adapter has one).
+    /// Native path, when the adapter has one.
     pub native_path: Option<String>,
-    /// `raw_hash` of the derived record.
+    /// Raw hash on the live record.
     pub raw_hash: String,
-    /// Per-table count of rows the real cascade would delete for
-    /// this descendant. Same shape as the root counts.
-    pub would_delete: ForgetCascadeCounts,
-    /// `Some(forgotten_at)` if a tombstone already exists for this
-    /// descendant (cascade would leave the tombstone alone). `None`
-    /// when the cascade would write a fresh tombstone.
-    pub already_forgotten_at: Option<i64>,
+    /// Operator-supplied `--reason`, echoed.
+    pub reason: Option<String>,
 }
 
-/// Round 133 (PR-78bb): preview shape returned by
-/// [`Store::preview_forget_record_with_options`]. `root` matches
-/// the R83 single-record preview; `derived` is populated only
-/// when `cascade_derived = true`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForgetCascadePreview {
-    /// Root record preview — semantically identical to
-    /// `preview_forget_record(id, reason)` from R83.
-    pub root: ForgetRecordPreview,
-    /// Descendants the cascade would touch. Empty when
-    /// `cascade_derived = false` or no descendants exist.
-    pub derived: Vec<DerivedForgetPreview>,
-}
-
-/// Round 134 (PR-78bc): opt-in options for the cascade-aware
-/// unforget API. Mirrors [`ForgetCascadeOptions`] so the call
-/// shapes are symmetric across forget/unforget. Default
-/// `cascade_derived = false` — exactly the R75 behaviour.
+/// Options for `forget_record_with_options`. Default = R72 behaviour.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UnforgetCascadeOptions {
-    /// When `true`, walk `record_tombstones.derived_from` starting at
-    /// the target record and delete every descendant tombstone in the
-    /// same `IMMEDIATE` transaction. When `false`, only the named
-    /// tombstone is removed and the call behaves exactly like R75
-    /// `unforget_record` / `preview_unforget_record`.
-    ///
-    /// Pre-R134 tombstones (written before `record_tombstones.derived_from`
-    /// existed) carry NULL. The cascade treats those as "no descendants
-    /// known" — the root unforget still works, just without the cascade
-    /// speedup. Re-running `forget` after R134 repopulates the pointer.
+pub struct ForgetCascadeOptions {
+    /// `true` = also tombstone every descendant via `provenance.derived_from`.
     pub cascade_derived: bool,
 }
 
-/// Round 134 (PR-78bc): per-derived-tombstone outcome from a cascade
-/// unforget. Only populated when `UnforgetCascadeOptions.cascade_derived
-/// = true`. Same field shape as [`ForgottenRecord`] (so an MCP/CLI
-/// surface can render derived rows with the same column set as the
-/// root) — but explicitly NOT recreating the live record itself,
-/// which is the R75 contract this cascade preserves.
+/// One descendant's outcome inside `ForgetCascadeOutcome.derived`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedForgetRecord {
+    /// Hashed record id.
+    pub record_id: RecordId,
+    /// Adapter id (typically `"extractor"`).
+    pub adapter: String,
+    /// Instance — empty for default.
+    pub instance: String,
+    /// Native id at source.
+    pub native_id: String,
+    /// Native path, if any.
+    pub native_path: Option<String>,
+    /// `raw_hash`.
+    pub raw_hash: String,
+    /// Tombstone timestamp (freshly written or pre-existing).
+    pub forgotten_at: i64,
+    /// `true` = tombstone already existed before this cascade.
+    pub was_already_forgotten: bool,
+}
+
+/// Outcome of `Store::forget_record_with_options`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetCascadeOutcome {
+    /// Root outcome (= R72 `forget_record`).
+    pub root: ForgetRecordOutcome,
+    /// Descendants visited; empty unless `cascade_derived = true`.
+    pub derived: Vec<DerivedForgetRecord>,
+}
+
+/// One descendant's dry-run preview row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedForgetPreview {
+    /// Hashed record id.
+    pub record_id: RecordId,
+    /// Adapter id.
+    pub adapter: String,
+    /// Instance — empty for default.
+    pub instance: String,
+    /// Native id at source.
+    pub native_id: String,
+    /// Native path, if any.
+    pub native_path: Option<String>,
+    /// `raw_hash`.
+    pub raw_hash: String,
+    /// Per-table cascade counts for this descendant.
+    pub would_delete: ForgetCascadeCounts,
+    /// `Some(ts)` = tombstone already exists; cascade leaves it alone.
+    pub already_forgotten_at: Option<i64>,
+}
+
+/// Preview for `Store::preview_forget_record_with_options`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetCascadePreview {
+    /// Root preview (= R83 `preview_forget_record`).
+    pub root: ForgetRecordPreview,
+    /// Descendants; empty unless `cascade_derived = true`.
+    pub derived: Vec<DerivedForgetPreview>,
+}
+
+/// Options for `unforget_record_with_options`. Default = R75 behaviour.
+/// Pre-R134 tombstones have NULL `derived_from`; cascade treats them as
+/// "no descendants known" — root unforget still works.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnforgetCascadeOptions {
+    /// `true` = also delete every descendant tombstone.
+    pub cascade_derived: bool,
+}
+
+/// One descendant tombstone deleted by the cascade.
+/// Note: does NOT recreate the live record (R75 contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedUnforgetRecord {
-    /// Hashed record id of the derived tombstone that got deleted.
+    /// Hashed record id.
     pub record_id: RecordId,
-    /// Adapter id captured at original forget time.
+    /// Adapter id from the original forget.
     pub adapter: String,
-    /// Instance discriminator — `""` for the default instance.
+    /// Instance — empty for default.
     pub instance: String,
-    /// Native id captured at original forget time.
+    /// Native id from the original forget.
     pub native_id: String,
-    /// Native path captured at original forget time, if any.
+    /// Native path, if any.
     pub native_path: Option<String>,
-    /// `raw_hash` of the original record.
+    /// `raw_hash`.
     pub raw_hash: String,
-    /// Operator-supplied `reason` captured at the original forget.
+    /// Reason from the original forget.
     pub reason: Option<String>,
-    /// Unix seconds when the original `forget_record` was committed
-    /// — copied from the tombstone before deletion so an operator
-    /// can render "this descendant was forgotten at X".
+    /// Original forget timestamp.
     pub forgotten_at: i64,
 }
 
-/// Round 134 (PR-78bc): outcome of [`Store::unforget_record_with_options`].
-/// `root` carries the same shape as the R75 [`UnforgetRecordOutcome`];
-/// `derived` is the list of descendant tombstones the cascade deleted
-/// and is empty when `UnforgetCascadeOptions.cascade_derived = false`.
+/// Outcome of `Store::unforget_record_with_options`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnforgetCascadeOutcome {
-    /// The target tombstone outcome — semantically identical to
-    /// `unforget_record(id)` from R75.
+    /// Root outcome (= R75 `unforget_record`).
     pub root: UnforgetRecordOutcome,
-    /// Descendant tombstones removed by the cascade. Empty when
-    /// `cascade_derived = false`, when the root tombstone had no
-    /// descendant tombstones, or when the root itself was
-    /// `NotForgotten`.
+    /// Descendant tombstones removed; empty unless cascading.
     pub derived: Vec<DerivedUnforgetRecord>,
 }
 
-/// Round 134 (PR-78bc): per-derived-tombstone preview from a cascade
-/// dry-run. Reports the snapshot of the descendant tombstone that
-/// `unforget_record_with_options` would delete.
+/// One descendant tombstone in a dry-run preview.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedUnforgetPreview {
-    /// Hashed record id of the descendant tombstone.
+    /// Hashed record id.
     pub record_id: RecordId,
-    /// Adapter id captured at forget time.
+    /// Adapter id from the original forget.
     pub adapter: String,
-    /// Instance discriminator — `""` for default.
+    /// Instance — empty for default.
     pub instance: String,
-    /// Native id captured at forget time.
+    /// Native id from the original forget.
     pub native_id: String,
-    /// Native path captured at forget time, if any.
+    /// Native path, if any.
     pub native_path: Option<String>,
-    /// `raw_hash` of the original record.
+    /// `raw_hash`.
     pub raw_hash: String,
-    /// Operator-supplied reason from the original forget.
+    /// Reason from the original forget.
     pub reason: Option<String>,
-    /// Unix seconds of the original forget.
+    /// Original forget timestamp.
     pub forgotten_at: i64,
 }
 
-/// Round 134 (PR-78bc): preview shape returned by
-/// [`Store::preview_unforget_record_with_options`]. `root` matches
-/// the R95 single-tombstone preview; `derived` is populated only
-/// when `cascade_derived = true`.
+/// Preview for `Store::preview_unforget_record_with_options`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnforgetCascadePreview {
-    /// Root tombstone preview — semantically identical to
-    /// `preview_unforget_record(id)` from R95.
+    /// Root preview (= R95 `preview_unforget_record`).
     pub root: UnforgetRecordOutcome,
-    /// Descendant tombstones the cascade would delete. Empty when
-    /// `cascade_derived = false` or no descendant tombstones exist.
+    /// Descendant tombstones the cascade would delete.
     pub derived: Vec<DerivedUnforgetPreview>,
 }
 
@@ -921,300 +804,178 @@ pub const MAX_LIST_LIMIT: u32 = 1000;
 /// exfiltrating the whole tombstone table.
 pub const LIST_FORGOTTEN_MAX_LIMIT: u32 = 100;
 
-/// Round 77: hard cap on `Store::list_duplicate_raw_hashes` page size.
-/// Same reason as `LIST_FORGOTTEN_MAX_LIMIT` (provenance-bearing
-/// diagnostic surface — no single operator request should
-/// exfiltrate thousands of records at once).
+/// Page cap on `Store::list_duplicate_raw_hashes` — anti-exfiltration.
 pub const LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT: u32 = 100;
 
-/// Round 135 (PR-78bd): hard cap on
-/// `Store::list_native_content_conflicts_filtered` page size. Same
-/// reason as the dedupe caps — the conflict surface can carry
-/// signal about source identity collisions across adapters.
+/// Page cap on `Store::list_native_content_conflicts_filtered`.
 pub const LIST_NATIVE_CONFLICTS_MAX_LIMIT: u32 = 100;
 
-/// Round 135 (PR-78bd): max characters of `content` returned in a
-/// conflict-record `content_preview` when the caller opts in via
-/// `include_content`. Short prose snippet — enough to disambiguate
-/// adapters that emit different normalisations of the same
-/// upstream record (e.g. trailing-newline drift, casing) without
-/// dumping a multi-kilobyte transcript blob across the wire.
+/// Max chars of `content` surfaced in a conflict-record preview
+/// when `include_content = true`.
 pub const NATIVE_CONFLICT_PREVIEW_CHARS: usize = 240;
 
-/// Round 78: per-tag length limit. Tags are operator-supplied
-/// short labels (`"todo"`, `"keep-forever"`, …); 64 bytes is
-/// already generous. Bounds enforced before the SQL write so
-/// pathological input never reaches `user_record_tags`.
+/// Per-tag length cap; bounded before write so pathological input
+/// can't reach `user_record_tags`.
 pub const USER_TAG_MAX_LEN: usize = 64;
 
-/// Round 78: max distinct tags applied in a single `tag_record`
-/// call. A user with thousands of memories that genuinely wants
-/// to bulk-apply tags should script per-record calls; this cap
-/// exists to keep one shell typo from blasting thousands of
-/// rows into the overlay table.
+/// Max distinct tags per `tag_record` call.
 pub const TAG_RECORD_MAX_BATCH: usize = 32;
 
-/// Which direction a `tag_record` call is moving the overlay.
-/// Distinguished as an enum (not a `bool add: true`) so the
-/// CLI / MCP wire stays readable and a future `Toggle` semantic
-/// doesn't need a third boolean.
+/// Direction of a `tag_record` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserTagOperation {
-    /// Insert each tag; existing rows are a no-op (set semantics).
+    /// Set-insert; existing tags are no-ops.
     Add,
-    /// Delete each tag; missing rows are a no-op (set semantics).
+    /// Set-delete; missing tags are no-ops.
     Remove,
-    /// Round 81 (PR-78c): atomically install the input tags as the
-    /// **full** post-call set on the record — anything not in the
-    /// input is deleted, anything new is inserted. Equivalent to
-    /// `Remove(all existing)` + `Add(requested)` but one
-    /// `Immediate` transaction (no half-applied state).
-    ///
-    /// Empty input is allowed for `Replace` and means "clear all
-    /// user tags on this record." `Add` and `Remove` still reject
-    /// empty input — those operations would be no-ops without it.
+    /// Install input as the **full** post-call set in one immediate tx.
+    /// Empty input clears all tags. `Add`/`Remove` reject empty input.
     Replace,
 }
 
-/// Result of `Store::tag_record`. Carries the resolved tags the
-/// call acted on, the count of rows actually changed (so the
-/// caller can render "added 2 of 3 — `dog` was already there"),
-/// and the post-call set on the record so the CLI / MCP surface
-/// doesn't need a second round-trip to show the new state.
+/// Result of `Store::tag_record`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTagMutation {
     /// Record the call mutated.
     pub record_id: RecordId,
-    /// Which direction the call moved (mirrors the input).
+    /// Direction of the call.
     pub operation: UserTagOperation,
-    /// The caller's tag list after normalisation
-    /// (`trim().to_lowercase()` + dedup + validation). Order
-    /// preserved from input minus collapsed duplicates.
+    /// Input after `trim().to_lowercase()` + dedup + validation;
+    /// input order preserved.
     pub requested: Vec<String>,
-    /// How many rows in `user_record_tags` actually changed.
-    /// `Add`: new (record_id, tag) pairs. `Remove`: deletions.
-    /// `Replace` (Round 81): the **set delta** — additions plus
-    /// deletions between the previous and the requested set, not
-    /// the raw "deleted N then inserted M" row count. Re-replacing
-    /// with the same set therefore reports `0`, matching the
-    /// idempotent semantic of Add/Remove.
+    /// `Add`/`Remove`: rows actually changed. `Replace`: set delta
+    /// (re-replacing with the same set reports `0`).
     pub changed: u32,
-    /// Full post-call set of user tags on this record, sorted
-    /// ASCII-ascending. Stable so callers can render it
-    /// deterministically.
+    /// Post-call set, ASCII-ascending.
     pub user_tags: Vec<String>,
 }
 
-/// One row inside a duplicate-raw_hash group. Carries the minimum
-/// the operator needs to decide which sibling to `forget`:
-/// `(adapter, instance, native_id)` for "where did this come
-/// from" and `record_id` for the actual forget call.
-///
-/// `native_path` is kept here because the operator often
-/// disambiguates duplicates by file path, but the CLI / MCP wire
-/// layers redact it by default — see the `include_sensitive` knob
-/// at those surfaces.
+/// One row inside a duplicate-raw_hash group. `native_path` is here for
+/// operator disambiguation; CLI/MCP wires redact it by default
+/// (`include_sensitive` knob).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateRawHashRecord {
-    /// Hashed `records.id`.
+    /// Hashed record id.
     pub record_id: RecordId,
-    /// Adapter id (e.g. `"claude-code"`).
+    /// Adapter id.
     pub adapter: String,
-    /// Instance discriminator — `""` for the default instance.
+    /// `""` for default instance.
     pub instance: String,
     /// Native id at the source.
     pub native_id: String,
-    /// Native path at the source, when the adapter has one.
+    /// Native path, when the adapter has one.
     pub native_path: Option<String>,
-    /// Record created_at, unix seconds.
+    /// Unix seconds.
     pub created_at: i64,
-    /// Record updated_at, unix seconds. `None` when never updated.
+    /// Unix seconds; `None` when never updated.
     pub updated_at: Option<i64>,
 }
 
-/// One group of records sharing a single `raw_hash`. Always size 2+
-/// (the SQL `HAVING COUNT(*) > 1` filter strips singletons).
-///
-/// Round 77 design choice: this is **exact** duplicate detection —
-/// only catches records whose source payload hashes byte-for-byte
-/// identically. Semantic / near-duplicate detection is a much
-/// bigger product decision and explicitly out of scope.
+/// Records sharing one `raw_hash` (always size ≥2 via `HAVING COUNT(*) > 1`).
+/// Exact byte-identical duplicates only — near-dup is R131.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateRawHashGroup {
-    /// The shared raw_hash. CLI / MCP wire surfaces redact this
-    /// by default since it can carry signal about the source
-    /// payload's structure.
+    /// Redacted by default at CLI/MCP wires.
     pub raw_hash: String,
-    /// All live records sharing this raw_hash. Length is always
-    /// `>= 2`. Ordered newest-first so the operator reads the
-    /// most-recent sibling first.
+    /// `>= 2` records, newest-first.
     pub records: Vec<DuplicateRawHashRecord>,
 }
 
-/// Round 80 (PR-77 follow-up): filter for
-/// `Store::list_duplicate_raw_hashes_filtered`. Scopes the
-/// duplicate report to groups whose member records include at
-/// least one matching `(adapter, instance)`. Groups are
-/// returned **whole** — all siblings stay visible because the
-/// operator needs the full set to decide which to `forget`.
-///
-/// `limit` is clamped to
-/// `[1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT]` by the store,
-/// same as the unfiltered API.
-///
-/// Round 104 (PR-78z): `source` now accepts a single adapter
-/// id (`"mem0"`) **or** a comma-separated OR list
-/// (`"mem0,claude-code"`). Parsing is delegated to
-/// [`anamnesis_core::parse_csv_filter`] inside the helpers, so
-/// the external shape stays `Option<String>` (no API break).
-/// `None` and `Some("")` continue to mean "no source filter".
-///
-/// Round 115: `instance` follows the same single-value-or-CSV
-/// shape (`"prod"` / `"prod,dev"`). Empty tokens are dropped;
-/// an empty parse means "no instance filter".
+/// Filter for `Store::list_duplicate_raw_hashes_filtered`. Groups stay whole;
+/// `source`/`instance` accept single value or comma-separated OR list via
+/// `anamnesis_core::parse_csv_filter`. `limit` clamped to
+/// `[1, LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT]`.
 #[derive(Debug, Clone, Default)]
 pub struct DuplicateRawHashFilter {
-    /// Adapter id (e.g. `"mem0"`) or comma-separated OR list
-    /// (`"mem0,claude-code"`) — see the struct doc. `None` or
-    /// empty string matches any adapter.
+    /// Adapter id or comma-separated OR list; `None`/`""` = any.
     pub source: Option<String>,
-    /// Instance discriminator or comma-separated OR list. `None`
-    /// or empty string matches any instance.
+    /// Instance or comma-separated OR list; `None`/`""` = any.
     pub instance: Option<String>,
-    /// Max groups to return. Clamped by the store.
+    /// Max groups; clamped by the store.
     pub limit: u32,
 }
 
-/// Round 97 (PR-78s): aggregate counts produced by
-/// `Store::count_duplicate_raw_hashes_by_source`. The
-/// `by_source[]` bucket is keyed on `(adapter, instance)` and
-/// counts **records**, not group memberships — mixed-source
-/// groups would otherwise double-count under group-membership
-/// arithmetic.
+/// Aggregate counts for `Store::count_duplicate_raw_hashes_by_source`.
+/// `by_source[]` counts **records** (not group memberships) to avoid
+/// double-counting across mixed-source groups.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DuplicateRawHashCounts {
-    /// Number of duplicate groups matching the filter (each
-    /// group has ≥2 live members).
+    /// Filter-matching groups (each has ≥2 live members).
     pub total_groups: u64,
-    /// Total live records across those groups — sums
-    /// `record_count` per group.
+    /// Live records summed across those groups.
     pub total_records: u64,
-    /// Per-`(adapter, instance)` duplicate-record breakdown.
-    /// Operator answer: "how many of my duplicate records sit
-    /// in mem0 vs claude-code?"
+    /// Per-`(adapter, instance)` breakdown.
     pub by_source: Vec<DuplicateRawHashSourceCount>,
 }
 
-/// Round 97 (PR-78s): one bucket of
-/// `DuplicateRawHashCounts.by_source`.
+/// One `(adapter, instance)` bucket of `DuplicateRawHashCounts.by_source`.
+/// Empty `instance` serialises as JSON `null` at the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateRawHashSourceCount {
     /// Adapter id.
     pub adapter: String,
-    /// Instance discriminator. Empty string for default; CLI /
-    /// MCP wire formats serialise that as JSON `null`.
+    /// Instance discriminator; `""` for default.
     pub instance: String,
-    /// Number of live records this source contributes to the
-    /// filter-scoped duplicate set.
+    /// Live records this source contributes to the filtered duplicate set.
     pub duplicate_record_count: u64,
 }
 
-/// Round 135 (PR-78bd): one record inside a `NativeConflictGroup`.
-/// Same privacy discipline as [`DuplicateRawHashRecord`] — no
-/// `content`, no `raw_hash` by default; the wire surfaces opt-in
-/// to a short `content_preview` via `include_content` and we never
-/// surface `native_path` directly (only `has_native_path` boolean).
+/// One record inside a [`NativeConflictGroup`]. Same privacy discipline
+/// as [`DuplicateRawHashRecord`]: no `content`/`raw_hash`/`native_path`
+/// by default; opt-in `content_preview` via `include_content`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeConflictRecord {
-    /// Hashed `records.id`.
+    /// Hashed record id.
     pub record_id: RecordId,
-    /// Adapter id (e.g. `"mem0"`, `"claude-code"`) — the dimension
-    /// that distinguishes one variant from another for the same
-    /// `native_id`.
+    /// Adapter id.
     pub adapter: String,
-    /// Instance discriminator — `""` for the default instance.
+    /// Instance discriminator; `""` for default.
     pub instance: String,
-    /// Native id at the source. Same value across the whole group
-    /// (that's the grouping key) — repeated per row for
-    /// flat-table-friendly downstream rendering.
+    /// Repeated per row (= group key) for flat-table rendering.
     pub native_id: String,
-    /// Whether the record carries a `native_path`. Path itself
-    /// stays redacted at this surface — operators read the live
-    /// record via `get_record` for the full path.
+    /// Whether the record carries a `native_path` (path itself is redacted).
     pub has_native_path: bool,
-    /// Record created_at, unix seconds.
+    /// Unix seconds.
     pub created_at: i64,
-    /// Record updated_at, unix seconds. `None` when never updated.
+    /// Unix seconds; `None` when never updated.
     pub updated_at: Option<i64>,
-    /// 1-based index of the **content variant** this record
-    /// belongs to inside its group: `1`, `2`, … (assigned in
-    /// stable adapter-asc / record_id-asc order). Two records with
-    /// the same `(native_id, content)` share a variant; the cardinality
-    /// of this column matches `NativeConflictGroup.content_variant_count`.
+    /// 1-based variant index inside the group, assigned in
+    /// `(adapter ASC, record_id ASC)` order. Records sharing
+    /// `(native_id, content)` share a variant.
     pub content_variant: u32,
-    /// Optional short preview of the record's `content`. Only
-    /// populated when the caller passed `include_content = true`;
-    /// truncated to `NATIVE_CONFLICT_PREVIEW_CHARS` so a multi-KB
-    /// transcript blob doesn't escape into the diagnostic surface.
+    /// Populated only when `include_content = true`; truncated to
+    /// `NATIVE_CONFLICT_PREVIEW_CHARS`.
     pub content_preview: Option<String>,
 }
 
-/// Round 135 (PR-78bd): one group of records sharing a `native_id`
-/// across multiple adapters with at least two distinct
-/// (normalised) `content` values. Always size 2+ and at least 2
-/// distinct adapters and at least 2 distinct content variants —
-/// see the eligibility filter in
-/// [`Store::list_native_content_conflicts_filtered`].
-///
-/// Design note: this is the **identity disagreement** surface,
-/// distinct from R77/R131 duplicate detection. Two adapters
-/// claiming the same upstream `native_id` but emitting different
-/// normalised content is a real interop signal — it means an
-/// upstream record was *captured* differently by each adapter, not
-/// that the same memory was paraphrased twice (R131 covers that).
+/// Records sharing one `native_id` across ≥2 adapters with ≥2 distinct
+/// (normalised) `content` values — the **identity disagreement** surface
+/// (distinct from R77/R131 duplicate detection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeConflictGroup {
-    /// Shared `native_id`. Surfaced because it's the grouping key
-    /// the operator needs to resolve the conflict; not redacted
-    /// (CLI / MCP echo it back so the operator can locate it
-    /// across adapters).
+    /// Shared `native_id`.
     pub native_id: String,
-    /// All live records sharing this `native_id`. Length is
-    /// always `>= 2` and spans at least 2 distinct adapters.
-    /// Ordered by `(adapter ASC, record_id ASC)` for stable
-    /// variant numbering.
+    /// Always `>= 2`, spanning `>= 2` distinct adapters. Ordered
+    /// `(adapter ASC, record_id ASC)` for stable variant numbering.
     pub records: Vec<NativeConflictRecord>,
-    /// Distinct content variants — `>= 2` by the group eligibility
-    /// filter. Useful as a sort key ("show me the highest-divergence
-    /// groups first" = highest variant count).
+    /// Distinct content variants, `>= 2`. Sort key for
+    /// "highest-divergence groups first".
     pub content_variant_count: u32,
 }
 
-/// Round 135 (PR-78bd): filter for
-/// [`Store::list_native_content_conflicts_filtered`]. Same
-/// source/instance/limit shape as the R80 dedupe filter so an
-/// operator's mental model carries across surfaces. Groups remain
-/// whole — siblings outside the filter still appear in the
-/// returned group so the operator sees the full disagreement set
-/// before deciding what to forget/merge.
+/// Filter for [`Store::list_native_content_conflicts_filtered`]. Source /
+/// instance accept a single value or comma-separated OR list (parsed via
+/// `anamnesis_core::parse_csv_filter`). Groups stay whole — siblings
+/// outside the filter still appear in the returned group.
 #[derive(Debug, Clone, Default)]
 pub struct NativeConflictFilter {
-    /// Adapter id (`"mem0"`) or comma-separated OR list
-    /// (`"mem0,claude-code"`) — same grammar as the R80 dedupe
-    /// filter (parsed via `anamnesis_core::parse_csv_filter`).
-    /// `None` or empty string matches any adapter.
+    /// Adapter id or comma-separated OR list; `None`/`""` = any.
     pub source: Option<String>,
-    /// Instance discriminator or comma-separated OR list. `None`
-    /// or empty string matches any instance.
+    /// Instance or comma-separated OR list; `None`/`""` = any.
     pub instance: Option<String>,
-    /// Cap on the number of groups returned. Clamped to
-    /// `[1, LIST_NATIVE_CONFLICTS_MAX_LIMIT]` by the store.
+    /// Clamped to `[1, LIST_NATIVE_CONFLICTS_MAX_LIMIT]`.
     pub limit: u32,
-    /// When `true`, populate `NativeConflictRecord.content_preview`
-    /// with the first `NATIVE_CONFLICT_PREVIEW_CHARS` of the
-    /// record's content. Default `false` keeps the surface
-    /// redacted by default (matches the dedupe `include_sensitive`
-    /// pattern, but the knob here is content-specific).
+    /// Populate `NativeConflictRecord.content_preview` (default off).
     pub include_content: bool,
 }
 
@@ -1651,34 +1412,19 @@ impl Store {
         Ok((total_records, total_chunks))
     }
 
-    /// Forget a record permanently: write a tombstone, delete the
-    /// record row (cascading raw_artifacts / record_chunks /
-    /// chunk_embeddings / embedding_jobs via FK), and remove any
-    /// vec0 rows for the record's chunks (vec0 is a virtual table
-    /// without FK cascade — same gotcha [`vec_ext::delete_vec_rows_for_record`]
-    /// solves in `write_chunks`).
-    ///
-    /// Idempotent: a second `forget_record` on the same id returns
-    /// [`ForgetRecordOutcome::AlreadyForgotten`] without touching the
-    /// store. If neither the record nor a tombstone exists,
-    /// returns [`ForgetRecordOutcome::NotFound`] — the caller decides
-    /// whether that's user error.
-    ///
-    /// The tombstone is keyed on `(adapter, instance, native_id)` so
-    /// `upsert_record` / `upsert_records_batch` can short-circuit a
-    /// re-import before any chunking / embedding work. This is what
-    /// makes "forget" mean "stay forgotten" instead of "delete until
-    /// the next `anamnesis import`."
+    /// Forget a record: write a `(adapter, instance, native_id)` tombstone,
+    /// delete the row (cascades raw_artifacts / record_chunks /
+    /// chunk_embeddings / embedding_jobs via FK), and clear vec0 rows
+    /// manually (vec0 has no FK cascade). Idempotent — second call returns
+    /// `AlreadyForgotten`; missing both row and tombstone returns `NotFound`.
+    /// The natural-key tombstone is what blocks re-import.
     pub fn forget_record(
         &self,
         id: &RecordId,
         reason: Option<&str>,
     ) -> Result<ForgetRecordOutcome> {
-        // Round 134 (PR-78bc): delegate to the shared `forget_one_in_tx`
-        // primitive so the single-record and cascade paths can't drift
-        // — particularly important because R134 added a new
-        // `record_tombstones.derived_from` column, and a per-call-site
-        // copy of the INSERT would silently skip it.
+        // Delegate to `forget_one_in_tx` so single-record + cascade paths
+        // can't drift on `record_tombstones.derived_from` writes.
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = chrono::Utc::now().timestamp();
@@ -1687,35 +1433,16 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Round 83 (PR-78e): dry-run preview of [`forget_record`].
-    ///
-    /// Returns:
-    ///   * [`ForgetRecordPreview::WouldForget`] with per-table
-    ///     cascade counts + would-be tombstone shape when the
-    ///     record is live;
-    ///   * [`ForgetRecordPreview::AlreadyForgotten`] (no work)
-    ///     when a tombstone exists;
-    ///   * [`ForgetRecordPreview::NotFound`] when neither.
-    ///
-    /// **Does not mutate the store** — all counts are taken
-    /// inside a single read-only transaction, the transaction is
-    /// rolled back at the end, and no `record_tombstones` /
-    /// audit-log write happens. The CLI / MCP surfaces are
-    /// responsible for not calling `Audit::record` either.
-    ///
-    /// vec0 row count uses the same `(chunk_id, model_id) →
-    /// vec_key` traversal as [`crate::vec_ext::delete_vec_rows_for_record`]
-    /// (via the mirror helper `count_vec_rows_for_record`) so the
-    /// preview can't drift from what the real delete would touch.
+    /// Dry-run [`forget_record`]: per-table cascade counts inside a
+    /// rolled-back transaction. Read-only; callers must not record audit.
+    /// vec0 counts traverse the same path as the real delete to prevent drift.
     pub fn preview_forget_record(
         &self,
         id: &RecordId,
         reason: Option<&str>,
     ) -> Result<ForgetRecordPreview> {
         let mut conn = self.conn.lock();
-        // We never commit — but using a transaction still gives a
-        // consistent point-in-time snapshot across the 7 counting
-        // queries below.
+        // Never commits — tx gives a consistent snapshot across the 7 counts.
         let tx = conn.transaction()?;
 
         // Live record? If so, the preview will be WouldForget.
@@ -1845,25 +1572,9 @@ impl Store {
         })
     }
 
-    /// Round 133 (PR-78bb): cascade-aware forget. With
-    /// `opts.cascade_derived = false` this delegates straight to
-    /// [`Store::forget_record`] (back-compat). With `cascade_derived
-    /// = true` it walks `provenance.derived_from` starting at `id`,
-    /// collects every descendant (cycle-safe via `lineage_chain`
-    /// semantics), and tombstones+deletes every reached record in
-    /// the same `IMMEDIATE` transaction.
-    ///
-    /// Ordering: derived descendants come back in the returned
-    /// `Vec` in BFS order (closest children first, grandchildren
-    /// next, …). Tombstones are written in the same order; the
-    /// `IMMEDIATE` transaction means the cascade is observable
-    /// atomically — either all tombstones land or none do.
-    ///
-    /// Closes the R72 provenance-semantic gap: a Stage 2 extractor
-    /// derives Fact / Preference / Skill from an Episode; forgetting
-    /// the Episode without the derived Facts left the operator
-    /// thinking "I forgot it" while search still returned the
-    /// distilled output.
+    /// Cascade-aware forget. With `cascade_derived=true`, BFS walks
+    /// `provenance.derived_from` (cycle-safe) and tombstones every
+    /// descendant in one IMMEDIATE tx. Descendants returned BFS order.
     pub fn forget_record_with_options(
         &self,
         id: &RecordId,
@@ -1934,17 +1645,7 @@ impl Store {
         })
     }
 
-    /// Round 133 (PR-78bb): cascade-aware dry-run preview. With
-    /// `opts.cascade_derived = false` this delegates straight to
-    /// [`Store::preview_forget_record`]. With `cascade_derived =
-    /// true` it walks descendants and reports per-record
-    /// [`ForgetCascadeCounts`] plus the existing tombstone state
-    /// (so an operator sees "this derived record already has a
-    /// tombstone, the cascade would skip it").
-    ///
-    /// Does NOT mutate the store and does NOT touch the audit log.
-    /// Read-only — the BFS + counts all happen inside a single
-    /// non-`Immediate` transaction that's dropped without commit.
+    /// Dry-run preview of `forget_record_with_options`. Read-only.
     pub fn preview_forget_record_with_options(
         &self,
         id: &RecordId,
@@ -1996,13 +1697,8 @@ impl Store {
         Ok(ForgetCascadePreview { root, derived })
     }
 
-    /// R133 helper: BFS through `provenance.derived_from` starting
-    /// at `start`, returning every descendant in BFS order (children
-    /// before grandchildren). The `start` record itself is NOT
-    /// included. Cycle-safe — a malformed `A → B → A` chain returns
-    /// `Err(StoreError::Corruption)` so the caller surfaces the bug
-    /// rather than silently looping. Returns an empty vec when the
-    /// root has no children (or doesn't exist).
+    /// BFS descendants via `records.derived_from`. Excludes `start`.
+    /// Cycles return `StoreError::Corruption`.
     fn collect_descendants(&self, start: &RecordId) -> Result<Vec<RecordId>> {
         let conn = self.conn.lock();
         let mut stmt =
@@ -2160,23 +1856,10 @@ impl Store {
         })
     }
 
-    /// Round 134 (PR-78bc): cascade-aware unforget. With
-    /// `opts.cascade_derived = false` this delegates straight to
-    /// [`Store::unforget_record`] (back-compat). With `cascade_derived
-    /// = true` it walks `record_tombstones.derived_from` starting at
-    /// `id`, collects every descendant tombstone, and deletes all of
-    /// them in the same `IMMEDIATE` transaction.
-    ///
-    /// **Important**: like the R75 single-record path, this does NOT
-    /// resurrect any live `records` row, chunk, embedding, or
-    /// extractor output. The cascade only removes tombstones — the
-    /// source's next re-import (or re-extract for derived rows) is
-    /// what actually brings the data back.
-    ///
-    /// For tombstones written before R134 (migration 0011), the
-    /// `derived_from` column is NULL; their descendants are not
-    /// discoverable through the cascade. The root unforget still
-    /// works the same way as before.
+    /// Cascade-aware unforget. With `cascade_derived=true`, BFS
+    /// `record_tombstones.derived_from` (pre-R134 rows = NULL =
+    /// invisible) and deletes every descendant tombstone in one tx.
+    /// Does NOT resurrect any record — re-import is still required.
     pub fn unforget_record_with_options(
         &self,
         id: &RecordId,
@@ -2230,15 +1913,7 @@ impl Store {
         })
     }
 
-    /// Round 134 (PR-78bc): cascade-aware dry-run preview for the
-    /// unforget cascade. With `opts.cascade_derived = false` this
-    /// delegates straight to [`Store::preview_unforget_record`]. With
-    /// `cascade_derived = true` it walks `record_tombstones.derived_from`
-    /// and reports the snapshot of every descendant tombstone the real
-    /// cascade would delete.
-    ///
-    /// Does NOT mutate the store and does NOT touch the audit log.
-    /// Read-only.
+    /// Dry-run preview of `unforget_record_with_options`. Read-only.
     pub fn preview_unforget_record_with_options(
         &self,
         id: &RecordId,
@@ -2273,12 +1948,8 @@ impl Store {
         Ok(UnforgetCascadePreview { root, derived })
     }
 
-    /// R134 helper: BFS through `record_tombstones.derived_from`
-    /// starting at `start`, returning every descendant tombstone in
-    /// BFS order (closest children first). The `start` tombstone
-    /// itself is NOT included. Cycle-safe — `StoreError::Corruption`
-    /// on `A → B → A`. Empty when the root has no descendant
-    /// tombstones (or doesn't exist as a tombstone).
+    /// BFS through `record_tombstones.derived_from` from `start` (excluded);
+    /// cycle-safe (`StoreError::Corruption` on revisit).
     fn collect_tombstone_descendants(&self, start: &RecordId) -> Result<Vec<RecordId>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -2309,19 +1980,9 @@ impl Store {
         Ok(out)
     }
 
-    /// Round 74 (PR-74): paginated read of `record_tombstones`,
-    /// newest-first. Used by `anamnesis list-forgotten` and the
-    /// admin-gated MCP `list_forgotten` tool to surface what's
-    /// been tombstoned so an operator can audit + (eventually)
-    /// `unforget` mistakes.
-    ///
-    /// Filters mirror what the importer keys on so the operator can
-    /// scope to one source: `(adapter, instance)`. `limit` is
-    /// clamped to `[1, LIST_FORGOTTEN_MAX_LIMIT]`. Empty filter
-    /// returns the most recent N across all sources.
-    ///
-    /// This method is read-only — callers are responsible for any
-    /// field-level redaction they want at the wire boundary.
+    /// Paginated newest-first scan of `record_tombstones`, optionally scoped to
+    /// `(adapter, instance)`. Read-only; `limit` is clamped to
+    /// `[1, LIST_FORGOTTEN_MAX_LIMIT]`.
     pub fn list_forgotten(&self, filter: &ListForgottenFilter) -> Result<Vec<ForgottenRecord>> {
         let limit = filter.limit.clamp(1, LIST_FORGOTTEN_MAX_LIMIT);
         let conn = self.conn.lock();
@@ -2838,42 +2499,13 @@ impl Store {
         })
     }
 
-    /// Round 135 (PR-78bd): cross-adapter identity-disagreement
-    /// detector. Returns groups of live `records` rows that:
-    ///
-    /// 1. share a single `provenance.native_id`,
-    /// 2. span at least 2 distinct `adapter` ids,
-    /// 3. carry at least 2 distinct (raw) `content` values.
-    ///
-    /// This is **not** dedupe — R77 catches byte-identical
-    /// duplicates and R131 catches paraphrase-grade near-dups.
-    /// This surface answers a different question: *multiple
-    /// adapters claim the same upstream record yet they disagree
-    /// on what it says*. A common interop signal — e.g. one
-    /// adapter normalises trailing newlines while another doesn't,
-    /// or one stores the user's edit while another keeps the
-    /// pre-edit baseline.
-    ///
-    /// Filter: `source` / `instance` use the shared R104 CSV
-    /// grammar via `parse_csv_filter`. A group is eligible if
-    /// **any** of its members matches the filter, but the returned
-    /// group keeps every sibling — the operator needs the full
-    /// disagreement set to decide what to do (forget one, merge
-    /// the other, file an adapter bug). Matches the R80 dedupe
-    /// "filter scopes eligibility, doesn't trim siblings" rule.
-    ///
-    /// Privacy: per-record fields are limited to the same
-    /// projection R77 dedupe surfaces (`record_id / adapter /
-    /// instance / native_id / created_at / updated_at /
-    /// has_native_path`) plus a `content_variant` index. Full
-    /// `content` is only returned as a short preview when
-    /// `filter.include_content = true`; `native_path` is never
-    /// returned directly (only `has_native_path`).
-    ///
-    /// Ordering: groups sorted by `content_variant_count DESC`
-    /// (highest divergence first) then `native_id ASC`. Within a
-    /// group, records ordered by `(adapter ASC, record_id ASC)`
-    /// so the variant numbering is stable across calls.
+    /// Cross-adapter identity-disagreement detector: groups of live records
+    /// sharing one `native_id` across ≥2 adapters with ≥2 distinct content
+    /// values. Filter (R104 CSV grammar) scopes group eligibility but never
+    /// trims siblings — operator needs the full set to act. Ordering:
+    /// `content_variant_count DESC, native_id ASC`; within a group,
+    /// `(adapter ASC, record_id ASC)` for stable variant numbering.
+    /// `content` is preview-only when `include_content = true`.
     pub fn list_native_content_conflicts_filtered(
         &self,
         filter: &NativeConflictFilter,
@@ -2884,13 +2516,9 @@ impl Store {
 
         let conn = self.conn.lock();
 
-        // First pass: pick eligible native_ids. A group qualifies
-        // if it has ≥2 records, ≥2 distinct adapters, ≥2 distinct
-        // content values, AND ≥1 member matches the source/instance
-        // filter (when set). The outer GROUP BY runs against the
-        // *full* record set, not the filtered one, so a group with
-        // 1 mem0 + 5 claude-code stays a group instead of being
-        // collapsed by the filter.
+        // Pick eligible native_ids (≥2 rows, ≥2 adapters, ≥2 content variants,
+        // ≥1 filter match). Outer GROUP BY runs against the *full* row set so
+        // siblings outside the filter still belong to the group.
         let mut sql = String::from(
             "SELECT native_id, COUNT(DISTINCT content) AS variant_count \
              FROM records \

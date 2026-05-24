@@ -59,14 +59,10 @@ pub const ADMIN_TOOLS: &[&str] = &[
     // source locations — non-admin agents shouldn't be able to
     // back-door read those.
     "audit_tail",
-    // Round 86 (PR-78h): `source_show` includes `recent_import_errors`
-    // which carry `native_path` + adapter-side error text (e.g.
-    // file paths, parse traces). Same gating logic as audit_tail.
-    // `list_sources` (no per-row error detail) stays non-admin.
+    // `source_show` surfaces `recent_import_errors` (native_path +
+    // adapter-side error text). `list_sources` stays non-admin.
     "source_show",
-    // Round 140 (PR-78bi): `export_memories` writes a new file on
-    // disk and can dump the entire memory corpus — both are
-    // operator-class actions, not introspection.
+    // `export_memories` writes a new file and can dump the corpus.
     "export_memories",
 ];
 
@@ -91,13 +87,8 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
-/// Round 133 (PR-78bb): MCP-side renderer for the `cascade` block
-/// attached to `forget_record { cascade_derived: true }`. Mirrors
-/// the CLI helper — `derived_count` + per-row record snapshot
-/// (record_id / adapter / instance / native_id / forgotten_at /
-/// was_already_forgotten). `raw_hash` and `native_path` stay
-/// available because this tool is admin-gated, same ACL as the
-/// root record.
+/// MCP `cascade` block for `forget_record { cascade_derived: true }`.
+/// Tool is admin-gated, so `raw_hash` + `native_path` stay visible.
 fn render_forget_cascade_json(derived: &[anamnesis_store::DerivedForgetRecord]) -> Value {
     let derived_records: Vec<Value> = derived
         .iter()
@@ -124,10 +115,8 @@ fn render_forget_cascade_json(derived: &[anamnesis_store::DerivedForgetRecord]) 
     })
 }
 
-/// Round 133 (PR-78bb): MCP-side renderer for the dry-run cascade
-/// preview. Per-row `would_delete` mirrors the root's per-table
-/// count shape; `already_forgotten_at` is `null` when the cascade
-/// would write a fresh tombstone, integer when one already exists.
+/// Dry-run cascade preview. `already_forgotten_at = null` means a
+/// fresh tombstone would be written.
 fn render_forget_cascade_preview_json(derived: &[anamnesis_store::DerivedForgetPreview]) -> Value {
     let derived_records: Vec<Value> = derived
         .iter()
@@ -278,10 +267,8 @@ fn render_dedupe_csv(groups: &[anamnesis_store::DuplicateRawHashGroup]) -> Strin
 
 /// Round 134 (PR-78bc): MCP-side renderer for the `cascade` block
 /// attached to `unforget_record { cascade_derived: true }`. Mirrors
-/// the R133 forget cascade renderer shape: `derived_count` plus
-/// per-row record snapshot. Pre-R134 tombstones (NULL `derived_from`)
-/// produce an empty list; the wrapper block still tells the caller
-/// "I asked for cascade".
+/// Mirrors the forget-cascade JSON shape. Empty list still emitted so
+/// callers know "cascade was asked for" vs "wasn't".
 fn render_unforget_cascade_json(derived: &[anamnesis_store::DerivedUnforgetRecord]) -> Value {
     let derived_records: Vec<Value> = derived
         .iter()
@@ -308,10 +295,8 @@ fn render_unforget_cascade_json(derived: &[anamnesis_store::DerivedUnforgetRecor
     })
 }
 
-/// Round 134 (PR-78bc): MCP-side renderer for the dry-run cascade
-/// preview on `unforget_record`. Same shape as the post-commit
-/// renderer; no `would_delete` per-row count block because each
-/// descendant is a single-tombstone DELETE.
+/// Dry-run cascade preview on `unforget_record` (single-tombstone
+/// DELETE per descendant, so no per-row `would_delete`).
 fn render_unforget_cascade_preview_json(
     derived: &[anamnesis_store::DerivedUnforgetPreview],
 ) -> Value {
@@ -340,14 +325,9 @@ fn render_unforget_cascade_preview_json(
     })
 }
 
-/// Round 132 (PR-78ba): render near-dedupe groups as a flat CSV
-/// string for `dedupe { mode: "near", csv: true }`. Same redaction
-/// discipline as R107 — no `raw_hash`, no `native_path` — plus
-/// `min_similarity` and `max_distance` columns so an MCP client can
-/// rank groups inside a spreadsheet without re-querying. The R131
-/// algorithm never reads `raw_hash` to begin with, so the privacy
-/// contract is enforced at the type level (NearDuplicateRecord has
-/// no such fields).
+/// Flat CSV for `dedupe { mode: "near", csv: true }`. Redacted
+/// (no `raw_hash`/`native_path` — enforced at the type level).
+/// `min_similarity` + `max_distance` columns for in-spreadsheet ranking.
 fn render_dedupe_near_csv(groups: &[anamnesis_store::NearDuplicateGroup]) -> String {
     let mut out = String::from(
         "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count,min_similarity,max_distance\n",
@@ -383,23 +363,16 @@ fn render_dedupe_near_csv(groups: &[anamnesis_store::NearDuplicateGroup]) -> Str
     out
 }
 
-/// Round 132 (PR-78ba): internal discriminator for the `dedupe`
-/// tool's `mode` arg. Public enum-ish at the wire boundary
-/// (`"exact"|"near"`); kept private here because the dispatch
-/// matches once and forwards to the appropriate branch.
+/// Internal discriminator for the `dedupe` tool's `mode` arg
+/// (`"exact"|"near"` at the wire).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DedupeMode {
     Exact,
     Near,
 }
 
-/// Round 92 (PR-78n): render `Audit::tail` results as the
-/// MCP CSV string. Same columns and redaction discipline as the
-/// CLI helper in R91 — `line_no,timestamp,action,via,outcome`
-/// only, never `detail` / `reason` / `query`. Empty rows still
-/// emit the header so scripts can branch uniformly. CSV
-/// escaping reuses the same simple rule (quote + double inner
-/// quotes when the field contains `,`, `"`, or `\n`).
+/// `Audit::tail` rows as MCP CSV. Columns: `line_no,timestamp,action,
+/// via,outcome` (never `detail`/`reason`/`query`). Header always emitted.
 fn render_audit_tail_csv(rows: &[anamnesis_core::AuditTailRow]) -> String {
     let mut out = String::from("line_no,timestamp,action,via,outcome\n");
     for r in rows {
@@ -1087,13 +1060,10 @@ impl AnamnesisServer {
         };
 
         let store = &self.store;
-        // Round 136 (PR-78be): central candidate-pool policy
-        // (see `anamnesis_search::candidate_pool_for_limit`).
+        // Central candidate-pool policy.
         let opts = HybridOpts::for_limit(limit, mode);
-        // Always go through the traced primitive so the live search
-        // and the trace can never drift. The `trace` field on the
-        // response is only included when the caller asked — keeping
-        // the default wire shape additive-compatible.
+        // Always use the traced primitive so live search and trace can't
+        // drift; `trace` is only attached when caller asked.
         let traced = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
                 .search_filtered_traced(store, query, &filter, &opts)
@@ -1984,17 +1954,8 @@ impl AnamnesisServer {
         }))
     }
 
-    /// Round 73 (PR-72b): MCP-side counterpart to `anamnesis forget`.
-    /// Admin-gated — the dispatcher rejects this tool unless
-    /// `allow_admin_tools = true` so only operator-trusted clients
-    /// can mutate state. Reuses `Store::forget_record` from R72,
-    /// which writes the tombstone + cascades cleanup + suppresses
-    /// future re-imports.
-    ///
-    /// `NotFound` is surfaced as a tool error, not success: if no
-    /// tombstone was written, Anamnesis cannot guarantee "stay
-    /// forgotten" — the caller probably has the wrong id and
-    /// should be told loudly.
+    /// MCP `forget_record` — admin-gated. Writes tombstone, cascades
+    /// cleanup, suppresses re-import. `NotFound` is a tool error.
     async fn tool_forget_record(&self, args: Value) -> Result<Value, String> {
         let record_id = args
             .get("record_id")
@@ -2004,18 +1965,12 @@ impl AnamnesisServer {
             .get("reason")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        // Round 83 (PR-78e): dry_run=true returns the cascade
-        // preview without writing a tombstone and without
-        // appending an audit entry. Still admin-gated — the
-        // preview reveals raw_hash/native_path and destructive
-        // intent that should match the real forget's ACL.
+        // `dry_run=true`: cascade preview, no write/audit.
         let dry_run = args
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Round 133 (PR-78bb): opt-in cascade through
-        // `provenance.derived_from`. Default false → fully
-        // back-compat. Same semantics as CLI `--cascade-derived`.
+        // Opt-in cascade via `provenance.derived_from`.
         let cascade_derived = args
             .get("cascade_derived")
             .and_then(|v| v.as_bool())
@@ -2062,11 +2017,7 @@ impl AnamnesisServer {
         let outcome = cascade_outcome.root;
         let derived = cascade_outcome.derived;
 
-        // Mirror the CLI's audit entry shape so operator history is
-        // entrypoint-agnostic (`anamnesis audit list` shows MCP and
-        // CLI forgets the same way). Round 133 adds
-        // `cascade_derived` + `derived_record_ids` to keep the audit
-        // chain truthful about the full blast radius.
+        // Mirror CLI audit shape; cascade fields capture full blast radius.
         let mut audit_detail = json!({
             "record_id": record_id,
             "reason":    reason,
@@ -2108,32 +2059,19 @@ impl AnamnesisServer {
         }
     }
 
-    /// Round 75 (PR-75): MCP-side counterpart to `anamnesis unforget`.
-    /// Admin-gated. Removes the tombstone so the source can resurrect
-    /// the memory on its next `import_source`. Does NOT recreate the
-    /// `records` row — same truthful-design constraint as the CLI:
-    /// Anamnesis is a read-only mirror of source data.
-    ///
-    /// `NotForgotten` is a tool error (not a silent success) because
-    /// the operator almost certainly typoed an id from
-    /// `list_forgotten` — better to surface the mistake than to log
-    /// a successful no-op.
+    /// MCP `unforget_record` — admin-gated. Removes tombstone; does NOT
+    /// recreate the `records` row. `NotForgotten` is a tool error.
     async fn tool_unforget_record(&self, args: Value) -> Result<Value, String> {
         let record_id = args
             .get("record_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "unforget_record.record_id is required".to_string())?;
-        // Round 95 (PR-78q): dry_run preview. Doesn't delete the
-        // tombstone, doesn't append to audit. Still admin-gated
-        // because the response includes raw_hash/native_path/reason.
+        // `dry_run=true`: preview only, no delete/audit.
         let dry_run = args
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Round 134 (PR-78bc): opt-in cascade through
-        // `record_tombstones.derived_from`. Default false → fully
-        // back-compat. Pre-R134 tombstones (NULL derived_from) just
-        // surface an empty `cascade.derived_records` list.
+        // Opt-in cascade via `record_tombstones.derived_from`.
         let cascade_derived = args
             .get("cascade_derived")
             .and_then(|v| v.as_bool())
@@ -2382,14 +2320,9 @@ impl AnamnesisServer {
         Ok(payload)
     }
 
-    /// Round 137 (PR-78bf): MCP `discover_adapters` — return the
-    /// compile-time adapter capability roster and the runtime
-    /// detection pass. Lets an MCP agent discover what adapters
-    /// this Anamnesis supports and what's already on this machine
-    /// without shelling out to `anamnesis discover`. Not
-    /// admin-gated — discovery only returns paths / schema names /
-    /// counts, never user memory content (the same contract the
-    /// CLI honours per BLUEPRINT §3.3).
+    /// MCP `discover_adapters` — adapter capability roster + runtime
+    /// detection pass. Not admin-gated (paths/schemas/counts only,
+    /// never user content, per BLUEPRINT §3.3).
     async fn tool_discover_adapters(&self) -> Result<Value, String> {
         Ok(
             crate::adapter_discovery::build_discover_adapters_payload(
@@ -2399,30 +2332,9 @@ impl AnamnesisServer {
         )
     }
 
-    /// Round 140 (PR-78bi): MCP `export_memories` — programmatic
-    /// round-trip complement to R137 `discover_adapters`. Admin-gated
-    /// because it writes a new file on disk and can dump the entire
-    /// memory corpus.
-    ///
-    /// Wire shape:
-    /// ```json
-    /// {
-    ///   "format": "jsonl|csv|mem0-sqlite|letta-sqlite",
-    ///   "out":    "/absolute/fresh/output/path",
-    ///   "source": "mem0,letta",   // optional R104 OR list
-    ///   "instance": "prod",       // optional R115 OR list
-    ///   "kind":   "fact"          // optional Kind discriminator
-    /// }
-    /// ```
-    ///
-    /// `out` is REQUIRED for every format here (unlike the CLI's
-    /// stdout default) — the MCP transport can't reasonably stream
-    /// binary SQLite or huge JSONL bodies through the JSON-RPC
-    /// channel. Refuses to overwrite an existing file (shared
-    /// safety guard in `anamnesis_export::validate_sqlite_output`).
-    /// Response carries bounded metadata only — record count,
-    /// output path, bytes written, echoed filters — not the file
-    /// contents themselves.
+    /// MCP `export_memories`. Admin-gated; writes a new file on disk.
+    /// `out` is required for every format (transport can't stream).
+    /// Refuses to overwrite. Response is bounded metadata only.
     async fn tool_export_memories(&self, args: Value) -> Result<Value, String> {
         let format_token = args
             .get("format")
@@ -2467,9 +2379,7 @@ impl AnamnesisServer {
         let outcome = anamnesis_export::run_export(&self.store, &filter, format, Some(&out), None)
             .map_err(|e| format!("export_memories: {e}"))?;
 
-        // Audit-log mirrors the CLI shape, plus `transport: "mcp"`
-        // so an operator scanning audit_tail can tell the export
-        // came from a peer agent.
+        // Audit mirrors CLI shape; `transport: "mcp"` tags the source.
         anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
             "export",
             json!({
@@ -2509,16 +2419,9 @@ impl AnamnesisServer {
         }))
     }
 
-    /// Round 135 (PR-78bd): MCP `list_conflicts` — cross-adapter
-    /// `native_id` content disagreement detector. NOT admin-gated
-    /// (read-only audit surface with the same redaction discipline
-    /// as `list_forgotten` / `dedupe`). The action half is the
-    /// existing `forget_record` workflow.
-    ///
-    /// Wire shape mirrors the CLI: per-record fields are limited
-    /// to the same projection R77 dedupe surfaces plus
-    /// `content_variant`, with `content_preview` only populated
-    /// when the caller passes `include_content: true`.
+    /// MCP `list_conflicts` — cross-adapter `native_id` content
+    /// disagreement detector. Read-only, not admin-gated. Wire shape
+    /// mirrors CLI; `content_preview` requires `include_content: true`.
     async fn tool_list_conflicts(&self, args: Value) -> Result<Value, String> {
         let limit = args
             .get("limit")
@@ -2606,21 +2509,12 @@ impl AnamnesisServer {
         }))
     }
 
-    /// Round 77 (PR-77): MCP audit view for raw-hash duplicates.
-    /// NOT admin-gated — this is a read-only diagnostic with the
-    /// same redaction discipline as `list_forgotten`. The action
-    /// half (`forget_record`) still requires admin.
-    ///
-    /// Round 132 (PR-78ba): accepts `mode: "exact"|"near"`.
-    /// Default `"exact"` is the R77 raw_hash byte-equal grouper
-    /// (back-compat). `"near"` invokes the R131 SimHash + LSH +
-    /// Jaccard cross-adapter detector and defaults to
-    /// cross-source-only groups; pass `include_near_self: true`
-    /// to opt out of the cross-source filter.
+    /// MCP `dedupe` — read-only duplicate audit (not admin-gated).
+    /// `mode: "exact"` (raw_hash byte-equal, default) or
+    /// `mode: "near"` (SimHash + LSH + Jaccard, cross-source-only
+    /// by default; `include_near_self: true` opts out).
     async fn tool_dedupe(&self, args: Value) -> Result<Value, String> {
-        // Round 132 (PR-78ba): mode discriminator. Unknown values
-        // are a fast-fail rather than a silent fallback — same
-        // policy as `tag_record.operation`.
+        // Fast-fail on unknown mode (same policy as tag_record).
         let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("exact");
         let mode = match mode_str {
             "exact" => DedupeMode::Exact,
@@ -2640,12 +2534,8 @@ impl AnamnesisServer {
             .get("include_sensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Round 80: scope duplicates to groups containing
-        // ≥1 record from a given source/instance. Empty
-        // strings normalised to None so the caller can pass
-        // `""` without accidentally filtering on the empty
-        // instance (which is a real value for single-instance
-        // adapters).
+        // Scope to groups with ≥1 record from a source/instance.
+        // Empty string → None (empty instance is a real value).
         let source = args
             .get("source")
             .and_then(|v| v.as_str())
@@ -2657,20 +2547,12 @@ impl AnamnesisServer {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
 
-        // Round 98 (PR-78t): opt-in filter-scoped aggregate.
-        // Symmetric with R97's CLI `--include-counts`. Counts
-        // ignore `limit` and reflect the full matching set; per-
-        // source breakdown counts records, not group memberships.
+        // Filter-scoped counts; ignore `limit`; per-source counts records.
         let include_counts = args
             .get("include_counts")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Round 107 (PR-78ac): opt-in CSV form, mirroring R92
-        // audit_tail.csv + R105 list_forgotten.csv. CSV is the
-        // redacted-summary form by design; we refuse
-        // `csv + include_sensitive` (would leak raw_hash /
-        // native_path) and `csv + include_counts` (CSV is flat,
-        // no nested counts block).
+        // CSV is the redacted-summary form; reject sensitive + counts.
         let csv_requested = args.get("csv").and_then(|v| v.as_bool()).unwrap_or(false);
         if csv_requested && include_sensitive {
             return Err(
@@ -2687,10 +2569,8 @@ impl AnamnesisServer {
             );
         }
 
-        // Round 132 (PR-78ba): near-dedupe has no raw_hash /
-        // native_path and no raw_hash-style aggregate, so the
-        // sensitive / counts knobs would be no-ops at best and
-        // misleading at worst. Refuse them so a caller notices.
+        // Near-dedupe has no raw_hash/native_path and no aggregate;
+        // sensitive/counts would be misleading no-ops. Refuse loudly.
         let include_near_self = args
             .get("include_near_self")
             .and_then(|v| v.as_bool())
@@ -2720,10 +2600,7 @@ impl AnamnesisServer {
         }
 
         if matches!(mode, DedupeMode::Near) {
-            // Dedicated near-dedupe branch — the wire shape adds
-            // `min_similarity` + `max_distance` per group and a
-            // `require_cross_source` field on `filter` that
-            // exact-mode doesn't have.
+            // Near branch carries extra per-group + filter fields.
             return self
                 .tool_dedupe_near(source, instance, limit, csv_requested, include_near_self)
                 .await;
@@ -2750,19 +2627,13 @@ impl AnamnesisServer {
         let effective_limit = limit.clamp(1, anamnesis_store::LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT);
 
         if csv_requested {
-            // CSV path returns a flat string, not `groups[]`.
-            // Same redacted-summary discipline as the CLI R107
-            // helper: `group_index` (not `raw_hash`) carries
-            // membership; `has_native_path` boolean (not the
-            // path itself).
+            // Flat-string CSV; `group_index` carries membership.
             let csv = render_dedupe_csv(&groups);
             return Ok(json!({
                 "count":              groups.len(),
                 "limit":              effective_limit,
                 "format":             "csv",
-                // Round 132 (PR-78ba): always emit the mode
-                // discriminator so a caller can route on
-                // `payload.mode` even before peeking inside.
+                // Always-emitted mode discriminator.
                 "mode":               "exact",
                 "sensitive_included": false,
                 "filter":             {
@@ -2837,10 +2708,7 @@ impl AnamnesisServer {
         let mut payload = json!({
             "count":              groups.len(),
             "format":             "json",
-            // Round 132 (PR-78ba): mode discriminator pairs with
-            // the new `mode: "near"` branch. Always emitted on
-            // both exact and near so a client can branch on
-            // `payload.mode` instead of probing for new fields.
+            // Always-emitted mode discriminator.
             "mode":               "exact",
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
@@ -2857,15 +2725,8 @@ impl AnamnesisServer {
         Ok(payload)
     }
 
-    /// Round 132 (PR-78ba): MCP `dedupe { mode: "near" }` — wraps
-    /// the R131 cross-source near-duplicate detector. Same redaction
-    /// discipline as exact: per-record `record_id / adapter /
-    /// instance / native_id / created_at / updated_at /
-    /// has_native_path` and nothing else; `min_similarity` +
-    /// `max_distance` per group give an MCP client enough to rank.
-    /// `format: "json"` keeps the wire-shape switch coherent;
-    /// CSV here mirrors the CLI's R107-style flat shape and also
-    /// carries the new similarity stats.
+    /// MCP `dedupe { mode: "near" }` — same redaction as exact, plus
+    /// per-group `min_similarity` + `max_distance` for ranking.
     async fn tool_dedupe_near(
         &self,
         source: Option<String>,
@@ -3587,7 +3448,7 @@ impl AnamnesisServer {
         };
 
         let store = &self.store;
-        // Round 136 (PR-78be): central candidate-pool policy.
+        // Central candidate-pool policy.
         let opts = HybridOpts::for_limit(limit, SearchMode::Hybrid);
         let hits = match self.provider.as_ref() {
             Some(p) => HybridSearcher::new(p.as_ref())
@@ -4117,19 +3978,14 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "export_memories",
-                "description": "Round 140: programmatic round-trip export. Writes Anamnesis records \
-                                to a fresh file in one of four formats: `jsonl` (full record JSON), \
-                                `csv` (flat tabular), `mem0-sqlite` (mem0's `memories` table), or \
-                                `letta-sqlite` (Letta's `block` table). Closes the agent-facing \
-                                loop opened by R137 `discover_adapters`: an MCP peer can now both \
-                                introspect Anamnesis's capabilities AND request a specific subset \
-                                of memory in any supported wire format. SQLite formats reconstruct \
-                                native columns from metadata for the originating adapter and add \
-                                an `anamnesis_*` provenance backlink so a re-import preserves \
-                                lineage. ADMIN-GATED — this writes a file and can dump the entire \
-                                corpus. `out` is REQUIRED for every format (MCP transport cannot \
-                                stream large/binary bodies); refuses to overwrite an existing \
-                                file (protects upstream `~/.mem0/history.db`, `~/.letta/letta.db`).",
+                "description": "Programmatic round-trip export. Writes Anamnesis records to a fresh file in \
+                                `jsonl`, `csv`, `mem0-sqlite` (mem0's `memories` table), or `letta-sqlite` \
+                                (Letta's `block` table). SQLite formats reconstruct native columns from \
+                                metadata for the originating adapter and add an `anamnesis_*` provenance \
+                                backlink so a re-import preserves lineage. ADMIN-GATED — writes a file and \
+                                can dump the entire corpus. `out` is REQUIRED for every format (transport \
+                                cannot stream); refuses to overwrite an existing file (protects upstream \
+                                `~/.mem0/history.db`, `~/.letta/letta.db`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -4217,19 +4073,12 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "forget_record",
-                "description": "Permanently forget a record by id. Writes a tombstone keyed on \
-                                `(adapter, instance, native_id)` so the same source can no longer \
-                                resurrect the memory through a subsequent `import_source`. \
-                                ADMIN-GATED: hidden from `tools/list` and rejected by `tools/call` \
-                                unless the server was started with `allow_admin_tools = true`. \
-                                Does NOT modify any upstream source data — Anamnesis stays \
-                                read-only with respect to the original Claude Code memory file / \
-                                mem0 row / etc. Calling with an unknown `record_id` is a tool error \
-                                (no tombstone was written, so the guarantee cannot be made). \
-                                Round 133: pass `cascade_derived: true` to also tombstone every \
-                                record that transitively claims this one via \
-                                `provenance.derived_from`. Closes the gap where forgetting an \
-                                Episode left Stage-2-extracted Facts / Preferences / Skills live.",
+                "description": "Permanently forget a record. Writes an `(adapter, instance, native_id)` \
+                                tombstone so re-import can't resurrect it. ADMIN-GATED. Does NOT modify \
+                                upstream source data — Anamnesis stays read-only. Unknown `record_id` is \
+                                a tool error. Pass `cascade_derived: true` to also tombstone every record \
+                                transitively claiming this one via `provenance.derived_from` (closes the \
+                                gap where forgetting an Episode left its Stage-2 extracts live).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -4245,24 +4094,19 @@ fn tools_list_payload_all() -> Value {
                         "dry_run": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 83: preview the cascade without writing. Returns `status: \
-                                            \"would-forget\"` plus `would_delete` (records, raw_artifacts, \
-                                            record_chunks, chunk_embeddings, embedding_jobs, user_record_tags, \
-                                            vec0_rows) and `would_insert` (record_tombstones, audit_log_entries). \
-                                            Does NOT mutate the store and does NOT append an audit entry. \
-                                            Round 133: combine with `cascade_derived: true` to also preview \
-                                            the per-descendant `would_delete` block under `cascade.derived_records[]`."
+                            "description": "Preview the cascade without writing. Returns `status: \"would-forget\"` \
+                                            plus `would_delete` (per-table cascade counts) and `would_insert` \
+                                            (record_tombstones, audit_log_entries). No store mutation, no audit \
+                                            entry. Combine with `cascade_derived: true` to preview per-descendant \
+                                            `would_delete` under `cascade.derived_records[]`."
                         },
                         "cascade_derived": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 133: also forget every record that transitively claims \
-                                            this one in `provenance.derived_from`. When true, the response \
-                                            carries a `cascade` block with `derived_count` and `derived_records[]` \
-                                            (record_id, adapter, instance, native_id, native_path, raw_hash, \
-                                            forgotten_at, was_already_forgotten). The audit-log entry also \
-                                            includes `cascade_derived: true` and `derived_record_ids[]`. \
-                                            Default false → fully back-compat with the R72 behaviour."
+                            "description": "Also forget every record transitively claiming this one via \
+                                            `provenance.derived_from`. Response carries a `cascade` block with \
+                                            `derived_count` + `derived_records[]`; audit-log entry includes \
+                                            `cascade_derived: true` and `derived_record_ids[]`."
                         }
                     },
                     "required": ["record_id"]
@@ -4270,17 +4114,12 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "unforget_record",
-                "description": "Remove a tombstone so the source can resurrect the memory on its \
-                                next `import_source`. Does NOT recreate the record itself — the \
-                                tombstone only stored provenance, so 'unforget' means 'allowed to \
-                                come back if the source re-emits.' Anamnesis stays a read-only \
-                                mirror; resurrection happens through the source's own re-import, \
-                                not through this tool. ADMIN-GATED. Calling with an id that has \
-                                no tombstone is a tool error (likely typo from `list_forgotten`). \
-                                Round 134: pass `cascade_derived: true` to also remove every \
-                                descendant tombstone the matching R133 `forget --cascade-derived` \
-                                wrote. Cascade only deletes tombstones — re-import (or re-extract \
-                                for derived rows) is still required to bring the data back.",
+                "description": "Remove a tombstone so the source can resurrect on next `import_source`. \
+                                Does NOT recreate the record (tombstone only stored provenance). \
+                                ADMIN-GATED. Missing tombstone is a tool error (likely typo from \
+                                `list_forgotten`). Pass `cascade_derived: true` to also remove every \
+                                descendant tombstone the matching `forget --cascade-derived` wrote — \
+                                re-import is still required to bring the data back.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -4292,25 +4131,21 @@ fn tools_list_payload_all() -> Value {
                         "dry_run": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 95: preview the tombstone the real unforget would delete. \
-                                            Returns `outcome: \"would-unforget\"` plus `would_delete.record_tombstones=1` \
-                                            and `would_insert.audit_log_entries=1`. Does NOT mutate the store and does NOT \
-                                            append an audit entry. Symmetric with `forget_record { dry_run: true }`. \
-                                            Round 134: combine with `cascade_derived: true` to preview the descendant \
-                                            tombstones under `cascade.derived_records[]`."
+                            "description": "Preview the would-be deletion. Returns `outcome: \"would-unforget\"` \
+                                            plus `would_delete.record_tombstones=1` and \
+                                            `would_insert.audit_log_entries=1`. No store mutation, no audit \
+                                            entry. Combine with `cascade_derived: true` to preview descendants \
+                                            under `cascade.derived_records[]`."
                         },
                         "cascade_derived": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 134: also remove every descendant tombstone the matching R133 \
-                                            `forget_record { cascade_derived: true }` wrote (via the new \
-                                            `record_tombstones.derived_from` column). When true, the response carries a \
-                                            `cascade` block with `derived_count` and `derived_records[]` (record_id, \
-                                            adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at). \
-                                            The audit-log entry also includes `cascade_derived: true` and \
-                                            `derived_record_ids[]`. Pre-R134 tombstones with NULL `derived_from` surface \
-                                            as zero-descendant cascade outcomes — root unforget still works. Default \
-                                            false → fully back-compat."
+                            "description": "Also remove every descendant tombstone (via \
+                                            `record_tombstones.derived_from`). Response carries a `cascade` \
+                                            block with `derived_count` + `derived_records[]`; audit-log entry \
+                                            includes `cascade_derived: true` and `derived_record_ids[]`. \
+                                            Old tombstones with NULL `derived_from` surface as zero-descendant \
+                                            cascades — root unforget still works."
                         }
                     },
                     "required": ["record_id"]
@@ -4362,18 +4197,14 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "dedupe",
-                "description": "Report duplicate or near-duplicate records. Two modes: `exact` \
-                                (default, R77) groups records sharing identical `raw_hash` \
-                                bytes; `near` (R132, backed by R131 SimHash + LSH 16×4 + \
-                                Jaccard ≥0.6) groups records that are likely the same memory \
-                                paraphrased across adapters. Read-only diagnostic, NOT \
-                                admin-gated — the action half is `forget_record` (admin-gated). \
-                                Default redacted: `raw_hash` and `native_path` are omitted \
-                                unless `include_sensitive=true` (exact only — near never reads \
-                                them). Limit clamped to [1, 100]. `near` defaults to \
-                                cross-source-only groups (the interop-relevant case `exact` \
-                                cannot catch); pass `include_near_self=true` to also see \
-                                within-adapter near-dups.",
+                "description": "Report duplicate or near-duplicate records. Two modes: `exact` (default) \
+                                groups records sharing identical `raw_hash` bytes; `near` (SimHash + \
+                                LSH 16×4 + Jaccard ≥0.6) groups records likely paraphrased across \
+                                adapters. Read-only; NOT admin-gated (the action half is `forget_record`). \
+                                Default redacted: `raw_hash` / `native_path` omitted unless \
+                                `include_sensitive=true` (exact only — near never reads them). \
+                                `near` defaults to cross-source-only groups; `include_near_self=true` \
+                                also surfaces within-adapter near-dups.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -4381,11 +4212,17 @@ fn tools_list_payload_all() -> Value {
                             "type": "string",
                             "enum": ["exact", "near"],
                             "default": "exact",
-                            "description": "Round 132: pick the detector. `exact` (default) is the R77 byte-equal raw_hash grouper. `near` invokes the R131 SimHash + LSH + Jaccard cross-adapter near-duplicate algorithm — groups carry `min_similarity` (Jaccard, ∈ [0.6, 1.0]) and `max_distance` (Hamming on the 64-bit SimHash, ∈ [0, 8]) instead of `raw_hash`. `near` defaults to cross-source-only groups; pass `include_near_self: true` to opt out. `include_sensitive` and `include_counts` are exact-only — both refused under `near`."
+                            "description": "Detector. `exact` is byte-equal raw_hash grouping. `near` uses \
+                                            SimHash + LSH + Jaccard — groups carry `min_similarity` (∈ [0.6, 1.0]) \
+                                            and `max_distance` (Hamming on 64-bit SimHash, ∈ [0, 8]) instead of \
+                                            `raw_hash`. `include_sensitive` and `include_counts` are exact-only \
+                                            (refused under `near`)."
                         },
                         "source": {
                             "type": "string",
-                            "description": "Restrict duplicate groups to those containing ≥1 record from a given adapter. Single value (`\"mem0\"`) is exact match (R80); comma-separated list (`\"mem0,claude-code\"`) is OR (R104) — groups whose members include at least one record from any listed adapter stay eligible. Tokens trimmed and empty tokens dropped. Omit (or empty string) for all sources."
+                            "description": "Restrict to groups containing ≥1 record from a given adapter. \
+                                            Single value (`\"mem0\"`) or comma-separated OR list \
+                                            (`\"mem0,claude-code\"`). Omit (or empty string) for all sources."
                         },
                         "instance": {
                             "type": "string",
@@ -4405,69 +4242,72 @@ fn tools_list_payload_all() -> Value {
                         "include_counts": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 98: attach a `counts` block with `total_groups` (duplicate groups matching the filter), `total_records` (sum of live records across whole groups), and `by_source[]` (per-`(adapter, instance)` duplicate-record breakdown). Counts ignore `limit` and reflect the full filter-scoped set. `by_source` counts records (not group memberships) so mixed-source groups don't double-count: sum(by_source.duplicate_record_count) == total_records. Exact-only — refused under `mode: \"near\"`."
+                            "description": "Attach a filter-scoped `counts` block (`total_groups`, \
+                                            `total_records`, `by_source[]`). Counts ignore `limit` and \
+                                            reflect the full filtered set. Exact-only — refused under \
+                                            `mode: \"near\"`."
                         },
                         "csv": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 107: return a CSV string in `csv` instead of structured `groups[]`. Same redacted-summary discipline as R91 `audit tail --csv` and R106 `list-forgotten --csv` — never carries `raw_hash` / `native_path`. `group_index` carries duplicate-group membership without leaking the hash. Mutually exclusive with `include_sensitive: true` and `include_counts: true`. R132: under `mode: \"near\"` the CSV header also carries `min_similarity` and `max_distance` columns."
+                            "description": "Return a flat CSV string in `csv` instead of `groups[]`. \
+                                            Redacted (never `raw_hash` / `native_path`); `group_index` \
+                                            carries membership. Mutually exclusive with `include_sensitive` \
+                                            and `include_counts`. Under `mode: \"near\"` the header adds \
+                                            `min_similarity` + `max_distance`."
                         },
                         "include_near_self": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 132: `mode: \"near\"` only — opt out of the default cross-source filter and also surface within-adapter near-duplicates. Equivalent to setting `NearDuplicateFilter::require_cross_source = false`. Refused under `mode: \"exact\"` (raw_hash has no cross-source notion)."
+                            "description": "`mode: \"near\"` only — opt out of the cross-source filter and \
+                                            also surface within-adapter near-dups. Refused under `exact`."
                         }
                     }
                 }
             },
             {
                 "name": "list_conflicts",
-                "description": "Round 135: list cross-adapter `native_id` content conflicts — \
-                                multiple adapters claiming the same upstream record yet emitting \
-                                different normalised content. NOT admin-gated; read-only audit \
-                                surface. Distinct from `dedupe`: dedupe answers 'are these the \
-                                same memory?' (raw_hash or near-dup), `list_conflicts` answers \
-                                'do these adapters disagree about the same identity?'. The action \
-                                half stays the existing `forget_record` workflow. Default \
-                                response is redacted — `content_preview` (capped at 240 chars) \
-                                only appears when `include_content=true`; `native_path` never \
-                                appears (only `has_native_path` boolean). Limit clamped to [1, 100].",
+                "description": "Cross-adapter `native_id` content conflicts — multiple adapters claiming \
+                                the same upstream record but disagreeing on its content. Read-only, NOT \
+                                admin-gated. Distinct from `dedupe` (`dedupe` = same memory?; \
+                                `list_conflicts` = same identity, different content?). The action half \
+                                is the existing `forget_record` workflow. Redacted by default — \
+                                `content_preview` (≤240 chars) only with `include_content=true`; \
+                                `native_path` never returned (only `has_native_path`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "source": {
                             "type": "string",
-                            "description": "Restrict conflict groups to those containing ≥1 record from a given adapter. Single value (`\"mem0\"`) is exact match; comma-separated list (`\"mem0,claude-code\"`) is OR. Groups stay whole — siblings outside the filter still appear so the operator sees the full disagreement set. Tokens trimmed, empty tokens dropped. Omit (or empty string) for all sources."
+                            "description": "Restrict to groups containing ≥1 record from a given adapter. \
+                                            Single value or comma-separated OR list. Groups stay whole — \
+                                            siblings outside the filter still appear."
                         },
                         "instance": {
                             "type": "string",
-                            "description": "Restrict conflict groups by instance. Same single-value-or-CSV grammar as `source`. Combines as AND with `source` when both are set."
+                            "description": "Restrict by instance; same grammar as `source`. AND with `source`."
                         },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
                             "default": 20,
-                            "description": "Max number of groups. Clamped to [1, 100] by the store."
+                            "description": "Max groups. Clamped to [1, 100]."
                         },
                         "include_content": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Attach a short `content_preview` (≤ 240 chars) per record so an MCP client can disambiguate variants without round-tripping `get_record`. Default off — keeps the surface redacted by default."
+                            "description": "Attach a short `content_preview` (≤240 chars) per record so a \
+                                            client can disambiguate variants without `get_record`."
                         }
                     }
                 }
             },
             {
                 "name": "discover_adapters",
-                "description": "Round 137: programmatic capability discovery. Returns the static \
-                                catalogue of adapters compiled into this MCP binary (`adapters[]`) \
-                                plus a runtime detection pass of memory sources present on this \
-                                machine (`detected[]`). Lets an agent answer 'what memory \
-                                frameworks does this Anamnesis support, and what's already on \
-                                disk?' without shelling out to the CLI. NOT admin-gated — the \
-                                same metadata-only contract the CLI honours per BLUEPRINT §3.3: \
-                                paths, schema names, glob counts only, never user memory content. \
-                                Takes no input.",
+                "description": "Capability discovery. Returns the static catalogue of adapters compiled \
+                                into this binary (`adapters[]`) plus a runtime detection pass of memory \
+                                sources on disk (`detected[]`). NOT admin-gated — metadata only \
+                                (paths/schema names/counts, never user content) per BLUEPRINT §3.3.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -4508,7 +4348,7 @@ fn tools_list_payload_all() -> Value {
                         "include_stats": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 96: append a `stats` block (`total_user_tags`: post-mutation tag count) to the response. Default off — keeps the wire shape back-compatible."
+                            "description": "Append a `stats` block (`total_user_tags`: post-mutation count). Off by default."
                         }
                     },
                     "required": ["record_id", "tags"]
