@@ -820,6 +820,7 @@ impl AnamnesisServer {
             "unforget_record" => self.tool_unforget_record(args.clone()).await,
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
             "dedupe" => self.tool_dedupe(args.clone()).await,
+            "list_conflicts" => self.tool_list_conflicts(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
             "audit_tail" => self.tool_audit_tail(args.clone()).await,
             "source_show" => self.tool_source_show(args.clone()).await,
@@ -2375,6 +2376,103 @@ impl AnamnesisServer {
             payload["counts"] = render_forgotten_counts(buckets);
         }
         Ok(payload)
+    }
+
+    /// Round 135 (PR-78bd): MCP `list_conflicts` — cross-adapter
+    /// `native_id` content disagreement detector. NOT admin-gated
+    /// (read-only audit surface with the same redaction discipline
+    /// as `list_forgotten` / `dedupe`). The action half is the
+    /// existing `forget_record` workflow.
+    ///
+    /// Wire shape mirrors the CLI: per-record fields are limited
+    /// to the same projection R77 dedupe surfaces plus
+    /// `content_variant`, with `content_preview` only populated
+    /// when the caller passes `include_content: true`.
+    async fn tool_list_conflicts(&self, args: Value) -> Result<Value, String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(20);
+        let source = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let instance = args
+            .get("instance")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let include_content = args
+            .get("include_content")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let filter = anamnesis_store::NativeConflictFilter {
+            source: source.clone(),
+            instance: instance.clone(),
+            limit,
+            include_content,
+        };
+        let groups = self
+            .store
+            .list_native_content_conflicts_filtered(&filter)
+            .map_err(|e| format!("list_conflicts: {e}"))?;
+        let effective_limit = limit.clamp(1, anamnesis_store::LIST_NATIVE_CONFLICTS_MAX_LIMIT);
+
+        let source_tokens = anamnesis_core::parse_csv_filter(source.as_deref());
+        let instance_tokens = anamnesis_core::parse_csv_filter(instance.as_deref());
+        let summary =
+            format!(
+            "{} cross-adapter `native_id` content conflict group(s) returned; limit {}; {}; {}; \
+             content_preview: {}.",
+            groups.len(),
+            effective_limit,
+            render_filter_clause("source", &source_tokens),
+            render_filter_clause("instance", &instance_tokens),
+            if include_content { "included" } else { "redacted" },
+        );
+
+        let payload_groups: Vec<Value> = groups
+            .iter()
+            .map(|g| {
+                json!({
+                    "native_id":             g.native_id,
+                    "record_count":          g.records.len(),
+                    "content_variant_count": g.content_variant_count,
+                    "records": g.records.iter().map(|r| {
+                        let mut row = json!({
+                            "record_id":       r.record_id.0,
+                            "adapter":         r.adapter,
+                            "instance":        if r.instance.is_empty() { Value::Null } else { Value::String(r.instance.clone()) },
+                            "native_id":       r.native_id,
+                            "created_at":      r.created_at,
+                            "updated_at":      r.updated_at,
+                            "has_native_path": r.has_native_path,
+                            "content_variant": r.content_variant,
+                        });
+                        if let Some(prev) = &r.content_preview {
+                            row["content_preview"] = json!(prev);
+                        }
+                        row
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "count":            groups.len(),
+            "format":           "json",
+            "limit":            effective_limit,
+            "content_included": include_content,
+            "summary":          summary,
+            "filter": {
+                "source":   source,
+                "instance": instance,
+            },
+            "groups":           payload_groups,
+        }))
     }
 
     /// Round 77 (PR-77): MCP audit view for raw-hash duplicates.
@@ -4152,6 +4250,43 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "list_conflicts",
+                "description": "Round 135: list cross-adapter `native_id` content conflicts — \
+                                multiple adapters claiming the same upstream record yet emitting \
+                                different normalised content. NOT admin-gated; read-only audit \
+                                surface. Distinct from `dedupe`: dedupe answers 'are these the \
+                                same memory?' (raw_hash or near-dup), `list_conflicts` answers \
+                                'do these adapters disagree about the same identity?'. The action \
+                                half stays the existing `forget_record` workflow. Default \
+                                response is redacted — `content_preview` (capped at 240 chars) \
+                                only appears when `include_content=true`; `native_path` never \
+                                appears (only `has_native_path` boolean). Limit clamped to [1, 100].",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Restrict conflict groups to those containing ≥1 record from a given adapter. Single value (`\"mem0\"`) is exact match; comma-separated list (`\"mem0,claude-code\"`) is OR. Groups stay whole — siblings outside the filter still appear so the operator sees the full disagreement set. Tokens trimmed, empty tokens dropped. Omit (or empty string) for all sources."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Restrict conflict groups by instance. Same single-value-or-CSV grammar as `source`. Combines as AND with `source` when both are set."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 20,
+                            "description": "Max number of groups. Clamped to [1, 100] by the store."
+                        },
+                        "include_content": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Attach a short `content_preview` (≤ 240 chars) per record so an MCP client can disambiguate variants without round-tripping `get_record`. Default off — keeps the surface redacted by default."
+                        }
+                    }
+                }
+            },
+            {
                 "name": "tag_record",
                 "description": "Apply, remove, or replace user tags on a record. Tags live in a \
                                 separate overlay table from the adapter-derived `tags` field, so \
@@ -4513,6 +4648,8 @@ mod tests {
             "doctor",
             // Round 77: read-only diagnostic, not admin-gated.
             "dedupe",
+            // Round 135: read-only diagnostic, not admin-gated.
+            "list_conflicts",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -4524,7 +4661,8 @@ mod tests {
             "import_source MUST be hidden by default — found in tools/list",
         );
         // R77 added `dedupe` to the non-admin catalogue (5 → 6).
-        assert_eq!(names.len(), 6, "expect exactly 6 non-admin tools");
+        // R135 added `list_conflicts` (6 → 7).
+        assert_eq!(names.len(), 7, "expect exactly 7 non-admin tools");
     }
 
     #[tokio::test]
@@ -4540,7 +4678,8 @@ mod tests {
         // (7→8). R75 added unforget_record (8→9). R77 added
         // dedupe (9→10). R78 added tag_record (10→11). R84 added
         // audit_tail (11→12). R86 added source_show (12→13).
-        assert_eq!(names.len(), 13);
+        // R135 added list_conflicts (13→14).
+        assert_eq!(names.len(), 14);
         for expected in [
             "search_memories",
             "get_record",
@@ -4555,6 +4694,7 @@ mod tests {
             "tag_record",
             "audit_tail",
             "source_show",
+            "list_conflicts",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -4567,7 +4707,8 @@ mod tests {
     /// `summary` line for agent discovery, completing the trio
     /// started in R111 (`prompts/list`) + R112
     /// (`resources/list`). Default (admin off): counts only
-    /// the 6 visible tools and says `admin tools hidden`.
+    /// the 7 visible tools (R135 added `list_conflicts`) and
+    /// says `admin tools hidden`.
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_off() {
         let s = server_with_records(&[]);
@@ -4579,9 +4720,10 @@ mod tests {
             .expect("tools/list must carry top-level `summary` for discovery");
         // Visible-count must match post-filter `tools[]`.len().
         // R86 baseline: 13 catalogue - 7 admin = 6 visible.
+        // R135 added list_conflicts (non-admin) → 14 catalogue - 7 admin = 7.
         assert!(
-            summary.contains("6 tools exposed"),
-            "non-admin summary should declare 6 visible tools: {summary}"
+            summary.contains("7 tools exposed"),
+            "non-admin summary should declare 7 visible tools: {summary}"
         );
         // Operator must learn which tools are gated even when
         // they're hidden.
@@ -4594,13 +4736,14 @@ mod tests {
             "summary should name a representative admin tool: {summary}"
         );
         // Back-compat: `tools[]` continues to carry only the
-        // 6 visible entries.
+        // 7 visible entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
-    /// With admin enabled, summary reports 13 visible tools
-    /// and switches the verb to `admin tools enabled`.
+    /// With admin enabled, summary reports 14 visible tools
+    /// (R135 added list_conflicts) and switches the verb to
+    /// `admin tools enabled`.
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
         let store = Store::open_in_memory().unwrap();
@@ -4609,17 +4752,17 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("13 tools exposed"),
-            "admin-on summary should declare 13 visible tools: {summary}"
+            summary.contains("14 tools exposed"),
+            "admin-on summary should declare 14 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
         // Same back-compat assertion: `tools[]` carries the
-        // 13 entries.
+        // 14 entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
     }
 
     #[tokio::test]

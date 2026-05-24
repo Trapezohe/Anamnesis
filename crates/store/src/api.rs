@@ -3,6 +3,8 @@
 //! Everything that touches the database goes through this module. `Store`
 //! itself owns the `Connection`; callers must never write SQL directly.
 
+use std::collections::HashMap;
+
 use anamnesis_core::chunk::{Chunk, ContentHash};
 use anamnesis_core::model::{AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor};
 use chrono::{DateTime, TimeZone, Utc};
@@ -214,6 +216,26 @@ fn forget_one_in_tx(
         reason: reason.map(str::to_owned),
         forgotten_at: now,
     }))
+}
+
+/// Round 135 (PR-78bd): char-boundary-safe truncation for the
+/// `NativeConflictRecord.content_preview` field. Returns at most
+/// `max_chars` Unicode scalar values; never splits a multi-byte
+/// codepoint. Used by `list_native_content_conflicts_filtered`
+/// when the caller opts into `include_content`.
+fn truncate_preview(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(max_chars * 2);
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 /// Round 134 (PR-78bc): inside-tx unforget primitive shared between
@@ -905,6 +927,20 @@ pub const LIST_FORGOTTEN_MAX_LIMIT: u32 = 100;
 /// exfiltrate thousands of records at once).
 pub const LIST_DUPLICATE_RAW_HASHES_MAX_LIMIT: u32 = 100;
 
+/// Round 135 (PR-78bd): hard cap on
+/// `Store::list_native_content_conflicts_filtered` page size. Same
+/// reason as the dedupe caps — the conflict surface can carry
+/// signal about source identity collisions across adapters.
+pub const LIST_NATIVE_CONFLICTS_MAX_LIMIT: u32 = 100;
+
+/// Round 135 (PR-78bd): max characters of `content` returned in a
+/// conflict-record `content_preview` when the caller opts in via
+/// `include_content`. Short prose snippet — enough to disambiguate
+/// adapters that emit different normalisations of the same
+/// upstream record (e.g. trailing-newline drift, casing) without
+/// dumping a multi-kilobyte transcript blob across the wire.
+pub const NATIVE_CONFLICT_PREVIEW_CHARS: usize = 240;
+
 /// Round 78: per-tag length limit. Tags are operator-supplied
 /// short labels (`"todo"`, `"keep-forever"`, …); 64 bytes is
 /// already generous. Bounds enforced before the SQL write so
@@ -1081,6 +1117,105 @@ pub struct DuplicateRawHashSourceCount {
     /// Number of live records this source contributes to the
     /// filter-scoped duplicate set.
     pub duplicate_record_count: u64,
+}
+
+/// Round 135 (PR-78bd): one record inside a `NativeConflictGroup`.
+/// Same privacy discipline as [`DuplicateRawHashRecord`] — no
+/// `content`, no `raw_hash` by default; the wire surfaces opt-in
+/// to a short `content_preview` via `include_content` and we never
+/// surface `native_path` directly (only `has_native_path` boolean).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeConflictRecord {
+    /// Hashed `records.id`.
+    pub record_id: RecordId,
+    /// Adapter id (e.g. `"mem0"`, `"claude-code"`) — the dimension
+    /// that distinguishes one variant from another for the same
+    /// `native_id`.
+    pub adapter: String,
+    /// Instance discriminator — `""` for the default instance.
+    pub instance: String,
+    /// Native id at the source. Same value across the whole group
+    /// (that's the grouping key) — repeated per row for
+    /// flat-table-friendly downstream rendering.
+    pub native_id: String,
+    /// Whether the record carries a `native_path`. Path itself
+    /// stays redacted at this surface — operators read the live
+    /// record via `get_record` for the full path.
+    pub has_native_path: bool,
+    /// Record created_at, unix seconds.
+    pub created_at: i64,
+    /// Record updated_at, unix seconds. `None` when never updated.
+    pub updated_at: Option<i64>,
+    /// 1-based index of the **content variant** this record
+    /// belongs to inside its group: `1`, `2`, … (assigned in
+    /// stable adapter-asc / record_id-asc order). Two records with
+    /// the same `(native_id, content)` share a variant; the cardinality
+    /// of this column matches `NativeConflictGroup.content_variant_count`.
+    pub content_variant: u32,
+    /// Optional short preview of the record's `content`. Only
+    /// populated when the caller passed `include_content = true`;
+    /// truncated to `NATIVE_CONFLICT_PREVIEW_CHARS` so a multi-KB
+    /// transcript blob doesn't escape into the diagnostic surface.
+    pub content_preview: Option<String>,
+}
+
+/// Round 135 (PR-78bd): one group of records sharing a `native_id`
+/// across multiple adapters with at least two distinct
+/// (normalised) `content` values. Always size 2+ and at least 2
+/// distinct adapters and at least 2 distinct content variants —
+/// see the eligibility filter in
+/// [`Store::list_native_content_conflicts_filtered`].
+///
+/// Design note: this is the **identity disagreement** surface,
+/// distinct from R77/R131 duplicate detection. Two adapters
+/// claiming the same upstream `native_id` but emitting different
+/// normalised content is a real interop signal — it means an
+/// upstream record was *captured* differently by each adapter, not
+/// that the same memory was paraphrased twice (R131 covers that).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeConflictGroup {
+    /// Shared `native_id`. Surfaced because it's the grouping key
+    /// the operator needs to resolve the conflict; not redacted
+    /// (CLI / MCP echo it back so the operator can locate it
+    /// across adapters).
+    pub native_id: String,
+    /// All live records sharing this `native_id`. Length is
+    /// always `>= 2` and spans at least 2 distinct adapters.
+    /// Ordered by `(adapter ASC, record_id ASC)` for stable
+    /// variant numbering.
+    pub records: Vec<NativeConflictRecord>,
+    /// Distinct content variants — `>= 2` by the group eligibility
+    /// filter. Useful as a sort key ("show me the highest-divergence
+    /// groups first" = highest variant count).
+    pub content_variant_count: u32,
+}
+
+/// Round 135 (PR-78bd): filter for
+/// [`Store::list_native_content_conflicts_filtered`]. Same
+/// source/instance/limit shape as the R80 dedupe filter so an
+/// operator's mental model carries across surfaces. Groups remain
+/// whole — siblings outside the filter still appear in the
+/// returned group so the operator sees the full disagreement set
+/// before deciding what to forget/merge.
+#[derive(Debug, Clone, Default)]
+pub struct NativeConflictFilter {
+    /// Adapter id (`"mem0"`) or comma-separated OR list
+    /// (`"mem0,claude-code"`) — same grammar as the R80 dedupe
+    /// filter (parsed via `anamnesis_core::parse_csv_filter`).
+    /// `None` or empty string matches any adapter.
+    pub source: Option<String>,
+    /// Instance discriminator or comma-separated OR list. `None`
+    /// or empty string matches any instance.
+    pub instance: Option<String>,
+    /// Cap on the number of groups returned. Clamped to
+    /// `[1, LIST_NATIVE_CONFLICTS_MAX_LIMIT]` by the store.
+    pub limit: u32,
+    /// When `true`, populate `NativeConflictRecord.content_preview`
+    /// with the first `NATIVE_CONFLICT_PREVIEW_CHARS` of the
+    /// record's content. Default `false` keeps the surface
+    /// redacted by default (matches the dedupe `include_sensitive`
+    /// pattern, but the knob here is content-specific).
+    pub include_content: bool,
 }
 
 /// Round 74 (PR-74): filter for `Store::list_forgotten`. Mirrors
@@ -2701,6 +2836,208 @@ impl Store {
             total_records,
             by_source,
         })
+    }
+
+    /// Round 135 (PR-78bd): cross-adapter identity-disagreement
+    /// detector. Returns groups of live `records` rows that:
+    ///
+    /// 1. share a single `provenance.native_id`,
+    /// 2. span at least 2 distinct `adapter` ids,
+    /// 3. carry at least 2 distinct (raw) `content` values.
+    ///
+    /// This is **not** dedupe — R77 catches byte-identical
+    /// duplicates and R131 catches paraphrase-grade near-dups.
+    /// This surface answers a different question: *multiple
+    /// adapters claim the same upstream record yet they disagree
+    /// on what it says*. A common interop signal — e.g. one
+    /// adapter normalises trailing newlines while another doesn't,
+    /// or one stores the user's edit while another keeps the
+    /// pre-edit baseline.
+    ///
+    /// Filter: `source` / `instance` use the shared R104 CSV
+    /// grammar via `parse_csv_filter`. A group is eligible if
+    /// **any** of its members matches the filter, but the returned
+    /// group keeps every sibling — the operator needs the full
+    /// disagreement set to decide what to do (forget one, merge
+    /// the other, file an adapter bug). Matches the R80 dedupe
+    /// "filter scopes eligibility, doesn't trim siblings" rule.
+    ///
+    /// Privacy: per-record fields are limited to the same
+    /// projection R77 dedupe surfaces (`record_id / adapter /
+    /// instance / native_id / created_at / updated_at /
+    /// has_native_path`) plus a `content_variant` index. Full
+    /// `content` is only returned as a short preview when
+    /// `filter.include_content = true`; `native_path` is never
+    /// returned directly (only `has_native_path`).
+    ///
+    /// Ordering: groups sorted by `content_variant_count DESC`
+    /// (highest divergence first) then `native_id ASC`. Within a
+    /// group, records ordered by `(adapter ASC, record_id ASC)`
+    /// so the variant numbering is stable across calls.
+    pub fn list_native_content_conflicts_filtered(
+        &self,
+        filter: &NativeConflictFilter,
+    ) -> Result<Vec<NativeConflictGroup>> {
+        let limit = filter.limit.clamp(1, LIST_NATIVE_CONFLICTS_MAX_LIMIT);
+        let sources = anamnesis_core::parse_csv_filter(filter.source.as_deref());
+        let instances = anamnesis_core::parse_csv_filter(filter.instance.as_deref());
+
+        let conn = self.conn.lock();
+
+        // First pass: pick eligible native_ids. A group qualifies
+        // if it has ≥2 records, ≥2 distinct adapters, ≥2 distinct
+        // content values, AND ≥1 member matches the source/instance
+        // filter (when set). The outer GROUP BY runs against the
+        // *full* record set, not the filtered one, so a group with
+        // 1 mem0 + 5 claude-code stays a group instead of being
+        // collapsed by the filter.
+        let mut sql = String::from(
+            "SELECT native_id, COUNT(DISTINCT content) AS variant_count \
+             FROM records \
+             WHERE native_id IN (",
+        );
+        let mut eligible_params: Vec<rusqlite::types::Value> = Vec::new();
+        if !sources.is_empty() || !instances.is_empty() {
+            sql.push_str("SELECT DISTINCT native_id FROM records WHERE 1=1");
+            if !sources.is_empty() {
+                let placeholders = vec!["?"; sources.len()].join(", ");
+                sql.push_str(&format!(" AND adapter IN ({placeholders})"));
+                for s in &sources {
+                    eligible_params.push(rusqlite::types::Value::Text(s.clone()));
+                }
+            }
+            if !instances.is_empty() {
+                let placeholders = vec!["?"; instances.len()].join(", ");
+                sql.push_str(&format!(" AND instance IN ({placeholders})"));
+                for s in &instances {
+                    eligible_params.push(rusqlite::types::Value::Text(s.clone()));
+                }
+            }
+        } else {
+            // No filter — every distinct native_id is eligible.
+            sql.push_str("SELECT DISTINCT native_id FROM records");
+        }
+        sql.push_str(
+            ") \
+             GROUP BY native_id \
+             HAVING COUNT(*) > 1 \
+                AND COUNT(DISTINCT adapter) > 1 \
+                AND COUNT(DISTINCT content) > 1 \
+             ORDER BY variant_count DESC, native_id ASC \
+             LIMIT ?",
+        );
+        eligible_params.push(rusqlite::types::Value::Integer(limit as i64));
+
+        let group_rows: Vec<(String, u32)> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let mapped = stmt
+                .query_map(rusqlite::params_from_iter(eligible_params.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            mapped
+        };
+
+        if group_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Second pass: fetch every member of every qualifying group.
+        // One query for the whole batch is cheaper than N round-trips.
+        let placeholders = vec!["?"; group_rows.len()].join(", ");
+        let member_sql = format!(
+            "SELECT id, adapter, instance, native_id, native_path, content, created_at, updated_at \
+             FROM records \
+             WHERE native_id IN ({placeholders}) \
+             ORDER BY native_id ASC, adapter ASC, id ASC"
+        );
+        let member_params: Vec<rusqlite::types::Value> = group_rows
+            .iter()
+            .map(|(nid, _)| rusqlite::types::Value::Text(nid.clone()))
+            .collect();
+
+        // Carry raw content along so we can compute the per-group
+        // variant index without re-fetching. Content stays in-memory
+        // only; the public `NativeConflictRecord.content_preview`
+        // gates exposure on the caller's `include_content` flag.
+        struct RawMember {
+            record_id: RecordId,
+            adapter: String,
+            instance: String,
+            native_id: String,
+            has_native_path: bool,
+            content: String,
+            created_at: i64,
+            updated_at: Option<i64>,
+        }
+        let mut by_group: HashMap<String, Vec<RawMember>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(&member_sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(member_params.iter()), |r| {
+                Ok(RawMember {
+                    record_id: RecordId(r.get::<_, String>(0)?),
+                    adapter: r.get(1)?,
+                    instance: r.get(2)?,
+                    native_id: r.get(3)?,
+                    has_native_path: r.get::<_, Option<String>>(4)?.is_some(),
+                    content: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            for row in rows {
+                let row = row?;
+                by_group.entry(row.native_id.clone()).or_default().push(row);
+            }
+        }
+
+        // Build groups in the same order the eligibility query
+        // returned. Per-group: assign 1-based `content_variant`
+        // indices by first-occurrence of each unique content
+        // string (stable adapter-asc, id-asc traversal).
+        let mut out: Vec<NativeConflictGroup> = Vec::with_capacity(group_rows.len());
+        for (native_id, variant_count) in &group_rows {
+            let Some(members) = by_group.remove(native_id) else {
+                continue;
+            };
+            let mut content_to_variant: HashMap<String, u32> = HashMap::new();
+            let mut next_variant: u32 = 1;
+            let records: Vec<NativeConflictRecord> = members
+                .into_iter()
+                .map(|m| {
+                    let variant =
+                        *content_to_variant
+                            .entry(m.content.clone())
+                            .or_insert_with(|| {
+                                let v = next_variant;
+                                next_variant += 1;
+                                v
+                            });
+                    let content_preview = if filter.include_content {
+                        Some(truncate_preview(&m.content, NATIVE_CONFLICT_PREVIEW_CHARS))
+                    } else {
+                        None
+                    };
+                    NativeConflictRecord {
+                        record_id: m.record_id,
+                        adapter: m.adapter,
+                        instance: m.instance,
+                        native_id: m.native_id,
+                        has_native_path: m.has_native_path,
+                        created_at: m.created_at,
+                        updated_at: m.updated_at,
+                        content_variant: variant,
+                        content_preview,
+                    }
+                })
+                .collect();
+            out.push(NativeConflictGroup {
+                native_id: native_id.clone(),
+                records,
+                content_variant_count: *variant_count,
+            });
+        }
+        Ok(out)
     }
 
     /// Round 78 (PR-78): apply or remove user-tags on a record.
@@ -8953,6 +9290,195 @@ mod tests {
             .collect();
         assert!(ids.contains(child.0.as_str()));
         assert!(ids.contains(grand.0.as_str()));
+    }
+
+    // ─── Round-135 PR-78bd: list_native_content_conflicts ────────
+
+    /// Plant two adapters each emitting a record at the same
+    /// `native_id` but with different content. Plus a control:
+    /// same `native_id` but identical content across adapters
+    /// (must NOT group).
+    fn seed_native_conflicts(store: &Store) {
+        // Cross-adapter conflict on `shared-1`: mem0 says A,
+        // claude-code says B → must group.
+        let mut a = make_record("mem0", "shared-1", "Memory body variant A", Kind::Fact);
+        a.provenance.native_id = "shared-1".into();
+        let mut b = make_record(
+            "claude-code",
+            "shared-1",
+            "Memory body variant B",
+            Kind::Fact,
+        );
+        b.provenance.native_id = "shared-1".into();
+        // Control: `shared-2` has identical content across
+        // adapters → must NOT group (no content disagreement).
+        let mut c = make_record("mem0", "shared-2", "Same content both sides", Kind::Fact);
+        c.provenance.native_id = "shared-2".into();
+        let mut d = make_record(
+            "claude-code",
+            "shared-2",
+            "Same content both sides",
+            Kind::Fact,
+        );
+        d.provenance.native_id = "shared-2".into();
+        // Control: `unique-3` only one adapter → singleton, drops.
+        let mut e = make_record("codex", "unique-3", "Solo record", Kind::Fact);
+        e.provenance.native_id = "unique-3".into();
+
+        for r in [&a, &b, &c, &d, &e] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_conflicts_only_returns_cross_adapter_content_disagreements() {
+        let store = Store::open_in_memory().unwrap();
+        seed_native_conflicts(&store);
+
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "must drop same-content and singleton groups: {groups:?}"
+        );
+        let g = &groups[0];
+        assert_eq!(g.native_id, "shared-1");
+        assert_eq!(g.records.len(), 2);
+        assert_eq!(g.content_variant_count, 2);
+        let adapters: std::collections::BTreeSet<&str> =
+            g.records.iter().map(|r| r.adapter.as_str()).collect();
+        assert!(adapters.contains("claude-code"));
+        assert!(adapters.contains("mem0"));
+        // Records have distinct content variants (1, 2).
+        let variants: std::collections::BTreeSet<u32> =
+            g.records.iter().map(|r| r.content_variant).collect();
+        assert_eq!(variants, [1u32, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn native_conflicts_default_filter_redacts_content_preview() {
+        let store = Store::open_in_memory().unwrap();
+        seed_native_conflicts(&store);
+
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        for r in &groups[0].records {
+            assert!(
+                r.content_preview.is_none(),
+                "default filter must NOT populate content_preview: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_conflicts_include_content_returns_truncated_preview() {
+        let store = Store::open_in_memory().unwrap();
+        // Plant a long content so we exercise the truncation path.
+        let mut a = make_record(
+            "mem0",
+            "long-1",
+            &"A".repeat(NATIVE_CONFLICT_PREVIEW_CHARS + 64),
+            Kind::Fact,
+        );
+        a.provenance.native_id = "long-1".into();
+        let mut b = make_record(
+            "claude-code",
+            "long-1",
+            "completely different body",
+            Kind::Fact,
+        );
+        b.provenance.native_id = "long-1".into();
+        for r in [&a, &b] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                limit: 20,
+                include_content: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        let long_row = groups[0]
+            .records
+            .iter()
+            .find(|r| r.adapter == "mem0")
+            .unwrap();
+        let preview = long_row.content_preview.as_ref().unwrap();
+        // Truncation contract: ≤ MAX chars + 1 ellipsis.
+        assert!(preview.chars().count() <= NATIVE_CONFLICT_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'), "must end with truncation marker");
+        let short_row = groups[0]
+            .records
+            .iter()
+            .find(|r| r.adapter == "claude-code")
+            .unwrap();
+        let short_preview = short_row.content_preview.as_ref().unwrap();
+        // Short content passes through unmodified (no ellipsis).
+        assert_eq!(short_preview, "completely different body");
+    }
+
+    #[test]
+    fn native_conflicts_source_filter_keeps_siblings_whole() {
+        let store = Store::open_in_memory().unwrap();
+        seed_native_conflicts(&store);
+
+        // Filter on `mem0` — but the group spans mem0 + claude-code
+        // and we return the whole sibling set so the operator sees
+        // what they'd be choosing between.
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                source: Some("mem0".into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        let adapters: std::collections::BTreeSet<&str> = groups[0]
+            .records
+            .iter()
+            .map(|r| r.adapter.as_str())
+            .collect();
+        assert!(adapters.contains("mem0"));
+        assert!(
+            adapters.contains("claude-code"),
+            "siblings must stay visible under source filter"
+        );
+
+        // Filter on a non-matching adapter — group drops entirely.
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                source: Some("hermes".into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn native_conflicts_empty_store_returns_empty_vec() {
+        let store = Store::open_in_memory().unwrap();
+        let groups = store
+            .list_native_content_conflicts_filtered(&NativeConflictFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(groups.is_empty());
     }
 
     /// Pre-R134 tombstones carry NULL `derived_from`. Synthesise
