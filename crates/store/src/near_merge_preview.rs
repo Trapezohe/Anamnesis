@@ -1,45 +1,53 @@
-//! Deterministic per-group ranking for `dedupe --mode near --merge-preview`.
+//! Deterministic keep/forget proposal for one near-duplicate group.
 //!
-//! Ranking keys (DESC; first non-tie wins): user_tag_count, effective_at
-//! (`updated_at`∨`created_at`), has_native_path, adapter ASC, record_id ASC.
-//! The first three are operator-meaningful; the last two are stable tiebreakers.
+//! Ranking keys (DESC, first non-tie wins):
+//!   1. `user_tag_count` — operator-curated signal.
+//!   2. `effective_at` (`updated_at` ∨ `created_at`) — recency.
+//!   3. `has_native_path` — re-import-friendly survives.
+//!   4. `adapter` ASC — alphabetical tiebreaker.
+//!   5. `record_id` ASC — final tiebreaker.
 //!
-//! Privacy: reads tag COUNTS only (never tag names), never content / raw_hash /
-//! native_path. Output is safe to dump.
+//! Privacy: never reads `content` / `raw_hash` / `native_path` (just
+//! the boolean) / tag names. Output carries tag *counts* only.
+//!
+//! Preview-only — operator action stays `forget_record`.
 
 use std::collections::HashMap;
 
 use anamnesis_core::model::RecordId;
-use anamnesis_store::{NearDuplicateGroup, NearDuplicateRecord};
 
-/// One ranked record. Full set returned so the operator can audit.
+use crate::semantic_dedupe::{NearDuplicateGroup, NearDuplicateRecord};
+
+/// One row of a per-group ranking.
 #[derive(Debug, Clone)]
 pub struct RankedRecord<'a> {
-    /// 1-based rank. Rank 1 = keep.
+    /// 1-based rank. Rank 1 = `keep`.
     pub rank: u32,
-    /// Source record.
+    /// Borrowed from the input group so callers reuse fields they already render.
     pub record: &'a NearDuplicateRecord,
-    /// Tag count (never tag names).
+    /// User-tag count (no tag names — privacy).
     pub user_tag_count: u32,
-    /// `updated_at` ?? `created_at`, unix seconds.
+    /// `updated_at` when set, else `created_at` (unix seconds).
     pub effective_at: i64,
-    /// Mirror for flat rendering.
+    /// Mirror of `NearDuplicateRecord.has_native_path`.
     pub has_native_path: bool,
-    /// `keep` for rank 1, else `forget`.
+    /// `"keep"` for rank 1, `"forget"` otherwise.
     pub decision: &'static str,
 }
 
-/// Per-group merge preview.
+/// Merge-preview view of one group.
 pub struct GroupMergePreview<'a> {
-    /// Winner (rank 1).
+    /// Rank-1 winner.
     pub keep_record_id: RecordId,
-    /// Losers, the targets for `forget_record`.
+    /// Losers — what `forget_record` would remove.
     pub forget_record_ids: Vec<RecordId>,
-    /// Full ranking, ordered rank-asc.
+    /// Full ranking, rank-asc.
     pub ranking: Vec<RankedRecord<'a>>,
 }
 
-/// Rank one group. Returns `None` for singletons.
+/// Build the per-group merge preview. `user_tag_counts` should come from
+/// `Store::user_tags_by_ids` (one batched lookup, not N). Returns `None`
+/// for groups with fewer than 2 records.
 pub fn build_merge_preview<'a>(
     group: &'a NearDuplicateGroup,
     user_tag_counts: &HashMap<String, u32>,
@@ -47,9 +55,9 @@ pub fn build_merge_preview<'a>(
     if group.records.len() < 2 {
         return None;
     }
-    // Decorate-sort-undecorate. Negate numeric keys for DESC via natural ASC.
-    // Tuple cols: 0..4 are sort keys; 5..8 carry through for the output rows.
-    // Aliased to quiet clippy::type_complexity.
+    // Decorate-sort-undecorate. Sort key columns (ASC sort, so DESC keys
+    // are negated): -tag_count, -effective_at, !has_native_path, adapter,
+    // record_id. Carried columns: borrowed record + the three render values.
     type DecoratedRow<'a> = (
         i64,
         i64,
@@ -139,8 +147,6 @@ mod tests {
 
     #[test]
     fn user_tag_count_wins_over_recency() {
-        // Older record `a` has 2 user tags; newer `b` has 0.
-        // Tag count must dominate → `a` keeps.
         let g = grp(vec![
             mk("a", "mem0", 100, false),
             mk("b", "claude-code", 200, false),
@@ -157,7 +163,6 @@ mod tests {
 
     #[test]
     fn recency_wins_when_tag_counts_tie() {
-        // Both 0 tags → newer (b, 200) wins.
         let g = grp(vec![
             mk("a", "mem0", 100, false),
             mk("b", "claude-code", 200, false),
@@ -168,7 +173,6 @@ mod tests {
 
     #[test]
     fn has_native_path_wins_when_recency_ties() {
-        // Same effective_at; b has a path, a doesn't.
         let g = grp(vec![
             mk("a", "mem0", 100, false),
             mk("b", "claude-code", 100, true),
@@ -179,13 +183,11 @@ mod tests {
 
     #[test]
     fn adapter_then_record_id_break_remaining_ties() {
-        // Identical metadata; adapter ASC then id ASC.
         let g = grp(vec![
             mk("z", "mem0", 100, true),
             mk("a", "claude-code", 100, true),
         ]);
         let preview = build_merge_preview(&g, &HashMap::new()).unwrap();
-        // claude-code < mem0 alphabetically → claude-code wins.
         assert_eq!(preview.keep_record_id.0, "a");
     }
 

@@ -5,8 +5,8 @@
 // inlined idents — clippy's literal-format-arg lint isn't load-bearing here.
 #![allow(clippy::print_literal)]
 
-// `dedupe --mode near --merge-preview` ranking heuristic (preview-only).
-mod near_merge_preview;
+// Near-dedupe merge-preview ranking lives in `anamnesis-store` so the
+// MCP `dedupe` tool can share the heuristic.
 
 use std::path::PathBuf;
 
@@ -4422,7 +4422,7 @@ fn cmd_dedupe_near(
                     })).collect::<Vec<_>>(),
                 });
                 if merge_preview {
-                    if let Some(preview) = near_merge_preview::build_merge_preview(g, &tag_counts) {
+                    if let Some(preview) = anamnesis_store::build_merge_preview(g, &tag_counts) {
                         // proposed_derived_from: every loser gets
                         // an edge pointing at the keeper, modelling
                         // what a future merge mutation would write
@@ -4512,7 +4512,7 @@ fn cmd_dedupe_near(
             );
         }
         if merge_preview {
-            if let Some(preview) = near_merge_preview::build_merge_preview(g, &tag_counts) {
+            if let Some(preview) = anamnesis_store::build_merge_preview(g, &tag_counts) {
                 println!("    merge-preview:");
                 println!("      keep:   {}", preview.keep_record_id.0);
                 for loser in &preview.forget_record_ids {
