@@ -22,6 +22,10 @@ rusqlite = { workspace = true, features = ["functions"] }
 sqlite-vec = { workspace = true }
 parking_lot = "0.12"
 jieba-rs = "0.7"
+# Round 131 (PR-78az): blake3 powers the near-duplicate detector's
+# token-level SimHash. Reuses the same hash family the rest of the
+# project uses for `raw_hash` / `content_hash`.
+blake3 = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

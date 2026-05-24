@@ -1770,6 +1770,54 @@ impl Store {
     /// Round 80: same as `list_duplicate_raw_hashes` but scopes
     /// the eligible groups to those whose member records include
     /// at least one matching `(adapter, instance)`. **Whole
+    /// Round 131 (PR-78az): read every live record's content + minimal
+    /// provenance for the near-duplicate detector
+    /// (`semantic_dedupe::list_near_duplicates`). Returns the projection
+    /// the algorithm needs and nothing more — the full record body is
+    /// only ever held in memory during the SimHash pass.
+    ///
+    /// Walks live `records` only (no tombstoned rows: a forgotten
+    /// memory shouldn't surface back through near-dedupe). Returns
+    /// rows in arbitrary order; the detector doesn't depend on order
+    /// and groups its own output newest-first inside each component.
+    pub fn list_records_for_near_dedupe(
+        &self,
+    ) -> Result<Vec<crate::semantic_dedupe::NearDedupeScanRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, adapter, instance, native_id, native_path, \
+                    content, kind, created_at, updated_at \
+             FROM records",
+        )?;
+        let mapped = stmt
+            .query_map([], |r| {
+                let kind_str: String = r.get(6)?;
+                let kind = match kind_str.as_str() {
+                    "fact" => anamnesis_core::model::Kind::Fact,
+                    "preference" => anamnesis_core::model::Kind::Preference,
+                    "feedback" => anamnesis_core::model::Kind::Feedback,
+                    "reference" => anamnesis_core::model::Kind::Reference,
+                    "episode" => anamnesis_core::model::Kind::Episode,
+                    "skill" => anamnesis_core::model::Kind::Skill,
+                    _ => anamnesis_core::model::Kind::Unknown,
+                };
+                let native_path: Option<String> = r.get(4)?;
+                Ok(crate::semantic_dedupe::NearDedupeScanRow {
+                    record_id: anamnesis_core::model::RecordId(r.get::<_, String>(0)?),
+                    adapter: r.get(1)?,
+                    instance: r.get(2)?,
+                    native_id: r.get(3)?,
+                    has_native_path: native_path.is_some(),
+                    content: r.get(5)?,
+                    kind,
+                    created_at: r.get(7)?,
+                    updated_at: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(mapped)
+    }
+
     /// groups** are returned — siblings outside the filter stay
     /// visible so the operator can decide which to `forget`.
     ///
@@ -7752,5 +7800,161 @@ mod tests {
         let hits = store.search_chunks_fts("alpha", &filter, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id.0, r.id.0);
+    }
+
+    // ─── Round-131 PR-78az: near-duplicate detection ─────────────
+
+    /// End-to-end on the store. mem0 and claude-code both capture
+    /// the same operator preference in slightly different wording
+    /// (different `raw_hash`); near-dedupe should group them.
+    /// An unrelated third record stays out of any group.
+    #[test]
+    fn near_dedupe_groups_cross_adapter_paraphrases() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Make a near-duplicate pair across adapters. Same key
+        // tokens (user prefers thorough error handling +
+        // integration tests + real fixtures + no mocks), different
+        // surface form so raw_hash differs.
+        let a = make_record(
+            "mem0",
+            "rec-a",
+            "The user prefers thorough error handling in Rust code and \
+             writes comprehensive integration tests with real fixtures \
+             and never uses mocks for critical paths.",
+            Kind::Fact,
+        );
+        let b = make_record(
+            "claude-code",
+            "rec-b",
+            "User prefers thorough error handling in Rust code; \
+             comprehensive integration tests with real fixtures; \
+             no mocks on critical paths.",
+            Kind::Fact,
+        );
+        // Unrelated long record to ensure it doesn't join.
+        let c = make_record(
+            "codex",
+            "rec-c",
+            "Configure the database connection pool to recycle stale \
+             connections after sixty seconds and enable TLS for all \
+             outbound traffic through the corporate proxy.",
+            Kind::Fact,
+        );
+        for r in [&a, &b, &c] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+
+        let groups = crate::semantic_dedupe::list_near_duplicates(
+            &store,
+            &crate::semantic_dedupe::NearDuplicateFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "must find the mem0+claude-code near-dup group: {groups:?}"
+        );
+        let group = &groups[0];
+        let adapters: std::collections::BTreeSet<&str> =
+            group.records.iter().map(|r| r.adapter.as_str()).collect();
+        assert_eq!(
+            adapters,
+            ["claude-code", "mem0"].into_iter().collect(),
+            "expected cross-adapter group: {group:?}"
+        );
+        assert!(
+            group.min_similarity >= 0.6,
+            "min_similarity must be ≥ Jaccard threshold: {}",
+            group.min_similarity
+        );
+
+        // Privacy: the group records carry no content / raw_hash.
+        // The `NearDuplicateRecord` struct doesn't even have those
+        // fields, so this is compile-time enforced; this assertion
+        // pins the wire contract going forward.
+        let serialised = format!("{:?}", group.records);
+        assert!(
+            !serialised.contains("comprehensive integration"),
+            "content must not leak into group debug repr"
+        );
+    }
+
+    /// Single-adapter near-dups are filtered by default
+    /// (require_cross_source=true) — Anamnesis is about the
+    /// cross-adapter interop story.
+    #[test]
+    fn near_dedupe_default_filters_single_adapter_groups() {
+        let store = Store::open_in_memory().unwrap();
+        // Two mem0 records with the same content (different
+        // native_id so raw_hash differs even before our
+        // tokenizer normalisation).
+        let a = make_record(
+            "mem0",
+            "rec-a",
+            "User prefers thorough error handling in Rust code with \
+             comprehensive integration tests and real fixtures.",
+            Kind::Fact,
+        );
+        let b = make_record(
+            "mem0",
+            "rec-b",
+            "User prefers thorough error handling in Rust code with \
+             comprehensive integration tests and real fixtures.",
+            Kind::Fact,
+        );
+        for r in [&a, &b] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+
+        let groups = crate::semantic_dedupe::list_near_duplicates(
+            &store,
+            &crate::semantic_dedupe::NearDuplicateFilter::default(),
+        )
+        .unwrap();
+        assert!(
+            groups.is_empty(),
+            "default filter must drop single-adapter near-dup groups: {groups:?}"
+        );
+
+        // With cross-source disabled, the same fixture surfaces.
+        let groups2 = crate::semantic_dedupe::list_near_duplicates(
+            &store,
+            &crate::semantic_dedupe::NearDuplicateFilter {
+                require_cross_source: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            groups2.len(),
+            1,
+            "with require_cross_source=false the single-adapter group must surface"
+        );
+    }
+
+    /// Short records (fewer than MIN_TOKENS) are skipped so
+    /// random vocabulary co-occurrence on 2-token records can't
+    /// produce false-positive groups.
+    #[test]
+    fn near_dedupe_skips_short_records() {
+        let store = Store::open_in_memory().unwrap();
+        let a = make_record("mem0", "short-a", "hello world", Kind::Fact);
+        let b = make_record("claude-code", "short-b", "hello world", Kind::Fact);
+        for r in [&a, &b] {
+            let chunks = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &chunks, None).unwrap();
+        }
+        let groups = crate::semantic_dedupe::list_near_duplicates(
+            &store,
+            &crate::semantic_dedupe::NearDuplicateFilter::default(),
+        )
+        .unwrap();
+        assert!(
+            groups.is_empty(),
+            "short records (< MIN_TOKENS) must be skipped: {groups:?}"
+        );
     }
 }
