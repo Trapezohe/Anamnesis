@@ -64,6 +64,10 @@ pub const ADMIN_TOOLS: &[&str] = &[
     // file paths, parse traces). Same gating logic as audit_tail.
     // `list_sources` (no per-row error detail) stays non-admin.
     "source_show",
+    // Round 140 (PR-78bi): `export_memories` writes a new file on
+    // disk and can dump the entire memory corpus — both are
+    // operator-class actions, not introspection.
+    "export_memories",
 ];
 
 /// Was this tool tagged as admin?
@@ -822,6 +826,7 @@ impl AnamnesisServer {
             "dedupe" => self.tool_dedupe(args.clone()).await,
             "list_conflicts" => self.tool_list_conflicts(args.clone()).await,
             "discover_adapters" => self.tool_discover_adapters().await,
+            "export_memories" => self.tool_export_memories(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
             "audit_tail" => self.tool_audit_tail(args.clone()).await,
             "source_show" => self.tool_source_show(args.clone()).await,
@@ -2392,6 +2397,116 @@ impl AnamnesisServer {
             )
             .await,
         )
+    }
+
+    /// Round 140 (PR-78bi): MCP `export_memories` — programmatic
+    /// round-trip complement to R137 `discover_adapters`. Admin-gated
+    /// because it writes a new file on disk and can dump the entire
+    /// memory corpus.
+    ///
+    /// Wire shape:
+    /// ```json
+    /// {
+    ///   "format": "jsonl|csv|mem0-sqlite|letta-sqlite",
+    ///   "out":    "/absolute/fresh/output/path",
+    ///   "source": "mem0,letta",   // optional R104 OR list
+    ///   "instance": "prod",       // optional R115 OR list
+    ///   "kind":   "fact"          // optional Kind discriminator
+    /// }
+    /// ```
+    ///
+    /// `out` is REQUIRED for every format here (unlike the CLI's
+    /// stdout default) — the MCP transport can't reasonably stream
+    /// binary SQLite or huge JSONL bodies through the JSON-RPC
+    /// channel. Refuses to overwrite an existing file (shared
+    /// safety guard in `anamnesis_export::validate_sqlite_output`).
+    /// Response carries bounded metadata only — record count,
+    /// output path, bytes written, echoed filters — not the file
+    /// contents themselves.
+    async fn tool_export_memories(&self, args: Value) -> Result<Value, String> {
+        let format_token = args
+            .get("format")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "export_memories.format is required".to_string())?;
+        let format = anamnesis_export::ExportFormat::parse(format_token)
+            .map_err(|e| format!("export_memories: {e}"))?;
+        let out = args
+            .get("out")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                "export_memories.out is required (MCP transport cannot stream binary SQLite \
+                 or large JSONL through the JSON-RPC channel)"
+                    .to_string()
+            })?;
+        if out.exists() {
+            return Err(format!(
+                "export_memories: refusing to overwrite existing file {}; pick a fresh `out` path",
+                out.display()
+            ));
+        }
+        let filter = anamnesis_export::ExportFilter {
+            source: args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            instance: args
+                .get("instance")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            kind: args
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        };
+
+        let outcome = anamnesis_export::run_export(&self.store, &filter, format, Some(&out), None)
+            .map_err(|e| format!("export_memories: {e}"))?;
+
+        // Audit-log mirrors the CLI shape, plus `transport: "mcp"`
+        // so an operator scanning audit_tail can tell the export
+        // came from a peer agent.
+        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
+            "export",
+            json!({
+                "format":    format.as_token(),
+                "source":    filter.source,
+                "instance":  filter.instance,
+                "kind":      filter.kind,
+                "out":       outcome.out.as_ref().map(|p| p.display().to_string()),
+                "records":   outcome.records,
+                "transport": "mcp",
+            }),
+        ));
+
+        let summary = format!(
+            "exported {} record(s) to {} ({} bytes) — {}",
+            outcome.records,
+            outcome
+                .out
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            outcome.bytes.unwrap_or(0),
+            anamnesis_export::render_filter_summary(&filter),
+        );
+
+        Ok(json!({
+            "summary": summary,
+            "format":  format.as_token(),
+            "out":     outcome.out.as_ref().map(|p| p.display().to_string()),
+            "records": outcome.records,
+            "bytes":   outcome.bytes,
+            "filters": {
+                "source":   filter.source,
+                "instance": filter.instance,
+                "kind":     filter.kind,
+            },
+        }))
     }
 
     /// Round 135 (PR-78bd): MCP `list_conflicts` — cross-adapter
@@ -4001,6 +4116,49 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "export_memories",
+                "description": "Round 140: programmatic round-trip export. Writes Anamnesis records \
+                                to a fresh file in one of four formats: `jsonl` (full record JSON), \
+                                `csv` (flat tabular), `mem0-sqlite` (mem0's `memories` table), or \
+                                `letta-sqlite` (Letta's `block` table). Closes the agent-facing \
+                                loop opened by R137 `discover_adapters`: an MCP peer can now both \
+                                introspect Anamnesis's capabilities AND request a specific subset \
+                                of memory in any supported wire format. SQLite formats reconstruct \
+                                native columns from metadata for the originating adapter and add \
+                                an `anamnesis_*` provenance backlink so a re-import preserves \
+                                lineage. ADMIN-GATED — this writes a file and can dump the entire \
+                                corpus. `out` is REQUIRED for every format (MCP transport cannot \
+                                stream large/binary bodies); refuses to overwrite an existing \
+                                file (protects upstream `~/.mem0/history.db`, `~/.letta/letta.db`).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite"],
+                            "description": "Output format. SQLite formats round-trip into the named framework."
+                        },
+                        "out": {
+                            "type": "string",
+                            "description": "Absolute path for the output file. REQUIRED. Must not exist (no overwrite)."
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Restrict to one adapter id, or comma-separated OR list (e.g. `\"mem0,letta\"`). Same R104 grammar as `list_sources`."
+                        },
+                        "instance": {
+                            "type": "string",
+                            "description": "Restrict to one instance, or comma-separated OR list. Same R115 grammar as `dedupe.instance`."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": "Restrict to a single Kind (`fact` / `preference` / `episode` / `feedback` / `skill` / `reference` / `unknown`)."
+                        }
+                    },
+                    "required": ["format", "out"]
+                }
+            },
+            {
                 "name": "trace_provenance",
                 "description": "Return native_id / native_path / raw_hash for one record. \
                                 Pass `id` (record_id from search_memories.record_id) for record-level provenance, \
@@ -4711,8 +4869,9 @@ mod tests {
         // dedupe (9→10). R78 added tag_record (10→11). R84 added
         // audit_tail (11→12). R86 added source_show (12→13).
         // R135 added list_conflicts (13→14). R137 added
-        // discover_adapters (14→15).
-        assert_eq!(names.len(), 15);
+        // discover_adapters (14→15). R140 added export_memories
+        // (15→16).
+        assert_eq!(names.len(), 16);
         for expected in [
             "search_memories",
             "get_record",
@@ -4729,6 +4888,7 @@ mod tests {
             "source_show",
             "list_conflicts",
             "discover_adapters",
+            "export_memories",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -4776,8 +4936,8 @@ mod tests {
         assert_eq!(tools.len(), 8);
     }
 
-    /// With admin enabled, summary reports 15 visible tools
-    /// (R137 added discover_adapters) and switches the verb to
+    /// With admin enabled, summary reports 16 visible tools
+    /// (R140 added export_memories) and switches the verb to
     /// `admin tools enabled`.
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
@@ -4787,17 +4947,17 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("15 tools exposed"),
-            "admin-on summary should declare 15 visible tools: {summary}"
+            summary.contains("16 tools exposed"),
+            "admin-on summary should declare 16 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
         // Same back-compat assertion: `tools[]` carries the
-        // 15 entries.
+        // 16 entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
     }
 
     #[tokio::test]

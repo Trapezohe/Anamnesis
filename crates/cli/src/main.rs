@@ -5,12 +5,12 @@
 // inlined idents — clippy's literal-format-arg lint isn't load-bearing here.
 #![allow(clippy::print_literal)]
 
-// Round 139 (PR-78bh): R138 introduced `export --format mem0-sqlite`
-// inline. As more round-trip formats land (R139 letta-sqlite,
-// future claude-code-md, etc.), the inline approach balloons
-// `cmd_export`. Keep each round-trip exporter in its own small
-// module.
-mod export_letta;
+// Round 140 (PR-78bi): R138/R139 introduced `mem0-sqlite` and
+// `letta-sqlite` exporters inline in the CLI. R140 lifted the
+// whole format catalogue into `anamnesis-export` so the CLI's
+// `anamnesis export` and the new MCP `export_memories` tool share
+// one implementation. The CLI is now just clap-parsing + audit
+// glue around `anamnesis_export::run_export`.
 
 use std::path::PathBuf;
 
@@ -2619,6 +2619,13 @@ fn audit(data_dir: &std::path::Path) -> anamnesis_core::Audit {
 // export
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Round 140 (PR-78bi): refactored to delegate to the shared
+/// `anamnesis-export` crate. Same wire behaviour as R138/R139 (CLI
+/// `--format` default `jsonl`, `out` defaults to stdout for
+/// jsonl/csv, REQUIRED for `mem0-sqlite` / `letta-sqlite`).
+/// The shared crate hosts the format dispatch, filter parsing,
+/// SQLite safety guard, and provenance metadata convention — so
+/// the MCP `export_memories` tool runs through the same writers.
 fn cmd_export(
     data_dir: &std::path::Path,
     out: Option<&std::path::Path>,
@@ -2626,230 +2633,41 @@ fn cmd_export(
     source: Option<&str>,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
-    // IMPORTANT: drop the connection guard BEFORE calling store.get_record
-    // below. Store wraps Connection in parking_lot::Mutex internally; both
-    // store.conn() and store.get_record() lock the same mutex, and
-    // parking_lot is not re-entrant → would deadlock under load.
-    let ids: Vec<String> = {
-        let (where_clause, params): (String, Vec<rusqlite::types::Value>) = match source {
-            Some(s) => (
-                "WHERE adapter = ?1".to_string(),
-                vec![rusqlite::types::Value::Text(s.to_string())],
-            ),
-            None => (String::new(), vec![]),
-        };
-        let sql = format!("SELECT id FROM records {where_clause} ORDER BY created_at ASC");
-        let conn = store.conn();
-        let mut stmt = conn.prepare(&sql)?;
-        let collected: rusqlite::Result<Vec<String>> = stmt
-            .query_map(rusqlite::params_from_iter(params), |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect();
-        collected?
-    }; // stmt + conn dropped here, mutex released before get_record below
-
-    // Round 138-139 (PR-78bg, PR-78bh): `mem0-sqlite` and
-    // `letta-sqlite` both write a brand-new SQLite file. They
-    // can't stream into stdout (rusqlite needs a path) and they
-    // must NEVER clobber an existing file — the user's real
-    // `~/.mem0/history.db` or `~/.letta/letta.db` is a
-    // one-typo-away target. Shared guard so both formats — and
-    // any future SQLite-output format — get the same protection.
-    if format == "mem0-sqlite" || format == "letta-sqlite" {
-        let out = out.ok_or_else(|| {
-            anyhow!(
-                "--format {format} requires --out <path>: SQLite output cannot stream to stdout"
-            )
-        })?;
-        if out.exists() {
-            return Err(anyhow!(
-                "refusing to overwrite existing file {}; pick a fresh --out path",
-                out.display()
-            ));
-        }
-        match format {
-            "mem0-sqlite" => export_mem0_sqlite(&store, &ids, out)?,
-            "letta-sqlite" => export_letta::export_letta_sqlite(&store, &ids, out)?,
-            _ => unreachable!("guard above narrows the format set"),
-        }
-        eprintln!("exported {} record(s) to {}", ids.len(), out.display());
-        audit(data_dir).record(anamnesis_core::AuditEntry::new(
-            "export",
-            serde_json::json!({
-                "format": format,
-                "source": source,
-                "out": out.display().to_string(),
-                "records": ids.len(),
-            }),
-        ));
-        return Ok(());
-    }
-
-    let mut writer: Box<dyn std::io::Write> = match out {
-        Some(p) => Box::new(std::fs::File::create(p)?),
-        None => Box::new(std::io::stdout()),
+    let fmt = anamnesis_export::ExportFormat::parse(format).map_err(|e| anyhow!("{e}"))?;
+    let filter = anamnesis_export::ExportFilter {
+        source: source.map(str::to_owned),
+        instance: None,
+        kind: None,
     };
 
-    match format {
-        "jsonl" => export_jsonl(&store, &ids, &mut writer)?,
-        "csv" => export_csv(&store, &ids, &mut writer)?,
-        other => {
-            return Err(anyhow!(
-                "unsupported format: {other} (try jsonl, csv, mem0-sqlite, or letta-sqlite)"
-            ))
-        }
+    // jsonl/csv with no `--out` writes to stdout (R0 behaviour);
+    // SQLite formats are guarded by the shared validate_sqlite_output.
+    let outcome = if matches!(
+        fmt,
+        anamnesis_export::ExportFormat::Jsonl | anamnesis_export::ExportFormat::Csv
+    ) && out.is_none()
+    {
+        let mut writer = std::io::stdout();
+        anamnesis_export::run_export(&store, &filter, fmt, None, Some(&mut writer))
+            .map_err(|e| anyhow!("{e}"))?
+    } else {
+        anamnesis_export::run_export(&store, &filter, fmt, out, None).map_err(|e| anyhow!("{e}"))?
+    };
+
+    if let Some(p) = &outcome.out {
+        eprintln!("exported {} record(s) to {}", outcome.records, p.display());
+    } else {
+        eprintln!("exported {} record(s)", outcome.records);
     }
-    eprintln!("exported {} record(s)", ids.len());
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
         "export",
         serde_json::json!({
-            "format": format,
-            "source": source,
-            "out": out.map(|p| p.display().to_string()),
-            "records": ids.len(),
+            "format":  fmt.as_token(),
+            "source":  source,
+            "out":     outcome.out.as_ref().map(|p| p.display().to_string()),
+            "records": outcome.records,
         }),
     ));
-    Ok(())
-}
-
-fn export_jsonl(store: &Store, ids: &[String], writer: &mut dyn std::io::Write) -> Result<()> {
-    for id in ids {
-        if let Some(rec) = store.get_record(&anamnesis_core::RecordId(id.clone()))? {
-            let line = serde_json::to_string(&rec)?;
-            writeln!(writer, "{line}")?;
-        }
-    }
-    Ok(())
-}
-
-/// Round 138 (PR-78bg): export to a fresh SQLite DB whose shape
-/// matches what mem0 itself reads. Closes the round-trip:
-/// `import mem0 → normalise/dedupe/consolidate → export
-/// mem0-sqlite` produces a file the same mem0 adapter can
-/// re-scan, and any other mem0-compatible tool can consume.
-///
-/// Wire shape (matches `adapter-mem0/src/scanner.rs` PRAGMA probe):
-///
-/// ```sql
-/// CREATE TABLE memories (
-///     id         TEXT PRIMARY KEY,
-///     memory     TEXT NOT NULL,
-///     user_id    TEXT,
-///     agent_id   TEXT,
-///     run_id     TEXT,
-///     metadata   TEXT,     -- JSON; carries our provenance backlink
-///     created_at TEXT,     -- RFC3339
-///     updated_at TEXT,     -- RFC3339
-///     hash       TEXT      -- == AnamnesisRecord.provenance.raw_hash
-/// );
-/// ```
-///
-/// `metadata` is a JSON object that always carries the operator's
-/// original adapter `metadata` (when present) plus an
-/// `anamnesis_*` provenance block — so re-importing this DB into
-/// Anamnesis preserves which source originally produced each row,
-/// even after a round-trip.
-fn export_mem0_sqlite(store: &Store, ids: &[String], out: &std::path::Path) -> Result<()> {
-    let conn = rusqlite::Connection::open(out)?;
-    conn.execute_batch(
-        "CREATE TABLE memories ( \
-            id         TEXT PRIMARY KEY, \
-            memory     TEXT NOT NULL, \
-            user_id    TEXT, \
-            agent_id   TEXT, \
-            run_id     TEXT, \
-            metadata   TEXT, \
-            created_at TEXT, \
-            updated_at TEXT, \
-            hash       TEXT \
-        );",
-    )?;
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO memories \
-                (id, memory, user_id, agent_id, run_id, metadata, created_at, updated_at, hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        for id in ids {
-            let Some(rec) = store.get_record(&anamnesis_core::RecordId(id.clone()))? else {
-                continue;
-            };
-            // metadata = original-adapter metadata + a provenance
-            // backlink under `anamnesis_*` keys. Both sides are
-            // serialised as a single JSON object string so the mem0
-            // reader (which keeps `metadata` as opaque text) sees
-            // exactly what it'd see for a native mem0 row.
-            // `AnamnesisRecord.metadata` is already a `Map<String,
-            // Value>` per the type — clone the existing entries and
-            // layer the `anamnesis_*` provenance keys on top.
-            let mut meta: serde_json::Map<String, serde_json::Value> = rec.metadata.clone();
-            meta.insert(
-                "anamnesis_source_adapter".into(),
-                serde_json::json!(rec.source.adapter),
-            );
-            if let Some(inst) = &rec.source.instance {
-                meta.insert("anamnesis_source_instance".into(), serde_json::json!(inst));
-            }
-            meta.insert(
-                "anamnesis_kind".into(),
-                serde_json::json!(format!("{:?}", rec.kind).to_lowercase()),
-            );
-            meta.insert(
-                "anamnesis_scope".into(),
-                serde_json::json!(format!("{:?}", rec.scope).to_lowercase()),
-            );
-            meta.insert("anamnesis_tags".into(), serde_json::json!(rec.tags));
-            meta.insert(
-                "anamnesis_native_id".into(),
-                serde_json::json!(rec.provenance.native_id),
-            );
-            if let Some(parent) = &rec.provenance.derived_from {
-                meta.insert("anamnesis_derived_from".into(), serde_json::json!(parent.0));
-            }
-            let metadata_json = serde_json::to_string(&serde_json::Value::Object(meta))?;
-            let created_iso = rec.created_at.to_rfc3339();
-            let updated_iso = rec.updated_at.map(|t| t.to_rfc3339());
-            stmt.execute(rusqlite::params![
-                rec.id.0,
-                rec.content,
-                Option::<String>::None, // user_id — Anamnesis doesn't track per-user attribution
-                Option::<String>::None, // agent_id
-                Option::<String>::None, // run_id
-                metadata_json,
-                created_iso,
-                updated_iso,
-                rec.provenance.raw_hash,
-            ])?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn export_csv(store: &Store, ids: &[String], writer: &mut dyn std::io::Write) -> Result<()> {
-    writeln!(
-        writer,
-        "id,adapter,instance,kind,scope,created_at,native_id,native_path,content"
-    )?;
-    for id in ids {
-        if let Some(rec) = store.get_record(&anamnesis_core::RecordId(id.clone()))? {
-            let row = format!(
-                "{id},{adapter},{instance},{kind},{scope},{created},{nid},{npath},{content}",
-                id = csv_field(&rec.id.0),
-                adapter = csv_field(&rec.source.adapter),
-                instance = csv_field(rec.source.instance.as_deref().unwrap_or("")),
-                kind = csv_field(&format!("{:?}", rec.kind).to_lowercase()),
-                scope = csv_field(&format!("{:?}", rec.scope).to_lowercase()),
-                created = rec.created_at.timestamp(),
-                nid = csv_field(&rec.provenance.native_id),
-                npath = csv_field(rec.provenance.native_path.as_deref().unwrap_or("")),
-                content = csv_field(&rec.content),
-            );
-            writeln!(writer, "{row}")?;
-        }
-    }
     Ok(())
 }
 
