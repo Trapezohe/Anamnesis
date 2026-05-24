@@ -984,6 +984,274 @@ fn export_mem0_sqlite_refuses_to_overwrite_existing_file() {
     );
 }
 
+// ─── Round 139 PR-78bh: export --format letta-sqlite ────────────────
+
+/// Seed Anamnesis with a Letta fixture so the exporter has
+/// known input shaped like a real Letta block table (id, value,
+/// label, description, metadata_, created_at, updated_at).
+fn seed_for_letta_export(dir: &std::path::Path) -> usize {
+    use rusqlite::Connection;
+    let letta_db = dir.join("letta_src.sqlite");
+    let conn = Connection::open(&letta_db).unwrap();
+    conn.execute_batch(
+        r#"CREATE TABLE block (
+            id TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            label TEXT,
+            description TEXT,
+            template_name TEXT,
+            metadata_ TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+        INSERT INTO block(id, value, label, description, template_name, metadata_, created_at, updated_at) VALUES
+          ('p', 'I am Anamnesis.',  'persona', 'self-view',  NULL,             NULL, '2024-01-01T00:00:00Z', NULL),
+          ('h', 'User likes Rust.', 'human',   'user model', 'default-human',  NULL, '2024-02-01T00:00:00Z', '2024-03-01T00:00:00Z'),
+          ('c', 'Custom block.',    'note',    NULL,         NULL,             NULL, '2024-04-01T00:00:00Z', NULL);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir)
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir)
+        .args([
+            "import",
+            "letta",
+            "--no-embed",
+            "--path",
+            letta_db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    3
+}
+
+/// Happy path: 3-row Letta fixture → `letta-sqlite` export
+/// produces the canonical `block` schema with the right row count.
+#[test]
+fn export_letta_sqlite_writes_block_schema_and_rows() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    let expected = seed_for_letta_export(dir.path());
+
+    let out_path = dir.path().join("exported_letta.sqlite");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "letta-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let conn = Connection::open(&out_path).unwrap();
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(block)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for expected_col in [
+        "id",
+        "value",
+        "label",
+        "description",
+        "template_name",
+        "metadata_",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            cols.iter().any(|c| c == expected_col),
+            "missing column {expected_col}: got {cols:?}"
+        );
+    }
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM block", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n as usize, expected);
+}
+
+/// Round-trip: exported `block` rows must restore Letta's native
+/// `label`, `description`, `template_name` columns from the
+/// metadata the Letta adapter stashed at import time. And
+/// `metadata_` must carry the `anamnesis_*` provenance backlink.
+#[test]
+fn export_letta_sqlite_round_trips_native_block_columns_and_provenance() {
+    use rusqlite::Connection;
+    let dir = tmp_dir();
+    seed_for_letta_export(dir.path());
+
+    let out_path = dir.path().join("exported_letta.sqlite");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "letta-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let conn = Connection::open(&out_path).unwrap();
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = conn
+        .prepare(
+            "SELECT value, label, description, template_name, metadata_ \
+             FROM block ORDER BY value",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // The "User likes Rust." row had label=human + template_name=default-human.
+    // Both must round-trip through metadata back into native columns.
+    let human = rows
+        .iter()
+        .find(|r| r.0 == "User likes Rust.")
+        .expect("human row");
+    assert_eq!(human.1, "human", "native label must round-trip");
+    assert_eq!(
+        human.3.as_deref(),
+        Some("default-human"),
+        "native template_name must round-trip"
+    );
+
+    // Every row carries the `anamnesis_source_adapter=letta`
+    // provenance backlink.
+    for (val, _label, _desc, _tmpl, metadata_) in &rows {
+        let meta_str = metadata_
+            .as_ref()
+            .unwrap_or_else(|| panic!("row {val:?} must carry metadata_"));
+        let meta: serde_json::Value = serde_json::from_str(meta_str).unwrap();
+        assert_eq!(
+            meta["anamnesis_source_adapter"], "letta",
+            "row {val:?} provenance backlink missing"
+        );
+        assert!(meta["anamnesis_kind"].is_string());
+        assert!(meta["anamnesis_raw_hash"].is_string());
+    }
+}
+
+/// Re-feed the exported DB back into the Letta adapter's own
+/// scanner — proves the export is honestly Letta-readable, not
+/// just "a SQLite file with the right column names".
+#[tokio::test]
+async fn export_letta_sqlite_is_letta_adapter_readable() {
+    use anamnesis_adapter_letta::scanner::read_all_blocks;
+    let dir = tmp_dir();
+    seed_for_letta_export(dir.path());
+
+    let out_path = dir.path().join("exported_letta.sqlite");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "letta-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let rows = read_all_blocks(&out_path).expect("Letta scanner must read exported DB");
+    assert_eq!(rows.len(), 3);
+    let values: std::collections::BTreeSet<String> = rows.iter().map(|r| r.value.clone()).collect();
+    assert!(values.contains("I am Anamnesis."));
+    assert!(values.contains("User likes Rust."));
+    assert!(values.contains("Custom block."));
+}
+
+/// Negative: `--format letta-sqlite` without `--out` must fail.
+#[test]
+fn export_letta_sqlite_requires_out_path() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["export", "--format", "letta-sqlite"])
+        .output()
+        .expect("run cli");
+    assert!(!out.status.success(), "must fail without --out");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires --out"),
+        "must explain the missing arg: {stderr}"
+    );
+}
+
+/// Negative: refuses to overwrite an existing file. Same guard
+/// R138 introduced for mem0-sqlite, now shared with letta-sqlite.
+#[test]
+fn export_letta_sqlite_refuses_to_overwrite_existing_file() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out_path = dir.path().join("already_there.sqlite");
+    std::fs::write(&out_path, b"do not clobber me").unwrap();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "letta-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run cli");
+    assert!(!out.status.success(), "must fail when target exists");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite"),
+        "must explain the overwrite refusal: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&out_path).unwrap(),
+        b"do not clobber me",
+        "pre-existing file must be untouched"
+    );
+}
+
 #[test]
 fn verify_reports_healthy_on_fresh_db() {
     let dir = tmp_dir();
