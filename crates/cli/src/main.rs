@@ -342,6 +342,14 @@ enum Command {
         /// appended. Symmetric with R83's `forget --dry-run`.
         #[arg(long)]
         dry_run: bool,
+        /// Round 134 (PR-78bc): also unforget every record that
+        /// `provenance.derived_from` of this one. Symmetric with
+        /// R133 `forget --cascade-derived`. Note: this only deletes
+        /// tombstones, never resurrects live records — the
+        /// source's re-import (or re-extract for derived rows) is
+        /// what actually brings the data back.
+        #[arg(long)]
+        cascade_derived: bool,
     },
 
     /// List tombstoned records (audit view).
@@ -1143,7 +1151,8 @@ async fn run() -> Result<()> {
             record_id,
             json,
             dry_run,
-        } => cmd_unforget(&data_dir, &record_id, json, dry_run),
+            cascade_derived,
+        } => cmd_unforget(&data_dir, &record_id, json, dry_run, cascade_derived),
         Command::ListForgotten {
             source,
             instance,
@@ -3584,27 +3593,36 @@ fn cmd_unforget(
     record_id: &str,
     json: bool,
     dry_run: bool,
+    cascade_derived: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let id = anamnesis_core::model::RecordId(record_id.to_string());
     if dry_run {
-        return cmd_unforget_dry_run(&store, record_id, &id, json);
+        return cmd_unforget_dry_run(&store, record_id, &id, json, cascade_derived);
     }
-    let outcome = store.unforget_record(&id)?;
+    let opts = anamnesis_store::UnforgetCascadeOptions { cascade_derived };
+    let cascade_outcome = store.unforget_record_with_options(&id, &opts)?;
+    let outcome = cascade_outcome.root;
+    let derived = cascade_outcome.derived;
 
-    audit(data_dir).record(anamnesis_core::AuditEntry::new(
-        "unforget",
-        serde_json::json!({
-            "record_id": record_id,
-            "outcome": match &outcome {
-                anamnesis_store::UnforgetRecordOutcome::Unforgotten(_) => "unforgotten",
-                anamnesis_store::UnforgetRecordOutcome::NotForgotten   => "not-forgotten",
-            },
-        }),
-    ));
+    let mut audit_detail = serde_json::json!({
+        "record_id": record_id,
+        "outcome": match &outcome {
+            anamnesis_store::UnforgetRecordOutcome::Unforgotten(_) => "unforgotten",
+            anamnesis_store::UnforgetRecordOutcome::NotForgotten   => "not-forgotten",
+        },
+    });
+    if cascade_derived {
+        audit_detail["cascade_derived"] = serde_json::json!(true);
+        audit_detail["derived_record_ids"] = serde_json::json!(derived
+            .iter()
+            .map(|d| d.record_id.0.clone())
+            .collect::<Vec<_>>());
+    }
+    audit(data_dir).record(anamnesis_core::AuditEntry::new("unforget", audit_detail));
 
     if json {
-        let payload = match &outcome {
+        let mut payload = match &outcome {
             anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => serde_json::json!({
                 "status": "unforgotten",
                 "record_id": r.record_id.0,
@@ -3620,21 +3638,29 @@ fn cmd_unforget(
                 "record_id": record_id,
             }),
         };
+        if cascade_derived {
+            payload["cascade"] = render_unforget_cascade_json(&derived);
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else if let anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) = &outcome {
-        let inst = if r.instance.is_empty() {
-            String::new()
-        } else {
-            format!(":{}", r.instance)
-        };
-        println!(
-            "unforgotten {} (adapter={}{inst}, native_id={})",
-            r.record_id.0, r.adapter, r.native_id
-        );
-        println!(
-            "  tombstone removed — record itself is NOT resurrected; \
-             re-import the source to bring it back."
-        );
+    } else {
+        if let anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) = &outcome {
+            let inst = if r.instance.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", r.instance)
+            };
+            println!(
+                "unforgotten {} (adapter={}{inst}, native_id={})",
+                r.record_id.0, r.adapter, r.native_id
+            );
+            println!(
+                "  tombstone removed — record itself is NOT resurrected; \
+                 re-import the source to bring it back."
+            );
+        }
+        if cascade_derived {
+            print_unforget_cascade_human(&derived);
+        }
     }
 
     if matches!(
@@ -3648,6 +3674,62 @@ fn cmd_unforget(
     Ok(())
 }
 
+/// Round 134 (PR-78bc): render the cascade block on `unforget --json`.
+/// Mirrors the R133 `forget` cascade renderer — `derived_count` +
+/// per-row record snapshot (record_id / adapter / instance /
+/// native_id / forgotten_at). Pre-R134 tombstones with NULL
+/// `derived_from` produce an empty list, but the empty `cascade`
+/// block still distinguishes "I asked for cascade" from "I didn't."
+fn render_unforget_cascade_json(
+    derived: &[anamnesis_store::DerivedUnforgetRecord],
+) -> serde_json::Value {
+    let derived_records: Vec<serde_json::Value> = derived
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "record_id":    d.record_id.0,
+                "adapter":      d.adapter,
+                "instance":     if d.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(d.instance.clone())
+                },
+                "native_id":    d.native_id,
+                "forgotten_at": d.forgotten_at,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
+/// R134: human one-liner per descendant tombstone beneath the root
+/// summary. Mirrors the structured cascade JSON shape so operators
+/// get the same information without `--json`.
+fn print_unforget_cascade_human(derived: &[anamnesis_store::DerivedUnforgetRecord]) {
+    if derived.is_empty() {
+        println!("  cascade-derived: no descendant tombstones");
+        return;
+    }
+    println!(
+        "  cascade-derived: removed {} descendant tombstone(s)",
+        derived.len()
+    );
+    for d in derived {
+        let inst = if d.instance.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", d.instance)
+        };
+        println!(
+            "    {} ({}{inst}, native_id={})",
+            d.record_id.0, d.adapter, d.native_id
+        );
+    }
+}
+
 /// Round 95 (PR-78q): `anamnesis unforget --dry-run` — preview
 /// the tombstone the real `unforget` would remove. Does NOT
 /// call `store.unforget_record` and does NOT append to
@@ -3658,10 +3740,14 @@ fn cmd_unforget_dry_run(
     record_id: &str,
     id: &anamnesis_core::model::RecordId,
     json: bool,
+    cascade_derived: bool,
 ) -> Result<()> {
-    let preview = store.preview_unforget_record(id)?;
+    let opts = anamnesis_store::UnforgetCascadeOptions { cascade_derived };
+    let cascade_preview = store.preview_unforget_record_with_options(id, &opts)?;
+    let preview = cascade_preview.root;
+    let derived = cascade_preview.derived;
     if json {
-        let payload = match &preview {
+        let mut payload = match &preview {
             anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => serde_json::json!({
                 "dry_run": true,
                 "status": "would-unforget",
@@ -3681,19 +3767,29 @@ fn cmd_unforget_dry_run(
                 "record_id": record_id,
             }),
         };
+        if cascade_derived {
+            payload["cascade"] = render_unforget_cascade_preview_json(&derived);
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else if let anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) = &preview {
-        let inst = if r.instance.is_empty() {
-            String::new()
-        } else {
-            format!(":{}", r.instance)
-        };
-        println!(
-            "DRY-RUN — would unforget {} (adapter={}{inst}, native_id={})",
-            r.record_id.0, r.adapter, r.native_id
-        );
-        println!("  would write: 1 audit entry, delete 1 tombstone");
-        println!("  (the record itself is NOT resurrected; re-import the source to bring it back)");
+    } else {
+        if let anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) = &preview {
+            let inst = if r.instance.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", r.instance)
+            };
+            println!(
+                "DRY-RUN — would unforget {} (adapter={}{inst}, native_id={})",
+                r.record_id.0, r.adapter, r.native_id
+            );
+            println!("  would write: 1 audit entry, delete 1 tombstone");
+            println!(
+                "  (the record itself is NOT resurrected; re-import the source to bring it back)"
+            );
+        }
+        if cascade_derived {
+            print_unforget_cascade_preview_human(&derived);
+        }
     }
 
     if matches!(
@@ -3705,6 +3801,58 @@ fn cmd_unforget_dry_run(
         ));
     }
     Ok(())
+}
+
+/// R134: render the cascade-preview block on `unforget --dry-run
+/// --cascade-derived --json`. Same per-row shape as the post-commit
+/// renderer; no `would_delete` counts here (descendants are one-row
+/// tombstone DELETEs each).
+fn render_unforget_cascade_preview_json(
+    derived: &[anamnesis_store::DerivedUnforgetPreview],
+) -> serde_json::Value {
+    let derived_records: Vec<serde_json::Value> = derived
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "record_id":    d.record_id.0,
+                "adapter":      d.adapter,
+                "instance":     if d.instance.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(d.instance.clone())
+                },
+                "native_id":    d.native_id,
+                "forgotten_at": d.forgotten_at,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
+/// R134: human cascade-preview lines under the root summary.
+fn print_unforget_cascade_preview_human(derived: &[anamnesis_store::DerivedUnforgetPreview]) {
+    if derived.is_empty() {
+        println!("  cascade-derived (DRY-RUN): no descendant tombstones");
+        return;
+    }
+    println!(
+        "  cascade-derived (DRY-RUN): would remove {} descendant tombstone(s)",
+        derived.len()
+    );
+    for d in derived {
+        let inst = if d.instance.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", d.instance)
+        };
+        println!(
+            "    {} ({}{inst}, native_id={}) — forgotten at {}",
+            d.record_id.0, d.adapter, d.native_id, d.forgotten_at
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

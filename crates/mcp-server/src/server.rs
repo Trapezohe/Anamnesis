@@ -272,6 +272,70 @@ fn render_dedupe_csv(groups: &[anamnesis_store::DuplicateRawHashGroup]) -> Strin
     out
 }
 
+/// Round 134 (PR-78bc): MCP-side renderer for the `cascade` block
+/// attached to `unforget_record { cascade_derived: true }`. Mirrors
+/// the R133 forget cascade renderer shape: `derived_count` plus
+/// per-row record snapshot. Pre-R134 tombstones (NULL `derived_from`)
+/// produce an empty list; the wrapper block still tells the caller
+/// "I asked for cascade".
+fn render_unforget_cascade_json(derived: &[anamnesis_store::DerivedUnforgetRecord]) -> Value {
+    let derived_records: Vec<Value> = derived
+        .iter()
+        .map(|d| {
+            json!({
+                "record_id":    d.record_id.0,
+                "adapter":      d.adapter,
+                "instance":     if d.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(d.instance.clone())
+                },
+                "native_id":    d.native_id,
+                "native_path":  d.native_path,
+                "raw_hash":     d.raw_hash,
+                "reason":       d.reason,
+                "forgotten_at": d.forgotten_at,
+            })
+        })
+        .collect();
+    json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
+/// Round 134 (PR-78bc): MCP-side renderer for the dry-run cascade
+/// preview on `unforget_record`. Same shape as the post-commit
+/// renderer; no `would_delete` per-row count block because each
+/// descendant is a single-tombstone DELETE.
+fn render_unforget_cascade_preview_json(
+    derived: &[anamnesis_store::DerivedUnforgetPreview],
+) -> Value {
+    let derived_records: Vec<Value> = derived
+        .iter()
+        .map(|d| {
+            json!({
+                "record_id":    d.record_id.0,
+                "adapter":      d.adapter,
+                "instance":     if d.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(d.instance.clone())
+                },
+                "native_id":    d.native_id,
+                "native_path":  d.native_path,
+                "raw_hash":     d.raw_hash,
+                "reason":       d.reason,
+                "forgotten_at": d.forgotten_at,
+            })
+        })
+        .collect();
+    json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
 /// Round 132 (PR-78ba): render near-dedupe groups as a flat CSV
 /// string for `dedupe { mode: "near", csv: true }`. Same redaction
 /// discipline as R107 — no `raw_hash`, no `native_path` — plus
@@ -2061,15 +2125,78 @@ impl AnamnesisServer {
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 134 (PR-78bc): opt-in cascade through
+        // `record_tombstones.derived_from`. Default false → fully
+        // back-compat. Pre-R134 tombstones (NULL derived_from) just
+        // surface an empty `cascade.derived_records` list.
+        let cascade_derived = args
+            .get("cascade_derived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let opts = anamnesis_store::UnforgetCascadeOptions { cascade_derived };
+
         if dry_run {
-            let preview = self
+            let cascade_preview = self
                 .store
-                .preview_unforget_record(&RecordId(record_id.to_string()))
+                .preview_unforget_record_with_options(&RecordId(record_id.to_string()), &opts)
                 .map_err(|e| format!("unforget_record: {e}"))?;
+            let preview = cascade_preview.root;
+            let derived = cascade_preview.derived;
             return match preview {
-                anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => Ok(json!({
-                    "dry_run":             true,
-                    "outcome":             "would-unforget",
+                anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => {
+                    let mut payload = json!({
+                        "dry_run":             true,
+                        "outcome":             "would-unforget",
+                        "record_id":           r.record_id.0,
+                        "adapter":             r.adapter,
+                        "instance":            if r.instance.is_empty() { Value::Null } else { Value::String(r.instance) },
+                        "native_id":           r.native_id,
+                        "forgotten_at":        r.forgotten_at,
+                        "record_resurrected":  false,
+                        "requires_reimport":   true,
+                        "would_delete":        { "record_tombstones": 1 },
+                        "would_insert":        { "audit_log_entries": 1 },
+                    });
+                    if cascade_derived {
+                        payload["cascade"] = render_unforget_cascade_preview_json(&derived);
+                    }
+                    Ok(payload)
+                }
+                anamnesis_store::UnforgetRecordOutcome::NotForgotten => Err(format!(
+                    "unforget_record: no tombstone for id {record_id:?} — nothing to unforget (dry-run)"
+                )),
+            };
+        }
+
+        let cascade_outcome = self
+            .store
+            .unforget_record_with_options(&RecordId(record_id.to_string()), &opts)
+            .map_err(|e| format!("unforget_record: {e}"))?;
+        let outcome = cascade_outcome.root;
+        let derived = cascade_outcome.derived;
+
+        let mut audit_detail = json!({
+            "record_id": record_id,
+            "outcome": match &outcome {
+                anamnesis_store::UnforgetRecordOutcome::Unforgotten(_) => "unforgotten",
+                anamnesis_store::UnforgetRecordOutcome::NotForgotten   => "not-forgotten",
+            },
+            "via": "mcp",
+        });
+        if cascade_derived {
+            audit_detail["cascade_derived"] = json!(true);
+            audit_detail["derived_record_ids"] = json!(derived
+                .iter()
+                .map(|d| d.record_id.0.clone())
+                .collect::<Vec<_>>());
+        }
+        anamnesis_core::Audit::new(&self.data_dir)
+            .record(anamnesis_core::AuditEntry::new("unforget", audit_detail));
+
+        match outcome {
+            anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => {
+                let mut payload = json!({
+                    "outcome":             "unforgotten",
                     "record_id":           r.record_id.0,
                     "adapter":             r.adapter,
                     "instance":            if r.instance.is_empty() { Value::Null } else { Value::String(r.instance) },
@@ -2077,43 +2204,12 @@ impl AnamnesisServer {
                     "forgotten_at":        r.forgotten_at,
                     "record_resurrected":  false,
                     "requires_reimport":   true,
-                    "would_delete":        { "record_tombstones": 1 },
-                    "would_insert":        { "audit_log_entries": 1 },
-                })),
-                anamnesis_store::UnforgetRecordOutcome::NotForgotten => Err(format!(
-                    "unforget_record: no tombstone for id {record_id:?} — nothing to unforget (dry-run)"
-                )),
-            };
-        }
-
-        let outcome = self
-            .store
-            .unforget_record(&RecordId(record_id.to_string()))
-            .map_err(|e| format!("unforget_record: {e}"))?;
-
-        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
-            "unforget",
-            json!({
-                "record_id": record_id,
-                "outcome": match &outcome {
-                    anamnesis_store::UnforgetRecordOutcome::Unforgotten(_) => "unforgotten",
-                    anamnesis_store::UnforgetRecordOutcome::NotForgotten   => "not-forgotten",
-                },
-                "via": "mcp",
-            }),
-        ));
-
-        match outcome {
-            anamnesis_store::UnforgetRecordOutcome::Unforgotten(r) => Ok(json!({
-                "outcome":             "unforgotten",
-                "record_id":           r.record_id.0,
-                "adapter":             r.adapter,
-                "instance":            if r.instance.is_empty() { Value::Null } else { Value::String(r.instance) },
-                "native_id":           r.native_id,
-                "forgotten_at":        r.forgotten_at,
-                "record_resurrected":  false,
-                "requires_reimport":   true,
-            })),
+                });
+                if cascade_derived {
+                    payload["cascade"] = render_unforget_cascade_json(&derived);
+                }
+                Ok(payload)
+            }
             anamnesis_store::UnforgetRecordOutcome::NotForgotten => Err(format!(
                 "unforget_record: no tombstone for id {record_id:?} — nothing to unforget"
             )),
@@ -3911,7 +4007,11 @@ fn tools_list_payload_all() -> Value {
                                 come back if the source re-emits.' Anamnesis stays a read-only \
                                 mirror; resurrection happens through the source's own re-import, \
                                 not through this tool. ADMIN-GATED. Calling with an id that has \
-                                no tombstone is a tool error (likely typo from `list_forgotten`).",
+                                no tombstone is a tool error (likely typo from `list_forgotten`). \
+                                Round 134: pass `cascade_derived: true` to also remove every \
+                                descendant tombstone the matching R133 `forget --cascade-derived` \
+                                wrote. Cascade only deletes tombstones — re-import (or re-extract \
+                                for derived rows) is still required to bring the data back.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -3926,7 +4026,22 @@ fn tools_list_payload_all() -> Value {
                             "description": "Round 95: preview the tombstone the real unforget would delete. \
                                             Returns `outcome: \"would-unforget\"` plus `would_delete.record_tombstones=1` \
                                             and `would_insert.audit_log_entries=1`. Does NOT mutate the store and does NOT \
-                                            append an audit entry. Symmetric with `forget_record { dry_run: true }`."
+                                            append an audit entry. Symmetric with `forget_record { dry_run: true }`. \
+                                            Round 134: combine with `cascade_derived: true` to preview the descendant \
+                                            tombstones under `cascade.derived_records[]`."
+                        },
+                        "cascade_derived": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 134: also remove every descendant tombstone the matching R133 \
+                                            `forget_record { cascade_derived: true }` wrote (via the new \
+                                            `record_tombstones.derived_from` column). When true, the response carries a \
+                                            `cascade` block with `derived_count` and `derived_records[]` (record_id, \
+                                            adapter, instance, native_id, native_path, raw_hash, reason, forgotten_at). \
+                                            The audit-log entry also includes `cascade_derived: true` and \
+                                            `derived_record_ids[]`. Pre-R134 tombstones with NULL `derived_from` surface \
+                                            as zero-descendant cascade outcomes — root unforget still works. Default \
+                                            false → fully back-compat."
                         }
                     },
                     "required": ["record_id"]
