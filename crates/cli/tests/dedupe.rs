@@ -1184,3 +1184,195 @@ fn dedupe_near_empty_store_says_so() {
         .success()
         .stdout(contains("no near-duplicate groups"));
 }
+
+// ─── Round 141 PR-78bj: dedupe --mode near --merge-preview ──────────
+
+/// Happy path: with the same paraphrase fixture R132 uses, the
+/// merge-preview block proposes one keeper and one forget loser.
+/// User tags on a record force it to win regardless of recency.
+#[test]
+fn dedupe_near_merge_preview_user_tag_wins_over_recency() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    // First find the records via near-dedupe (no preview) so we
+    // can tag one — then re-run WITH preview and confirm the
+    // tagged record is the keeper.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let group = &v["groups"][0];
+    // Tag the mem0 record — but only if it's the OLDER one so the
+    // preview must override recency to honour the tag.
+    let mem0_id = group["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["adapter"] == "mem0")
+        .unwrap()["record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "tag-record",
+            &mem0_id,
+            "important",
+            "keep-forever",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--merge-preview", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["merge_preview_included"], true);
+    let group = &v["groups"][0];
+    let preview = &group["merge_preview"];
+    assert_eq!(
+        preview["keep_record_id"], mem0_id,
+        "tagged record must win: {preview}"
+    );
+    assert_eq!(preview["forget_record_ids"].as_array().unwrap().len(), 1);
+    // proposed_derived_from edges point losers → keeper.
+    let edges = preview["proposed_derived_from"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["to"], mem0_id);
+    // ranking[] has 2 rows: rank 1 (keep) + rank 2 (forget).
+    let ranking = preview["ranking"].as_array().unwrap();
+    assert_eq!(ranking.len(), 2);
+    assert_eq!(ranking[0]["rank"], 1);
+    assert_eq!(ranking[0]["decision"], "keep");
+    assert_eq!(ranking[0]["user_tag_count"], 2);
+    assert_eq!(ranking[1]["rank"], 2);
+    assert_eq!(ranking[1]["decision"], "forget");
+    assert_eq!(ranking[1]["user_tag_count"], 0);
+}
+
+/// Privacy canary: --merge-preview must NOT leak content,
+/// raw_hash, native_path, or user-tag names. Only counts +
+/// metadata-derived ranking signals.
+#[test]
+fn dedupe_near_merge_preview_does_not_leak_sensitive_fields() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    // Tag with a sensitive name to make sure the name itself
+    // never appears in the merge-preview output.
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let any_id = v["groups"][0]["records"][0]["record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "tag-record",
+            &any_id,
+            "private-vault-token-secret",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--merge-preview", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for forbidden in [
+        "thorough error handling",    // content body marker
+        "integration tests",          // content body marker
+        "near-raw-mem0",              // raw_hash marker
+        "near-raw-cc",                // raw_hash marker
+        "/tmp/mem0/rec-a.md",         // native_path marker
+        "/tmp/claude-code/rec-b.md",  // native_path marker
+        "private-vault-token-secret", // tag NAME marker
+        "raw_hash",                   // field name leak
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "merge-preview must not leak {forbidden:?}: {stdout}"
+        );
+    }
+}
+
+/// `--merge-preview` without `--mode near` errors with a clear
+/// pointer at the right mode.
+#[test]
+fn dedupe_merge_preview_requires_near_mode() {
+    let data = tmp_dir();
+    init_db(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--merge-preview"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "must reject exact + merge-preview");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("--mode near"),
+        "error must point at near: {stderr}"
+    );
+}
+
+/// `--mode near --merge-preview --csv` errors: nested decision
+/// draft doesn't flatten safely.
+#[test]
+fn dedupe_near_merge_preview_rejects_csv() {
+    let data = tmp_dir();
+    init_db(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--merge-preview", "--csv"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "error must surface the conflict: {stderr}"
+    );
+}
+
+/// Default near dedupe (no `--merge-preview`) wire shape stays
+/// back-compat — no `merge_preview` key on groups, top-level
+/// `merge_preview_included: false`.
+#[test]
+fn dedupe_near_default_json_back_compat_without_merge_preview() {
+    let data = tmp_dir();
+    init_db(data.path());
+    seed_near_dup_paraphrases(data.path());
+
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args(["dedupe", "--mode", "near", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["merge_preview_included"], false);
+    let group = &v["groups"][0];
+    assert!(
+        group.get("merge_preview").is_none(),
+        "no flag → no merge_preview block: {group}"
+    );
+}

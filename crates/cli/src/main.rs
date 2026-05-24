@@ -12,6 +12,12 @@
 // one implementation. The CLI is now just clap-parsing + audit
 // glue around `anamnesis_export::run_export`.
 
+// Round 141 (PR-78bj): `dedupe --mode near --merge-preview` —
+// operator-decision tooling that closes the loop on R131/R132's
+// detector. Picks a winner per group with a deterministic
+// ranking heuristic; preview-only.
+mod near_merge_preview;
+
 use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
@@ -325,6 +331,18 @@ enum Command {
         /// has no cross-source notion).
         #[arg(long)]
         include_near_self: bool,
+        /// Round 141 (PR-78bj): `--mode near` only — augment
+        /// each group with a deterministic ranking heuristic
+        /// proposing which record to keep, which to forget, and
+        /// the `provenance.derived_from` edge a future merge
+        /// would write. Read-only: ranks on existing metadata
+        /// (user-tag count, effective_at, has_native_path,
+        /// adapter, id) — never reads record content. Operator
+        /// action stays `anamnesis forget <record_id>`.
+        /// `--csv` + `--merge-preview` is rejected (nested
+        /// decision draft doesn't flatten safely).
+        #[arg(long)]
+        merge_preview: bool,
     },
 
     /// Round 135 (PR-78bd): list cross-adapter `native_id`
@@ -1201,6 +1219,7 @@ async fn run() -> Result<()> {
             include_counts,
             csv,
             include_near_self,
+            merge_preview,
         } => cmd_dedupe(
             &data_dir,
             mode,
@@ -1212,6 +1231,7 @@ async fn run() -> Result<()> {
             include_counts,
             csv,
             include_near_self,
+            merge_preview,
         ),
         Command::Conflicts {
             source,
@@ -4179,7 +4199,22 @@ fn cmd_dedupe(
     include_counts: bool,
     csv: bool,
     include_near_self: bool,
+    merge_preview: bool,
 ) -> Result<()> {
+    // Round 141 (PR-78bj): `--merge-preview` is near-only and
+    // JSON/human-only. Refuse `exact` (no per-group ranking to
+    // propose) and refuse `csv` (the nested decision draft
+    // doesn't flatten safely into a flat row format).
+    if merge_preview && matches!(mode, DedupeMode::Exact) {
+        return Err(anyhow!(
+            "--merge-preview requires --mode near: the exact path has no per-group ranking to propose."
+        ));
+    }
+    if merge_preview && csv {
+        return Err(anyhow!(
+            "--merge-preview and --csv are mutually exclusive — the per-group ranking draft is a nested object that doesn't flatten safely. Use --merge-preview --json or omit --csv."
+        ));
+    }
     // Round 132 (PR-78ba): near mode is privacy-safe by
     // construction — it never touches raw_hash or native_path —
     // so `--include-sensitive` and `--include-counts` have
@@ -4231,6 +4266,7 @@ fn cmd_dedupe(
             json,
             csv,
             include_near_self,
+            merge_preview,
         );
     }
 
@@ -4519,6 +4555,7 @@ fn render_dedupe_counts_json(c: &anamnesis_store::DuplicateRawHashCounts) -> ser
 ///   ]
 /// }
 /// ```
+#[allow(clippy::too_many_arguments)]
 fn cmd_dedupe_near(
     data_dir: &std::path::Path,
     source: Option<&str>,
@@ -4527,6 +4564,7 @@ fn cmd_dedupe_near(
     json: bool,
     csv: bool,
     include_near_self: bool,
+    merge_preview: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
     let filter = anamnesis_store::NearDuplicateFilter {
@@ -4537,6 +4575,26 @@ fn cmd_dedupe_near(
     };
     let groups = anamnesis_store::list_near_duplicates(&store, &filter)?;
     let effective_limit = limit.clamp(1, anamnesis_store::NEAR_DEDUPE_MAX_LIMIT);
+
+    // Round 141 (PR-78bj): batch-fetch user-tag counts for every
+    // record across every group. One round-trip instead of N, and
+    // the count map is what `build_merge_preview` consumes. Always
+    // computed (cheap) so the human path can also render the
+    // ranking; the JSON path attaches a `merge_preview` block per
+    // group only when the operator explicitly asked.
+    let all_ids: Vec<anamnesis_core::model::RecordId> = groups
+        .iter()
+        .flat_map(|g| g.records.iter().map(|r| r.record_id.clone()))
+        .collect();
+    let tags_map = if all_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        store.user_tags_by_ids(&all_ids)?
+    };
+    let tag_counts: std::collections::HashMap<String, u32> = tags_map
+        .into_iter()
+        .map(|(id, tags)| (id.0, tags.len() as u32))
+        .collect();
 
     if csv {
         // R107-style flat CSV. Header carries the per-group
@@ -4605,13 +4663,14 @@ fn cmd_dedupe_near(
             "format": "json",
             "mode": "near",
             "limit": effective_limit,
+            "merge_preview_included": merge_preview,
             "filter": {
                 "source": source,
                 "instance": instance,
                 "require_cross_source": !include_near_self,
             },
             "groups": groups.iter().map(|g| {
-                serde_json::json!({
+                let mut group_json = serde_json::json!({
                     "record_count": g.records.len(),
                     "min_similarity": g.min_similarity,
                     "max_distance": g.max_distance,
@@ -4624,7 +4683,43 @@ fn cmd_dedupe_near(
                         "updated_at":      r.updated_at,
                         "has_native_path": r.has_native_path,
                     })).collect::<Vec<_>>(),
-                })
+                });
+                if merge_preview {
+                    if let Some(preview) = near_merge_preview::build_merge_preview(g, &tag_counts) {
+                        // proposed_derived_from: every loser gets
+                        // an edge pointing at the keeper, modelling
+                        // what a future merge mutation would write
+                        // into `provenance.derived_from`.
+                        let proposed_edges: Vec<serde_json::Value> = preview
+                            .forget_record_ids
+                            .iter()
+                            .map(|loser| serde_json::json!({
+                                "from": loser.0,
+                                "to":   preview.keep_record_id.0,
+                            }))
+                            .collect();
+                        let ranking_json: Vec<serde_json::Value> = preview
+                            .ranking
+                            .iter()
+                            .map(|r| serde_json::json!({
+                                "rank":            r.rank,
+                                "record_id":       r.record.record_id.0,
+                                "adapter":         r.record.adapter,
+                                "decision":        r.decision,
+                                "user_tag_count":  r.user_tag_count,
+                                "effective_at":    r.effective_at,
+                                "has_native_path": r.has_native_path,
+                            }))
+                            .collect();
+                        group_json["merge_preview"] = serde_json::json!({
+                            "keep_record_id":         preview.keep_record_id.0,
+                            "forget_record_ids":      preview.forget_record_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+                            "proposed_derived_from":  proposed_edges,
+                            "ranking":                ranking_json,
+                        });
+                    }
+                }
+                group_json
             }).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -4678,6 +4773,20 @@ fn cmd_dedupe_near(
                 "    {} ({}{inst}, native_id={}, created_at={})",
                 r.record_id.0, r.adapter, r.native_id, r.created_at
             );
+        }
+        if merge_preview {
+            if let Some(preview) = near_merge_preview::build_merge_preview(g, &tag_counts) {
+                println!("    merge-preview:");
+                println!("      keep:   {}", preview.keep_record_id.0);
+                for loser in &preview.forget_record_ids {
+                    println!("      forget: {}", loser.0);
+                }
+                println!(
+                    "      proposed derived_from: {} edge(s) → {}",
+                    preview.forget_record_ids.len(),
+                    preview.keep_record_id.0
+                );
+            }
         }
         println!();
     }
