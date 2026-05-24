@@ -87,6 +87,77 @@ fn forget_payload(outcome: &str, r: anamnesis_store::ForgottenRecord) -> Value {
     })
 }
 
+/// Round 133 (PR-78bb): MCP-side renderer for the `cascade` block
+/// attached to `forget_record { cascade_derived: true }`. Mirrors
+/// the CLI helper — `derived_count` + per-row record snapshot
+/// (record_id / adapter / instance / native_id / forgotten_at /
+/// was_already_forgotten). `raw_hash` and `native_path` stay
+/// available because this tool is admin-gated, same ACL as the
+/// root record.
+fn render_forget_cascade_json(derived: &[anamnesis_store::DerivedForgetRecord]) -> Value {
+    let derived_records: Vec<Value> = derived
+        .iter()
+        .map(|d| {
+            json!({
+                "record_id":             d.record_id.0,
+                "adapter":               d.adapter,
+                "instance":              if d.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(d.instance.clone())
+                },
+                "native_id":             d.native_id,
+                "native_path":           d.native_path,
+                "raw_hash":              d.raw_hash,
+                "forgotten_at":          d.forgotten_at,
+                "was_already_forgotten": d.was_already_forgotten,
+            })
+        })
+        .collect();
+    json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
+/// Round 133 (PR-78bb): MCP-side renderer for the dry-run cascade
+/// preview. Per-row `would_delete` mirrors the root's per-table
+/// count shape; `already_forgotten_at` is `null` when the cascade
+/// would write a fresh tombstone, integer when one already exists.
+fn render_forget_cascade_preview_json(derived: &[anamnesis_store::DerivedForgetPreview]) -> Value {
+    let derived_records: Vec<Value> = derived
+        .iter()
+        .map(|d| {
+            json!({
+                "record_id":             d.record_id.0,
+                "adapter":               d.adapter,
+                "instance":              if d.instance.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(d.instance.clone())
+                },
+                "native_id":             d.native_id,
+                "native_path":           d.native_path,
+                "raw_hash":              d.raw_hash,
+                "would_delete": {
+                    "records":          d.would_delete.records,
+                    "raw_artifacts":    d.would_delete.raw_artifacts,
+                    "record_chunks":    d.would_delete.record_chunks,
+                    "chunk_embeddings": d.would_delete.chunk_embeddings,
+                    "embedding_jobs":   d.would_delete.embedding_jobs,
+                    "user_record_tags": d.would_delete.user_record_tags,
+                    "vec0_rows":        d.would_delete.vec0_rows,
+                },
+                "already_forgotten_at":  d.already_forgotten_at,
+            })
+        })
+        .collect();
+    json!({
+        "derived_count":   derived.len(),
+        "derived_records": derived_records,
+    })
+}
+
 /// Round 105 (PR-78aa): CSV-shape rules shared by every MCP
 /// CSV renderer (audit_tail in R92, list_forgotten in R105).
 /// Quote + double inner-quote when the field contains `,`,
@@ -1873,61 +1944,94 @@ impl AnamnesisServer {
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Round 133 (PR-78bb): opt-in cascade through
+        // `provenance.derived_from`. Default false → fully
+        // back-compat. Same semantics as CLI `--cascade-derived`.
+        let cascade_derived = args
+            .get("cascade_derived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let opts = anamnesis_store::ForgetCascadeOptions { cascade_derived };
 
         if dry_run {
-            let preview = self
+            let cascade_preview = self
                 .store
-                .preview_forget_record(&RecordId(record_id.to_string()), reason.as_deref())
+                .preview_forget_record_with_options(
+                    &RecordId(record_id.to_string()),
+                    reason.as_deref(),
+                    &opts,
+                )
                 .map_err(|e| format!("forget_record: {e}"))?;
-            return match preview {
+            let preview = cascade_preview.root;
+            let derived = cascade_preview.derived;
+            let mut payload = match preview {
                 anamnesis_store::ForgetRecordPreview::WouldForget {
                     would_delete,
                     tombstone_preview,
-                } => Ok(forget_dry_run_payload(
-                    "would-forget",
-                    &would_delete,
-                    &tombstone_preview,
-                )),
+                } => forget_dry_run_payload("would-forget", &would_delete, &tombstone_preview),
                 anamnesis_store::ForgetRecordPreview::AlreadyForgotten(r) => {
                     let mut p = forget_payload("already-forgotten", r);
                     p["dry_run"] = json!(true);
-                    Ok(p)
+                    p
                 }
-                anamnesis_store::ForgetRecordPreview::NotFound => Err(format!(
-                    "forget_record: no record with id {record_id:?} — nothing to forget (dry-run)"
-                )),
+                anamnesis_store::ForgetRecordPreview::NotFound => {
+                    return Err(format!(
+                        "forget_record: no record with id {record_id:?} — nothing to forget (dry-run)"
+                    ));
+                }
             };
+            if cascade_derived {
+                payload["cascade"] = render_forget_cascade_preview_json(&derived);
+            }
+            return Ok(payload);
         }
 
-        let outcome = self
+        let cascade_outcome = self
             .store
-            .forget_record(&RecordId(record_id.to_string()), reason.as_deref())
+            .forget_record_with_options(&RecordId(record_id.to_string()), reason.as_deref(), &opts)
             .map_err(|e| format!("forget_record: {e}"))?;
+        let outcome = cascade_outcome.root;
+        let derived = cascade_outcome.derived;
 
         // Mirror the CLI's audit entry shape so operator history is
         // entrypoint-agnostic (`anamnesis audit list` shows MCP and
-        // CLI forgets the same way). Same on-demand `Audit::new` the
-        // import path uses — keeps the server struct slim.
-        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
-            "forget",
-            json!({
-                "record_id": record_id,
-                "reason":    reason,
-                "outcome": match &outcome {
-                    anamnesis_store::ForgetRecordOutcome::Forgotten(_)        => "forgotten",
-                    anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(_) => "already-forgotten",
-                    anamnesis_store::ForgetRecordOutcome::NotFound            => "not-found",
-                },
-                "via": "mcp",
-            }),
-        ));
+        // CLI forgets the same way). Round 133 adds
+        // `cascade_derived` + `derived_record_ids` to keep the audit
+        // chain truthful about the full blast radius.
+        let mut audit_detail = json!({
+            "record_id": record_id,
+            "reason":    reason,
+            "outcome": match &outcome {
+                anamnesis_store::ForgetRecordOutcome::Forgotten(_)        => "forgotten",
+                anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(_) => "already-forgotten",
+                anamnesis_store::ForgetRecordOutcome::NotFound            => "not-found",
+            },
+            "via": "mcp",
+        });
+        if cascade_derived {
+            audit_detail["cascade_derived"] = json!(true);
+            audit_detail["derived_record_ids"] = json!(derived
+                .iter()
+                .map(|d| d.record_id.0.clone())
+                .collect::<Vec<_>>());
+        }
+        anamnesis_core::Audit::new(&self.data_dir)
+            .record(anamnesis_core::AuditEntry::new("forget", audit_detail));
 
         match outcome {
             anamnesis_store::ForgetRecordOutcome::Forgotten(r) => {
-                Ok(forget_payload("forgotten", r))
+                let mut p = forget_payload("forgotten", r);
+                if cascade_derived {
+                    p["cascade"] = render_forget_cascade_json(&derived);
+                }
+                Ok(p)
             }
             anamnesis_store::ForgetRecordOutcome::AlreadyForgotten(r) => {
-                Ok(forget_payload("already-forgotten", r))
+                let mut p = forget_payload("already-forgotten", r);
+                if cascade_derived {
+                    p["cascade"] = render_forget_cascade_json(&derived);
+                }
+                Ok(p)
             }
             anamnesis_store::ForgetRecordOutcome::NotFound => Err(format!(
                 "forget_record: no record with id {record_id:?} — nothing to forget"
@@ -3756,7 +3860,11 @@ fn tools_list_payload_all() -> Value {
                                 Does NOT modify any upstream source data — Anamnesis stays \
                                 read-only with respect to the original Claude Code memory file / \
                                 mem0 row / etc. Calling with an unknown `record_id` is a tool error \
-                                (no tombstone was written, so the guarantee cannot be made).",
+                                (no tombstone was written, so the guarantee cannot be made). \
+                                Round 133: pass `cascade_derived: true` to also tombstone every \
+                                record that transitively claims this one via \
+                                `provenance.derived_from`. Closes the gap where forgetting an \
+                                Episode left Stage-2-extracted Facts / Preferences / Skills live.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -3776,7 +3884,20 @@ fn tools_list_payload_all() -> Value {
                                             \"would-forget\"` plus `would_delete` (records, raw_artifacts, \
                                             record_chunks, chunk_embeddings, embedding_jobs, user_record_tags, \
                                             vec0_rows) and `would_insert` (record_tombstones, audit_log_entries). \
-                                            Does NOT mutate the store and does NOT append an audit entry."
+                                            Does NOT mutate the store and does NOT append an audit entry. \
+                                            Round 133: combine with `cascade_derived: true` to also preview \
+                                            the per-descendant `would_delete` block under `cascade.derived_records[]`."
+                        },
+                        "cascade_derived": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 133: also forget every record that transitively claims \
+                                            this one in `provenance.derived_from`. When true, the response \
+                                            carries a `cascade` block with `derived_count` and `derived_records[]` \
+                                            (record_id, adapter, instance, native_id, native_path, raw_hash, \
+                                            forgotten_at, was_already_forgotten). The audit-log entry also \
+                                            includes `cascade_derived: true` and `derived_record_ids[]`. \
+                                            Default false → fully back-compat with the R72 behaviour."
                         }
                     },
                     "required": ["record_id"]
