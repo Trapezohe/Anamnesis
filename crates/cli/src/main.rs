@@ -25,7 +25,36 @@ use anamnesis_importer::{ImportOptions, ImportService};
 use anamnesis_search::{pack, ContextBudget, HybridOpts, HybridSearcher, SearchMode};
 use anamnesis_store::Store;
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Round 132 (PR-78ba): pick the dedupe detector. `exact` is the
+/// R77 byte-equal `raw_hash` grouper (default, fully back-compat).
+/// `near` is the R131 SimHash + LSH + Jaccard cross-adapter
+/// near-duplicate detector. Default-on cross-source filter keeps
+/// near surfaces aligned with the interoperability mission.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum DedupeMode {
+    /// R77 raw_hash byte-equal grouping. Catches only identical
+    /// source payloads; misses cross-adapter paraphrases.
+    Exact,
+    /// R131 SimHash + LSH + Jaccard. Catches cross-adapter
+    /// paraphrases (mem0 vs claude-code on the same memory)
+    /// that `exact` can't see. Defaults to cross-source-only
+    /// groups; pass `--include-near-self` to also surface
+    /// within-adapter near-dups.
+    Near,
+}
+
+impl DedupeMode {
+    /// Wire-shape label used in JSON / CSV payloads and human
+    /// summaries so a script can branch on `payload.mode`.
+    fn wire_label(self) -> &'static str {
+        match self {
+            DedupeMode::Exact => "exact",
+            DedupeMode::Near => "near",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -218,10 +247,21 @@ enum Command {
     /// are omitted; only reported as `has_*` booleans (JSON) /
     /// hidden (human). Pass `--include-sensitive` to reveal.
     ///
-    /// Naming caveat: this is *exact* duplicate detection (raw
-    /// payload bytes). Semantic / near-duplicate is a much bigger
-    /// product decision and explicitly out of scope.
+    /// Two modes (Round 132): `--mode exact` (default, R77
+    /// `raw_hash` byte-equal) and `--mode near` (R131
+    /// SimHash + LSH + Jaccard cross-adapter near-duplicate
+    /// detection). Near defaults to cross-source-only groups —
+    /// the interop-relevant case raw_hash can't catch because
+    /// adapters differ in punctuation / prefixes / tokenization.
     Dedupe {
+        /// Round 132 (PR-78ba): pick the detector. `exact` is
+        /// the R77 raw_hash byte-equal grouper (default, fully
+        /// back-compat). `near` is the R131 SimHash + LSH +
+        /// Jaccard cross-adapter near-duplicate detector and
+        /// defaults to cross-source-only groups (the interop-
+        /// relevant case raw_hash can't catch).
+        #[arg(long, value_enum, default_value_t = DedupeMode::Exact)]
+        mode: DedupeMode,
         /// Scope to duplicate groups that include ≥1 record from
         /// this adapter (e.g. `mem0`, `claude-code`). Round 104:
         /// also accepts a comma-separated OR list
@@ -270,6 +310,14 @@ enum Command {
         /// membership without leaking the hash.
         #[arg(long, conflicts_with = "json")]
         csv: bool,
+        /// Round 132 (PR-78ba): `--mode near` only — opt out of
+        /// the default cross-source filter and surface
+        /// within-adapter near-duplicates too. Equivalent to
+        /// `NearDuplicateFilter::require_cross_source = false`.
+        /// Ignored under `--mode exact` (raw_hash detection
+        /// has no cross-source notion).
+        #[arg(long)]
+        include_near_self: bool,
     },
 
     /// Remove a tombstone so the source can resurrect the memory
@@ -1062,6 +1110,7 @@ async fn run() -> Result<()> {
             include_stats,
         ),
         Command::Dedupe {
+            mode,
             source,
             instance,
             limit,
@@ -1069,8 +1118,10 @@ async fn run() -> Result<()> {
             include_sensitive,
             include_counts,
             csv,
+            include_near_self,
         } => cmd_dedupe(
             &data_dir,
+            mode,
             source.as_deref(),
             instance.as_deref(),
             limit,
@@ -1078,6 +1129,7 @@ async fn run() -> Result<()> {
             include_sensitive,
             include_counts,
             csv,
+            include_near_self,
         ),
         Command::Unforget {
             record_id,
@@ -3604,6 +3656,7 @@ fn filter_label(source: Option<&str>, instance: Option<&str>) -> String {
 #[allow(clippy::too_many_arguments)]
 fn cmd_dedupe(
     data_dir: &std::path::Path,
+    mode: DedupeMode,
     source: Option<&str>,
     instance: Option<&str>,
     limit: u32,
@@ -3611,7 +3664,30 @@ fn cmd_dedupe(
     include_sensitive: bool,
     include_counts: bool,
     csv: bool,
+    include_near_self: bool,
 ) -> Result<()> {
+    // Round 132 (PR-78ba): near mode is privacy-safe by
+    // construction — it never touches raw_hash or native_path —
+    // so `--include-sensitive` and `--include-counts` have
+    // nothing meaningful to add. Refuse them loudly so an
+    // operator notices the mismatch instead of seeing a
+    // silently-ignored flag.
+    if matches!(mode, DedupeMode::Near) && include_sensitive {
+        return Err(anyhow!(
+            "--mode near and --include-sensitive are mutually exclusive — near-dedupe never reads `raw_hash` / `native_path`, so there is nothing sensitive to reveal."
+        ));
+    }
+    if matches!(mode, DedupeMode::Near) && include_counts {
+        return Err(anyhow!(
+            "--mode near and --include-counts are mutually exclusive — the `counts` aggregate is exact-dedupe specific. Drop --include-counts (group cardinality is already on each near group)."
+        ));
+    }
+    if matches!(mode, DedupeMode::Exact) && include_near_self {
+        return Err(anyhow!(
+            "--include-near-self only applies to --mode near (it opts out of the cross-source filter that is unique to near-dedupe)."
+        ));
+    }
+
     // Round 107 (PR-78ac): runtime guards for the CSV
     // conflicts clap can't carry without flirting with the
     // Windows stack-overflow we fixed in R106. `--csv --json`
@@ -3627,6 +3703,21 @@ fn cmd_dedupe(
         return Err(anyhow!(
             "--csv and --include-counts are mutually exclusive — CSV is flat redacted rows. Drop --csv to get the counts block back."
         ));
+    }
+
+    if matches!(mode, DedupeMode::Near) {
+        // Defer to the dedicated near-dedupe path — it doesn't
+        // share the raw_hash projection so we keep the branches
+        // separate rather than papering over with `if` ladders.
+        return cmd_dedupe_near(
+            data_dir,
+            source,
+            instance,
+            limit,
+            json,
+            csv,
+            include_near_self,
+        );
     }
 
     let store = Store::open(db_path(data_dir))?;
@@ -3734,6 +3825,12 @@ fn cmd_dedupe(
             "summary": summary,
             "count": groups.len(),
             "format": "json",
+            // Round 132 (PR-78ba): wire-shape mode discriminator
+            // pairs with the new `dedupe --mode near` branch so a
+            // script can switch on `payload.mode` without inspecting
+            // which fields are present. Always emitted; default
+            // back-compat value is `"exact"`.
+            "mode": mode.wire_label(),
             "limit": effective_limit,
             "sensitive_included": include_sensitive,
             "filter": {
@@ -3872,6 +3969,208 @@ fn render_dedupe_counts_json(c: &anamnesis_store::DuplicateRawHashCounts) -> ser
             "duplicate_record_count": b.duplicate_record_count,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Round 132 (PR-78ba): `anamnesis dedupe --mode near` — wraps the
+/// R131 cross-source near-duplicate algorithm (SimHash + LSH +
+/// Jaccard) in the CLI's standard redacted-summary discipline. No
+/// `--include-sensitive` / `--include-counts` paths: the algorithm
+/// never reads `raw_hash` / `native_path` and there is no
+/// raw_hash-style aggregate to surface.
+///
+/// JSON wire shape:
+/// ```text
+/// {
+///   "format": "json",
+///   "mode": "near",
+///   "summary": "<human discovery summary>",
+///   "count": <groups returned>,
+///   "limit": <clamped limit>,
+///   "filter": {
+///     "source": <raw input | null>,
+///     "instance": <raw input | null>,
+///     "require_cross_source": <bool>
+///   },
+///   "groups": [
+///     {
+///       "record_count": N,
+///       "min_similarity": <f64 in [0.6, 1.0]>,
+///       "max_distance": <u32 in [0, 8]>,
+///       "records": [{
+///         "record_id", "adapter", "instance" (null for default),
+///         "native_id", "created_at", "updated_at",
+///         "has_native_path"
+///       }, ...]
+///     }, ...
+///   ]
+/// }
+/// ```
+fn cmd_dedupe_near(
+    data_dir: &std::path::Path,
+    source: Option<&str>,
+    instance: Option<&str>,
+    limit: u32,
+    json: bool,
+    csv: bool,
+    include_near_self: bool,
+) -> Result<()> {
+    let store = Store::open(db_path(data_dir))?;
+    let filter = anamnesis_store::NearDuplicateFilter {
+        source: source.map(str::to_owned),
+        instance: instance.map(str::to_owned),
+        require_cross_source: !include_near_self,
+        limit,
+    };
+    let groups = anamnesis_store::list_near_duplicates(&store, &filter)?;
+    let effective_limit = limit.clamp(1, anamnesis_store::NEAR_DEDUPE_MAX_LIMIT);
+
+    if csv {
+        // R107-style flat CSV. Header carries the per-group
+        // similarity stats so a script doesn't need a second
+        // round-trip for ranking. `group_index` (not raw_hash —
+        // near-dedupe has none) keeps membership recoverable.
+        println!(
+            "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count,min_similarity,max_distance"
+        );
+        for (gi, g) in groups.iter().enumerate() {
+            let record_count = g.records.len();
+            for r in &g.records {
+                let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.created_at, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| r.created_at.to_string());
+                let updated_iso = match r.updated_at {
+                    Some(t) => chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                        .unwrap_or_else(|| t.to_string()),
+                    None => String::new(),
+                };
+                println!(
+                    "{group_index},{rid},{adapter},{instance},{native_id},{created},{updated},{has_np},{rc},{sim:.4},{dist}",
+                    group_index = gi,
+                    rid = csv_field(&r.record_id.0),
+                    adapter = csv_field(&r.adapter),
+                    instance = csv_field(&r.instance),
+                    native_id = csv_field(&r.native_id),
+                    created = csv_field(&created_iso),
+                    updated = csv_field(&updated_iso),
+                    has_np = r.has_native_path,
+                    rc = record_count,
+                    sim = g.min_similarity,
+                    dist = g.max_distance,
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if json {
+        let source_tokens = anamnesis_core::parse_csv_filter(source);
+        let instance_tokens = anamnesis_core::parse_csv_filter(instance);
+        let source_clause = if source_tokens.is_empty() {
+            "source filter: all sources".to_string()
+        } else {
+            format!("source filter: {}", source_tokens.join(" OR "))
+        };
+        let instance_clause = if instance_tokens.is_empty() {
+            "instance filter: all instances".to_string()
+        } else {
+            format!("instance filter: {}", instance_tokens.join(" OR "))
+        };
+        let summary = format!(
+            "{} near-duplicate group(s) returned (mode=near); limit {}; {}; {}; cross-source-only: {}.",
+            groups.len(),
+            effective_limit,
+            source_clause,
+            instance_clause,
+            !include_near_self,
+        );
+
+        let payload = serde_json::json!({
+            "summary": summary,
+            "count": groups.len(),
+            "format": "json",
+            "mode": "near",
+            "limit": effective_limit,
+            "filter": {
+                "source": source,
+                "instance": instance,
+                "require_cross_source": !include_near_self,
+            },
+            "groups": groups.iter().map(|g| {
+                serde_json::json!({
+                    "record_count": g.records.len(),
+                    "min_similarity": g.min_similarity,
+                    "max_distance": g.max_distance,
+                    "records": g.records.iter().map(|r| serde_json::json!({
+                        "record_id":       r.record_id.0,
+                        "adapter":         r.adapter,
+                        "instance":        if r.instance.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(r.instance.clone()) },
+                        "native_id":       r.native_id,
+                        "created_at":      r.created_at,
+                        "updated_at":      r.updated_at,
+                        "has_native_path": r.has_native_path,
+                    })).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    // Human form: mirror exact-dedupe structure but call out the
+    // similarity/distance per group so the operator can sort by
+    // confidence at a glance.
+    if groups.is_empty() {
+        let scope = filter_label(source, instance);
+        if scope.is_empty() {
+            println!("no near-duplicate groups (mode=near)");
+        } else {
+            println!("no near-duplicate groups (mode=near, filter: {scope})");
+        }
+        if !include_near_self {
+            println!(
+                "  (cross-source-only filter is ON by default; pass --include-near-self to also see within-adapter near-dups)"
+            );
+        }
+        return Ok(());
+    }
+    let scope = filter_label(source, instance);
+    let scope_suffix = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(" (filter: {scope})")
+    };
+    println!(
+        "{} near-duplicate group(s){} (mode=near; cross-source-only: {})",
+        groups.len(),
+        scope_suffix,
+        !include_near_self,
+    );
+    for (idx, g) in groups.iter().enumerate() {
+        println!(
+            "[{rank}] {n} record(s); min_similarity={sim:.3}, max_distance={dist}",
+            rank = idx + 1,
+            n = g.records.len(),
+            sim = g.min_similarity,
+            dist = g.max_distance,
+        );
+        for r in &g.records {
+            let inst = if r.instance.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", r.instance)
+            };
+            println!(
+                "    {} ({}{inst}, native_id={}, created_at={})",
+                r.record_id.0, r.adapter, r.native_id, r.created_at
+            );
+        }
+        println!();
+    }
+    println!(
+        "These groups are *candidates* — open the records and decide before running `anamnesis forget`."
+    );
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

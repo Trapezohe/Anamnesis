@@ -201,6 +201,59 @@ fn render_dedupe_csv(groups: &[anamnesis_store::DuplicateRawHashGroup]) -> Strin
     out
 }
 
+/// Round 132 (PR-78ba): render near-dedupe groups as a flat CSV
+/// string for `dedupe { mode: "near", csv: true }`. Same redaction
+/// discipline as R107 — no `raw_hash`, no `native_path` — plus
+/// `min_similarity` and `max_distance` columns so an MCP client can
+/// rank groups inside a spreadsheet without re-querying. The R131
+/// algorithm never reads `raw_hash` to begin with, so the privacy
+/// contract is enforced at the type level (NearDuplicateRecord has
+/// no such fields).
+fn render_dedupe_near_csv(groups: &[anamnesis_store::NearDuplicateGroup]) -> String {
+    let mut out = String::from(
+        "group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count,min_similarity,max_distance\n",
+    );
+    for (gi, g) in groups.iter().enumerate() {
+        let record_count = g.records.len();
+        for r in &g.records {
+            let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(r.created_at, 0)
+                .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| r.created_at.to_string());
+            let updated_iso = match r.updated_at {
+                Some(t) => chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| t.to_string()),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "{group_index},{rid},{adapter},{instance},{native_id},{created},{updated},{has_np},{rc},{sim:.4},{dist}\n",
+                group_index = gi,
+                rid = csv_escape(&r.record_id.0),
+                adapter = csv_escape(&r.adapter),
+                instance = csv_escape(&r.instance),
+                native_id = csv_escape(&r.native_id),
+                created = csv_escape(&created_iso),
+                updated = csv_escape(&updated_iso),
+                has_np = r.has_native_path,
+                rc = record_count,
+                sim = g.min_similarity,
+                dist = g.max_distance,
+            ));
+        }
+    }
+    out
+}
+
+/// Round 132 (PR-78ba): internal discriminator for the `dedupe`
+/// tool's `mode` arg. Public enum-ish at the wire boundary
+/// (`"exact"|"near"`); kept private here because the dispatch
+/// matches once and forwards to the appropriate branch.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DedupeMode {
+    Exact,
+    Near,
+}
+
 /// Round 92 (PR-78n): render `Audit::tail` results as the
 /// MCP CSV string. Same columns and redaction discipline as the
 /// CLI helper in R91 — `line_no,timestamp,action,via,outcome`
@@ -2128,7 +2181,27 @@ impl AnamnesisServer {
     /// NOT admin-gated — this is a read-only diagnostic with the
     /// same redaction discipline as `list_forgotten`. The action
     /// half (`forget_record`) still requires admin.
+    ///
+    /// Round 132 (PR-78ba): accepts `mode: "exact"|"near"`.
+    /// Default `"exact"` is the R77 raw_hash byte-equal grouper
+    /// (back-compat). `"near"` invokes the R131 SimHash + LSH +
+    /// Jaccard cross-adapter detector and defaults to
+    /// cross-source-only groups; pass `include_near_self: true`
+    /// to opt out of the cross-source filter.
     async fn tool_dedupe(&self, args: Value) -> Result<Value, String> {
+        // Round 132 (PR-78ba): mode discriminator. Unknown values
+        // are a fast-fail rather than a silent fallback — same
+        // policy as `tag_record.operation`.
+        let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("exact");
+        let mode = match mode_str {
+            "exact" => DedupeMode::Exact,
+            "near" => DedupeMode::Near,
+            other => {
+                return Err(format!(
+                    "dedupe.mode must be \"exact\" or \"near\"; got {other:?}"
+                ));
+            }
+        };
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -2185,6 +2258,48 @@ impl AnamnesisServer {
             );
         }
 
+        // Round 132 (PR-78ba): near-dedupe has no raw_hash /
+        // native_path and no raw_hash-style aggregate, so the
+        // sensitive / counts knobs would be no-ops at best and
+        // misleading at worst. Refuse them so a caller notices.
+        let include_near_self = args
+            .get("include_near_self")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if matches!(mode, DedupeMode::Near) && include_sensitive {
+            return Err(
+                "dedupe: `mode: \"near\"` and `include_sensitive: true` are mutually exclusive — \
+                 near-dedupe never reads `raw_hash` / `native_path`, so there is nothing \
+                 sensitive to reveal."
+                    .to_string(),
+            );
+        }
+        if matches!(mode, DedupeMode::Near) && include_counts {
+            return Err(
+                "dedupe: `mode: \"near\"` and `include_counts: true` are mutually exclusive — \
+                 the `counts` aggregate is exact-dedupe specific. Drop `include_counts` (group \
+                 cardinality is already on each near group)."
+                    .to_string(),
+            );
+        }
+        if matches!(mode, DedupeMode::Exact) && include_near_self {
+            return Err(
+                "dedupe: `include_near_self: true` only applies to `mode: \"near\"` (it opts \
+                 out of the cross-source filter that is unique to near-dedupe)."
+                    .to_string(),
+            );
+        }
+
+        if matches!(mode, DedupeMode::Near) {
+            // Dedicated near-dedupe branch — the wire shape adds
+            // `min_similarity` + `max_distance` per group and a
+            // `require_cross_source` field on `filter` that
+            // exact-mode doesn't have.
+            return self
+                .tool_dedupe_near(source, instance, limit, csv_requested, include_near_self)
+                .await;
+        }
+
         let filter = anamnesis_store::DuplicateRawHashFilter {
             source: source.clone(),
             instance: instance.clone(),
@@ -2216,6 +2331,10 @@ impl AnamnesisServer {
                 "count":              groups.len(),
                 "limit":              effective_limit,
                 "format":             "csv",
+                // Round 132 (PR-78ba): always emit the mode
+                // discriminator so a caller can route on
+                // `payload.mode` even before peeking inside.
+                "mode":               "exact",
                 "sensitive_included": false,
                 "filter":             {
                     "source":   source,
@@ -2289,6 +2408,11 @@ impl AnamnesisServer {
         let mut payload = json!({
             "count":              groups.len(),
             "format":             "json",
+            // Round 132 (PR-78ba): mode discriminator pairs with
+            // the new `mode: "near"` branch. Always emitted on
+            // both exact and near so a client can branch on
+            // `payload.mode` instead of probing for new fields.
+            "mode":               "exact",
             "limit":              effective_limit,
             "sensitive_included": include_sensitive,
             "summary":            summary,
@@ -2302,6 +2426,96 @@ impl AnamnesisServer {
             payload["counts"] = render_dedupe_counts(c);
         }
         Ok(payload)
+    }
+
+    /// Round 132 (PR-78ba): MCP `dedupe { mode: "near" }` — wraps
+    /// the R131 cross-source near-duplicate detector. Same redaction
+    /// discipline as exact: per-record `record_id / adapter /
+    /// instance / native_id / created_at / updated_at /
+    /// has_native_path` and nothing else; `min_similarity` +
+    /// `max_distance` per group give an MCP client enough to rank.
+    /// `format: "json"` keeps the wire-shape switch coherent;
+    /// CSV here mirrors the CLI's R107-style flat shape and also
+    /// carries the new similarity stats.
+    async fn tool_dedupe_near(
+        &self,
+        source: Option<String>,
+        instance: Option<String>,
+        limit: u32,
+        csv_requested: bool,
+        include_near_self: bool,
+    ) -> Result<Value, String> {
+        let filter = anamnesis_store::NearDuplicateFilter {
+            source: source.clone(),
+            instance: instance.clone(),
+            require_cross_source: !include_near_self,
+            limit,
+        };
+        let groups = anamnesis_store::list_near_duplicates(&self.store, &filter)
+            .map_err(|e| format!("dedupe near: {e}"))?;
+        let effective_limit = limit.clamp(1, anamnesis_store::NEAR_DEDUPE_MAX_LIMIT);
+
+        if csv_requested {
+            let csv = render_dedupe_near_csv(&groups);
+            return Ok(json!({
+                "count":  groups.len(),
+                "limit":  effective_limit,
+                "format": "csv",
+                "mode":   "near",
+                "filter": {
+                    "source":               source,
+                    "instance":             instance,
+                    "require_cross_source": !include_near_self,
+                },
+                "csv":    csv,
+            }));
+        }
+
+        let source_tokens = anamnesis_core::parse_csv_filter(source.as_deref());
+        let instance_tokens = anamnesis_core::parse_csv_filter(instance.as_deref());
+        let summary = format!(
+            "{} near-duplicate group(s) returned (mode=near); limit {}; {}; {}; \
+             cross-source-only: {}.",
+            groups.len(),
+            effective_limit,
+            render_filter_clause("source", &source_tokens),
+            render_filter_clause("instance", &instance_tokens),
+            !include_near_self,
+        );
+
+        let payload_groups: Vec<Value> = groups
+            .iter()
+            .map(|g| {
+                json!({
+                    "record_count":   g.records.len(),
+                    "min_similarity": g.min_similarity,
+                    "max_distance":   g.max_distance,
+                    "records":        g.records.iter().map(|r| json!({
+                        "record_id":       r.record_id.0,
+                        "adapter":         r.adapter,
+                        "instance":        if r.instance.is_empty() { Value::Null } else { Value::String(r.instance.clone()) },
+                        "native_id":       r.native_id,
+                        "created_at":      r.created_at,
+                        "updated_at":      r.updated_at,
+                        "has_native_path": r.has_native_path,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "count":   groups.len(),
+            "format":  "json",
+            "mode":    "near",
+            "limit":   effective_limit,
+            "summary": summary,
+            "filter": {
+                "source":               source,
+                "instance":             instance,
+                "require_cross_source": !include_near_self,
+            },
+            "groups":  payload_groups,
+        }))
     }
 
     /// Round 78 (PR-78): MCP-side `tag_record`. Admin-gated
@@ -3643,19 +3857,27 @@ fn tools_list_payload_all() -> Value {
             },
             {
                 "name": "dedupe",
-                "description": "Report records sharing identical `raw_hash` (exact source-payload \
-                                duplicates). Read-only diagnostic, NOT admin-gated — the action \
-                                half is `forget_record` (which is admin-gated). Default response \
-                                is redacted: `raw_hash` and `native_path` are omitted unless \
-                                `include_sensitive=true`. Limit clamped to [1, 100]. Optional \
-                                `source` / `instance` scope the report to groups containing ≥1 \
-                                matching record; the full sibling set is still returned so the \
-                                operator sees which non-matching records share the same hash. \
-                                Only catches byte-identical duplicates; semantic / near-duplicate \
-                                detection is out of scope.",
+                "description": "Report duplicate or near-duplicate records. Two modes: `exact` \
+                                (default, R77) groups records sharing identical `raw_hash` \
+                                bytes; `near` (R132, backed by R131 SimHash + LSH 16×4 + \
+                                Jaccard ≥0.6) groups records that are likely the same memory \
+                                paraphrased across adapters. Read-only diagnostic, NOT \
+                                admin-gated — the action half is `forget_record` (admin-gated). \
+                                Default redacted: `raw_hash` and `native_path` are omitted \
+                                unless `include_sensitive=true` (exact only — near never reads \
+                                them). Limit clamped to [1, 100]. `near` defaults to \
+                                cross-source-only groups (the interop-relevant case `exact` \
+                                cannot catch); pass `include_near_self=true` to also see \
+                                within-adapter near-dups.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["exact", "near"],
+                            "default": "exact",
+                            "description": "Round 132: pick the detector. `exact` (default) is the R77 byte-equal raw_hash grouper. `near` invokes the R131 SimHash + LSH + Jaccard cross-adapter near-duplicate algorithm — groups carry `min_similarity` (Jaccard, ∈ [0.6, 1.0]) and `max_distance` (Hamming on the 64-bit SimHash, ∈ [0, 8]) instead of `raw_hash`. `near` defaults to cross-source-only groups; pass `include_near_self: true` to opt out. `include_sensitive` and `include_counts` are exact-only — both refused under `near`."
+                        },
                         "source": {
                             "type": "string",
                             "description": "Restrict duplicate groups to those containing ≥1 record from a given adapter. Single value (`\"mem0\"`) is exact match (R80); comma-separated list (`\"mem0,claude-code\"`) is OR (R104) — groups whose members include at least one record from any listed adapter stay eligible. Tokens trimmed and empty tokens dropped. Omit (or empty string) for all sources."
@@ -3668,22 +3890,27 @@ fn tools_list_payload_all() -> Value {
                             "type": "integer",
                             "minimum": 1,
                             "default": 20,
-                            "description": "Max number of groups. Clamped to [1, 100] by the store."
+                            "description": "Max number of groups. Clamped to [1, 100] by the store (both modes)."
                         },
                         "include_sensitive": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Reveal `raw_hash` and `native_path`. Off by default."
+                            "description": "Reveal `raw_hash` and `native_path`. Off by default. Only valid under `mode: \"exact\"` — `near` never reads these fields and refuses the flag."
                         },
                         "include_counts": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 98: attach a `counts` block with `total_groups` (duplicate groups matching the filter), `total_records` (sum of live records across whole groups), and `by_source[]` (per-`(adapter, instance)` duplicate-record breakdown). Counts ignore `limit` and reflect the full filter-scoped set. `by_source` counts records (not group memberships) so mixed-source groups don't double-count: sum(by_source.duplicate_record_count) == total_records."
+                            "description": "Round 98: attach a `counts` block with `total_groups` (duplicate groups matching the filter), `total_records` (sum of live records across whole groups), and `by_source[]` (per-`(adapter, instance)` duplicate-record breakdown). Counts ignore `limit` and reflect the full filter-scoped set. `by_source` counts records (not group memberships) so mixed-source groups don't double-count: sum(by_source.duplicate_record_count) == total_records. Exact-only — refused under `mode: \"near\"`."
                         },
                         "csv": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Round 107: return a CSV string in `csv` (header `group_index,record_id,adapter,instance,native_id,created_at,updated_at,has_native_path,record_count`) instead of structured `groups[]`. Same redacted-summary discipline as R91 `audit tail --csv` and R106 `list-forgotten --csv` — never carries `raw_hash` / `native_path`. `group_index` carries duplicate-group membership without leaking the hash. Mutually exclusive with `include_sensitive: true` and `include_counts: true`."
+                            "description": "Round 107: return a CSV string in `csv` instead of structured `groups[]`. Same redacted-summary discipline as R91 `audit tail --csv` and R106 `list-forgotten --csv` — never carries `raw_hash` / `native_path`. `group_index` carries duplicate-group membership without leaking the hash. Mutually exclusive with `include_sensitive: true` and `include_counts: true`. R132: under `mode: \"near\"` the CSV header also carries `min_similarity` and `max_distance` columns."
+                        },
+                        "include_near_self": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Round 132: `mode: \"near\"` only — opt out of the default cross-source filter and also surface within-adapter near-duplicates. Equivalent to setting `NearDuplicateFilter::require_cross_source = false`. Refused under `mode: \"exact\"` (raw_hash has no cross-source notion)."
                         }
                     }
                 }
