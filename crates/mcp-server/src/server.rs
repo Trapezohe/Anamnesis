@@ -844,6 +844,7 @@ impl AnamnesisServer {
             "dedupe" => self.tool_dedupe(args.clone()).await,
             "list_conflicts" => self.tool_list_conflicts(args.clone()).await,
             "accept_conflict_variant" => self.tool_accept_conflict_variant(args.clone()).await,
+            "reconcile_sources" => self.tool_reconcile_sources(args.clone()).await,
             "discover_adapters" => self.tool_discover_adapters().await,
             "export_memories" => self.tool_export_memories(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
@@ -2690,6 +2691,105 @@ impl AnamnesisServer {
             "forget_records":   outcome.forget_records.iter().map(render).collect::<Vec<_>>(),
             "cascade_derived":  cascade_derived,
             "cascade":          cascade,
+        }))
+    }
+
+    /// MCP `reconcile_sources` — cross-adapter drift diagnostic.
+    /// Read-only, NOT admin-gated. Compares two (adapter, instance)
+    /// pairs by identity (anamnesis_native_id ∨ native_id) and reports
+    /// `only_left` / `only_right` / `both` / `conflicts` counts plus
+    /// capped sample arrays. `include_identity: true` reveals the
+    /// identity_key per row; default is counts + minimal projection.
+    async fn tool_reconcile_sources(&self, args: Value) -> Result<Value, String> {
+        let parse_side = |key: &str| -> Result<anamnesis_store::ReconcileSourceSelector, String> {
+            let obj = args.get(key).ok_or_else(|| {
+                format!("reconcile_sources.{key} is required (object with `adapter`)")
+            })?;
+            let adapter = obj
+                .get("adapter")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("reconcile_sources.{key}.adapter is required"))?
+                .to_owned();
+            let instance = obj
+                .get("instance")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            Ok(anamnesis_store::ReconcileSourceSelector { adapter, instance })
+        };
+        let left = parse_side("left")?;
+        let right = parse_side("right")?;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(10);
+        let include_identity = args
+            .get("include_identity")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let opts = anamnesis_store::ReconcileOptions {
+            left: left.clone(),
+            right: right.clone(),
+            limit,
+            include_identity,
+        };
+        let outcome = self
+            .store
+            .reconcile_sources(&opts)
+            .map_err(|e| format!("reconcile_sources: {e}"))?;
+
+        let render = |s: &anamnesis_store::ReconcileSample| {
+            let mut row = json!({
+                "record_id":       s.record_id.0,
+                "kind":            s.kind,
+                "scope":           s.scope,
+                "created_at":      s.created_at,
+                "identity_source": s.identity_source,
+            });
+            if let Some(key) = &s.identity_key {
+                row["identity_key"] = json!(key);
+            }
+            row
+        };
+        let render_side = |s: &anamnesis_store::ReconcileSourceSelector| {
+            json!({
+                "adapter":  s.adapter,
+                "instance": s.instance.clone().unwrap_or_default(),
+            })
+        };
+        let summary = format!(
+            "{} only_left, {} only_right, {} both, {} conflicts (left_total={}, right_total={}, \
+             identity_included: {}).",
+            outcome.counts.only_left,
+            outcome.counts.only_right,
+            outcome.counts.both,
+            outcome.counts.conflicts,
+            outcome.counts.left_total,
+            outcome.counts.right_total,
+            if include_identity { "yes" } else { "no" },
+        );
+        Ok(json!({
+            "summary":            summary,
+            "left":               render_side(&outcome.left),
+            "right":              render_side(&outcome.right),
+            "identity_included":  include_identity,
+            "limit":              limit.clamp(1, anamnesis_store::RECONCILE_MAX_LIMIT),
+            "counts": {
+                "only_left":   outcome.counts.only_left,
+                "only_right":  outcome.counts.only_right,
+                "both":        outcome.counts.both,
+                "conflicts":   outcome.counts.conflicts,
+                "left_total":  outcome.counts.left_total,
+                "right_total": outcome.counts.right_total,
+            },
+            "samples": {
+                "only_left":  outcome.samples.only_left.iter().map(&render).collect::<Vec<_>>(),
+                "only_right": outcome.samples.only_right.iter().map(&render).collect::<Vec<_>>(),
+                "conflicts":  outcome.samples.conflicts.iter().map(&render).collect::<Vec<_>>(),
+            },
         }))
     }
 
@@ -4611,6 +4711,58 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "reconcile_sources",
+                "description": "Cross-adapter drift diagnostic. Compares two (adapter, instance) \
+                                pairs by identity key (round-trip `metadata.anamnesis_native_id` \
+                                preferred, else `provenance.native_id`) and reports four buckets: \
+                                `only_left`, `only_right`, `both`, `conflicts` (subset of `both` \
+                                where content differs). NOT admin-gated; read-only. Default \
+                                redacted: counts + minimal per-sample projection (record_id / \
+                                kind / scope / created_at / identity_source). Each sample carries \
+                                `identity_source` so the operator knows whether the match is via \
+                                round-trip provenance (`anamnesis_native_id` — safe to compare) \
+                                or per-adapter native id (only meaningful when adapters share \
+                                an upstream source).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "left": {
+                            "type": "object",
+                            "description": "Left side selector: `{ adapter, instance? }`.",
+                            "properties": {
+                                "adapter": { "type": "string" },
+                                "instance": { "type": "string" }
+                            },
+                            "required": ["adapter"]
+                        },
+                        "right": {
+                            "type": "object",
+                            "description": "Right side selector: `{ adapter, instance? }`.",
+                            "properties": {
+                                "adapter": { "type": "string" },
+                                "instance": { "type": "string" }
+                            },
+                            "required": ["adapter"]
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 10,
+                            "description": "Per-bucket sample cap. Clamped to [1, 100]. Counts \
+                                            ignore the cap."
+                        },
+                        "include_identity": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Surface the per-sample `identity_key` (round-tripped \
+                                            anamnesis_native_id or per-adapter native_id). Off by \
+                                            default — counts alone usually answer the question."
+                        }
+                    },
+                    "required": ["left", "right"]
+                }
+            },
+            {
                 "name": "discover_adapters",
                 "description": "Capability discovery. Returns the static catalogue of adapters compiled \
                                 into this binary (`adapters[]`) plus a runtime detection pass of memory \
@@ -4997,21 +5149,18 @@ mod tests {
             !names.contains(&"import_source".to_string()),
             "import_source MUST be hidden by default — found in tools/list",
         );
-        // R77 added `dedupe` to the non-admin catalogue (5 → 6).
-        // R135 added `list_conflicts` (6 → 7).
-        // R137 added `discover_adapters` (7 → 8).
-        assert_eq!(names.len(), 8, "expect exactly 8 non-admin tools");
+        // R146 added `reconcile_sources` to the non-admin catalogue (8 → 9).
+        assert_eq!(names.len(), 9, "expect exactly 9 non-admin tools");
     }
 
     #[tokio::test]
     async fn tools_list_includes_all_when_admin_enabled() {
-        // With admin enabled, the full catalogue surfaces. R144 added
-        // accept_conflict_variant (16→17).
+        // R146 added reconcile_sources (17 → 18).
         let store = Store::open_in_memory().unwrap();
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 18);
         for expected in [
             "search_memories",
             "get_record",
@@ -5028,6 +5177,7 @@ mod tests {
             "source_show",
             "list_conflicts",
             "accept_conflict_variant",
+            "reconcile_sources",
             "discover_adapters",
             "export_memories",
         ] {
@@ -5053,13 +5203,10 @@ mod tests {
         let summary = payload["summary"]
             .as_str()
             .expect("tools/list must carry top-level `summary` for discovery");
-        // Visible-count must match post-filter `tools[]`.len().
-        // R86 baseline: 13 catalogue - 7 admin = 6 visible.
-        // R135 added list_conflicts → 14 - 7 = 7.
-        // R137 added discover_adapters → 15 - 7 = 8.
+        // R146 added reconcile_sources to non-admin (8 → 9).
         assert!(
-            summary.contains("8 tools exposed"),
-            "non-admin summary should declare 8 visible tools: {summary}"
+            summary.contains("9 tools exposed"),
+            "non-admin summary should declare 9 visible tools: {summary}"
         );
         // Operator must learn which tools are gated even when
         // they're hidden.
@@ -5071,14 +5218,11 @@ mod tests {
             summary.contains("forget_record"),
             "summary should name a representative admin tool: {summary}"
         );
-        // Back-compat: `tools[]` continues to carry only the
-        // 8 visible entries.
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
     }
 
-    /// Admin-on summary: 17 visible tools (R144 added
-    /// `accept_conflict_variant`).
+    /// Admin-on summary: 18 visible tools (R146 added `reconcile_sources`).
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
         let store = Store::open_in_memory().unwrap();
@@ -5087,15 +5231,15 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("17 tools exposed"),
-            "admin-on summary should declare 17 visible tools: {summary}"
+            summary.contains("18 tools exposed"),
+            "admin-on summary should declare 18 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
     }
 
     #[tokio::test]

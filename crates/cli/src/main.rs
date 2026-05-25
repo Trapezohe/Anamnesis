@@ -333,6 +333,31 @@ enum Command {
         json: bool,
     },
 
+    /// Cross-adapter drift diagnostic: compare two `(adapter, instance)`
+    /// pairs by identity key and report `only_left` / `only_right` /
+    /// `both` / `conflicts` counts plus sample rows. Read-only.
+    /// Identity = round-trip `metadata.anamnesis_native_id` ∨
+    /// `provenance.native_id`. Each sample carries `identity_source` so
+    /// the operator knows whether the match is provenance-safe or
+    /// per-adapter-only.
+    Reconcile {
+        /// Left side as `adapter[:instance]` (instance defaults to "").
+        #[arg(long)]
+        left: String,
+        /// Right side as `adapter[:instance]`.
+        #[arg(long)]
+        right: String,
+        /// Per-bucket sample cap (default 10, max 100). Counts ignore this.
+        #[arg(long, default_value_t = 10)]
+        limit: u32,
+        /// Surface per-sample `identity_key`. Default off.
+        #[arg(long)]
+        include_identity: bool,
+        /// Emit JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Remove a tombstone so the source can resurrect the memory on
     /// its next import. Does NOT recreate the record — the tombstone
     /// only stored provenance. Unknown id exits non-zero.
@@ -1147,6 +1172,13 @@ async fn run() -> Result<()> {
             reason.as_deref(),
             json,
         ),
+        Command::Reconcile {
+            left,
+            right,
+            limit,
+            include_identity,
+            json,
+        } => cmd_reconcile(&data_dir, &left, &right, limit, include_identity, json),
         Command::Unforget {
             record_id,
             json,
@@ -3397,6 +3429,133 @@ fn cmd_accept_conflict(
         }
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reconcile (R146)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `anamnesis reconcile --left mem0[:inst] --right letta[:inst]` —
+/// read-only cross-adapter drift diagnostic.
+fn cmd_reconcile(
+    data_dir: &std::path::Path,
+    left_token: &str,
+    right_token: &str,
+    limit: u32,
+    include_identity: bool,
+    json: bool,
+) -> Result<()> {
+    let left = parse_source_token(left_token)?;
+    let right = parse_source_token(right_token)?;
+    let store = Store::open(db_path(data_dir))?;
+    let opts = anamnesis_store::ReconcileOptions {
+        left: left.clone(),
+        right: right.clone(),
+        limit,
+        include_identity,
+    };
+    let outcome = store.reconcile_sources(&opts)?;
+
+    if json {
+        let render = |s: &anamnesis_store::ReconcileSample| {
+            let mut row = serde_json::json!({
+                "record_id":       s.record_id.0,
+                "kind":            s.kind,
+                "scope":           s.scope,
+                "created_at":      s.created_at,
+                "identity_source": s.identity_source,
+            });
+            if let Some(key) = &s.identity_key {
+                row["identity_key"] = serde_json::json!(key);
+            }
+            row
+        };
+        let payload = serde_json::json!({
+            "left": {
+                "adapter":  outcome.left.adapter,
+                "instance": outcome.left.instance.clone().unwrap_or_default(),
+            },
+            "right": {
+                "adapter":  outcome.right.adapter,
+                "instance": outcome.right.instance.clone().unwrap_or_default(),
+            },
+            "identity_included": include_identity,
+            "limit": limit.clamp(1, anamnesis_store::RECONCILE_MAX_LIMIT),
+            "counts": {
+                "only_left":   outcome.counts.only_left,
+                "only_right":  outcome.counts.only_right,
+                "both":        outcome.counts.both,
+                "conflicts":   outcome.counts.conflicts,
+                "left_total":  outcome.counts.left_total,
+                "right_total": outcome.counts.right_total,
+            },
+            "samples": {
+                "only_left":  outcome.samples.only_left.iter().map(&render).collect::<Vec<_>>(),
+                "only_right": outcome.samples.only_right.iter().map(&render).collect::<Vec<_>>(),
+                "conflicts":  outcome.samples.conflicts.iter().map(&render).collect::<Vec<_>>(),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let label = |s: &anamnesis_store::ReconcileSourceSelector| {
+            if let Some(inst) = &s.instance {
+                format!("{}:{}", s.adapter, inst)
+            } else {
+                s.adapter.clone()
+            }
+        };
+        println!(
+            "{} vs {}: only_left={}, only_right={}, both={}, conflicts={} (left_total={}, right_total={})",
+            label(&outcome.left),
+            label(&outcome.right),
+            outcome.counts.only_left,
+            outcome.counts.only_right,
+            outcome.counts.both,
+            outcome.counts.conflicts,
+            outcome.counts.left_total,
+            outcome.counts.right_total,
+        );
+        let print_bucket = |label: &str, rows: &[anamnesis_store::ReconcileSample]| {
+            if rows.is_empty() {
+                return;
+            }
+            println!("  {label} ({} sample row(s)):", rows.len());
+            for r in rows {
+                let suffix = match &r.identity_key {
+                    Some(k) => {
+                        format!("  identity_key={k} (identity_source={})", r.identity_source)
+                    }
+                    None => format!("  identity_source={}", r.identity_source),
+                };
+                println!(
+                    "    {} ({}/{}, created_at={}){suffix}",
+                    r.record_id.0, r.kind, r.scope, r.created_at
+                );
+            }
+        };
+        print_bucket("only_left", &outcome.samples.only_left);
+        print_bucket("only_right", &outcome.samples.only_right);
+        print_bucket("conflicts", &outcome.samples.conflicts);
+    }
+    Ok(())
+}
+
+/// Parse `adapter[:instance]` shorthand used by `--left`/`--right`.
+fn parse_source_token(s: &str) -> Result<anamnesis_store::ReconcileSourceSelector> {
+    if s.trim().is_empty() {
+        return Err(anyhow!("source token must not be empty"));
+    }
+    let (adapter, instance) = match s.split_once(':') {
+        Some((a, i)) if !i.is_empty() => (a, Some(i.to_owned())),
+        _ => (s, None),
+    };
+    if adapter.trim().is_empty() {
+        return Err(anyhow!("source token {s:?} has empty adapter"));
+    }
+    Ok(anamnesis_store::ReconcileSourceSelector {
+        adapter: adapter.to_owned(),
+        instance,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

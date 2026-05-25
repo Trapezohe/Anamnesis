@@ -97,15 +97,14 @@ async fn http_endpoint_round_trips_initialize() {
     let tools = body["result"]["tools"].as_array().unwrap();
     // PR-A: admin tools (`import_source`) are hidden by default. The HTTP
     // test server is built without `with_admin_tools(true)`, so only the
-    // read-only tools should show up — search_memories, get_record,
-    // list_sources, trace_provenance, doctor (5 since round-54) +
-    // dedupe (Round 77) + list_conflicts (Round 135) +
-    // discover_adapters (Round 137) = 8.
+    // read-only tools: search_memories, get_record, list_sources,
+    // trace_provenance, doctor, dedupe, list_conflicts,
+    // discover_adapters, reconcile_sources (R146) = 9.
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert_eq!(
         tools.len(),
-        8,
-        "expect 8 non-admin tools by default; got {names:?}"
+        9,
+        "expect 9 non-admin tools by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source"));
     for expected in [
