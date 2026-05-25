@@ -358,6 +358,35 @@ enum Command {
         json: bool,
     },
 
+    /// Export one reconcile drift bucket (`only_left` or `only_right`)
+    /// as a fresh round-trip file the operator can feed to the lagging
+    /// adapter's importer. Refuses to overwrite the output target.
+    /// Read-only on the Anamnesis side.
+    ReconcileExport {
+        /// Left side as `adapter[:instance]`.
+        #[arg(long)]
+        left: String,
+        /// Right side as `adapter[:instance]`.
+        #[arg(long)]
+        right: String,
+        /// Which bucket to export. `only-left` writes records the LEFT
+        /// side has and the RIGHT side lacks; `only-right` does the
+        /// inverse. `both` and `conflicts` are intentionally rejected —
+        /// they need separate decision tooling (R143/R144).
+        #[arg(long, value_parser = ["only-left", "only-right"])]
+        bucket: String,
+        /// Output format: `jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`,
+        /// or `memos-dir`. Pick the one the lagging adapter reads.
+        #[arg(long)]
+        format: String,
+        /// Output path. Required for every format; must not exist.
+        #[arg(long)]
+        out: PathBuf,
+        /// Emit JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Remove a tombstone so the source can resurrect the memory on
     /// its next import. Does NOT recreate the record — the tombstone
     /// only stored provenance. Unknown id exits non-zero.
@@ -1179,6 +1208,14 @@ async fn run() -> Result<()> {
             include_identity,
             json,
         } => cmd_reconcile(&data_dir, &left, &right, limit, include_identity, json),
+        Command::ReconcileExport {
+            left,
+            right,
+            bucket,
+            format,
+            out,
+            json,
+        } => cmd_reconcile_export(&data_dir, &left, &right, &bucket, &format, &out, json),
         Command::Unforget {
             record_id,
             json,
@@ -3556,6 +3593,88 @@ fn parse_source_token(s: &str) -> Result<anamnesis_store::ReconcileSourceSelecto
         adapter: adapter.to_owned(),
         instance,
     })
+}
+
+/// `anamnesis reconcile-export` — pipe one reconcile bucket's record ids
+/// through the existing R138/R139/R145 round-trip writers so the operator
+/// can fill the lagging adapter from the leading one.
+#[allow(clippy::too_many_arguments)]
+fn cmd_reconcile_export(
+    data_dir: &std::path::Path,
+    left_token: &str,
+    right_token: &str,
+    bucket_token: &str,
+    format_token: &str,
+    out: &std::path::Path,
+    json: bool,
+) -> Result<()> {
+    let left = parse_source_token(left_token)?;
+    let right = parse_source_token(right_token)?;
+    let bucket = match bucket_token {
+        "only-left" => anamnesis_store::ReconcileBucket::OnlyLeft,
+        "only-right" => anamnesis_store::ReconcileBucket::OnlyRight,
+        other => {
+            return Err(anyhow!(
+                "--bucket must be `only-left` or `only-right`; got {other:?}"
+            ));
+        }
+    };
+    let format = anamnesis_export::ExportFormat::parse(format_token).map_err(|e| anyhow!("{e}"))?;
+    let store = Store::open(db_path(data_dir))?;
+    let ids: Vec<String> = store
+        .reconcile_bucket_ids(&left, &right, bucket)?
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    let outcome = anamnesis_export::run_export_with_ids(&store, &ids, format, Some(out), None)?;
+
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "reconcile_export",
+        serde_json::json!({
+            "left":     { "adapter": left.adapter,  "instance": left.instance.clone().unwrap_or_default() },
+            "right":    { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
+            "bucket":   bucket_token,
+            "format":   format.as_token(),
+            "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+            "records":  outcome.records,
+        }),
+    ));
+
+    if json {
+        let payload = serde_json::json!({
+            "bucket":   bucket_token,
+            "format":   format.as_token(),
+            "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+            "records":  outcome.records,
+            "bytes":    outcome.bytes,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "exported {} record(s) from {} → {} ({} bytes) — bucket={}, format={}",
+            outcome.records,
+            outcome
+                .out
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            "lagging adapter",
+            outcome.bytes.unwrap_or(0),
+            bucket_token,
+            format.as_token(),
+        );
+        println!(
+            "Next: feed `{}` to the lagging adapter's importer, then re-import \
+             into Anamnesis. The next `reconcile` run should show those records \
+             moved into `both`.",
+            outcome
+                .out
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

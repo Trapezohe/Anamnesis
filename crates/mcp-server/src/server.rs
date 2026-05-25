@@ -66,6 +66,8 @@ pub const ADMIN_TOOLS: &[&str] = &[
     "export_memories",
     // R144: tombstones loser variants in a cross-adapter conflict.
     "accept_conflict_variant",
+    // R147: writes a fresh round-trip file of a reconcile bucket.
+    "reconcile_export_bucket",
 ];
 
 /// Was this tool tagged as admin?
@@ -845,6 +847,7 @@ impl AnamnesisServer {
             "list_conflicts" => self.tool_list_conflicts(args.clone()).await,
             "accept_conflict_variant" => self.tool_accept_conflict_variant(args.clone()).await,
             "reconcile_sources" => self.tool_reconcile_sources(args.clone()).await,
+            "reconcile_export_bucket" => self.tool_reconcile_export_bucket(args.clone()).await,
             "discover_adapters" => self.tool_discover_adapters().await,
             "export_memories" => self.tool_export_memories(args.clone()).await,
             "tag_record" => self.tool_tag_record(args.clone()).await,
@@ -2790,6 +2793,114 @@ impl AnamnesisServer {
                 "only_right": outcome.samples.only_right.iter().map(&render).collect::<Vec<_>>(),
                 "conflicts":  outcome.samples.conflicts.iter().map(&render).collect::<Vec<_>>(),
             },
+        }))
+    }
+
+    /// MCP `reconcile_export_bucket` — ADMIN-GATED. Pipes a reconcile
+    /// drift bucket's record ids through the existing round-trip writers
+    /// (`mem0-sqlite` / `letta-sqlite` / `memos-dir` / `jsonl` / `csv`).
+    /// `out` is required (transport can't stream); target must not exist.
+    /// Audit-logged. Response carries bounded metadata only — record
+    /// count + bytes + echoed filter, never `content` / `raw_hash`.
+    async fn tool_reconcile_export_bucket(&self, args: Value) -> Result<Value, String> {
+        let parse_side = |key: &str| -> Result<anamnesis_store::ReconcileSourceSelector, String> {
+            let obj = args
+                .get(key)
+                .ok_or_else(|| format!("reconcile_export_bucket.{key} is required"))?;
+            let adapter = obj
+                .get("adapter")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("reconcile_export_bucket.{key}.adapter is required"))?
+                .to_owned();
+            let instance = obj
+                .get("instance")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            Ok(anamnesis_store::ReconcileSourceSelector { adapter, instance })
+        };
+        let left = parse_side("left")?;
+        let right = parse_side("right")?;
+        let bucket_token = args
+            .get("bucket")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "reconcile_export_bucket.bucket is required".to_string())?;
+        let bucket = match bucket_token {
+            "only-left" => anamnesis_store::ReconcileBucket::OnlyLeft,
+            "only-right" => anamnesis_store::ReconcileBucket::OnlyRight,
+            other => {
+                return Err(format!(
+                    "reconcile_export_bucket.bucket must be `only-left` or `only-right`; got {other:?}"
+                ));
+            }
+        };
+        let format_token = args
+            .get("format")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "reconcile_export_bucket.format is required".to_string())?;
+        let format = anamnesis_export::ExportFormat::parse(format_token)
+            .map_err(|e| format!("reconcile_export_bucket: {e}"))?;
+        let out = args
+            .get("out")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                "reconcile_export_bucket.out is required (transport cannot stream)".to_string()
+            })?;
+        if out.exists() {
+            return Err(format!(
+                "reconcile_export_bucket: refusing to overwrite existing path {}",
+                out.display()
+            ));
+        }
+
+        let ids: Vec<String> = self
+            .store
+            .reconcile_bucket_ids(&left, &right, bucket)
+            .map_err(|e| format!("reconcile_export_bucket: {e}"))?
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        let outcome =
+            anamnesis_export::run_export_with_ids(&self.store, &ids, format, Some(&out), None)
+                .map_err(|e| format!("reconcile_export_bucket: {e}"))?;
+
+        anamnesis_core::Audit::new(&self.data_dir).record(anamnesis_core::AuditEntry::new(
+            "reconcile_export",
+            json!({
+                "left":     { "adapter": left.adapter,  "instance": left.instance.clone().unwrap_or_default() },
+                "right":    { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
+                "bucket":   bucket_token,
+                "format":   format.as_token(),
+                "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+                "records":  outcome.records,
+                "via":      "mcp",
+            }),
+        ));
+
+        let summary = format!(
+            "exported {} record(s) from bucket={} to {} (format={}, {} bytes).",
+            outcome.records,
+            bucket_token,
+            outcome
+                .out
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            format.as_token(),
+            outcome.bytes.unwrap_or(0),
+        );
+        Ok(json!({
+            "summary":  summary,
+            "bucket":   bucket_token,
+            "format":   format.as_token(),
+            "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+            "records":  outcome.records,
+            "bytes":    outcome.bytes,
+            "left":     { "adapter": left.adapter,  "instance": left.instance.clone().unwrap_or_default() },
+            "right":    { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
         }))
     }
 
@@ -4763,6 +4874,41 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "reconcile_export_bucket",
+                "description": "Pipe one reconcile drift bucket (`only-left` or `only-right`) through \
+                                the existing round-trip writers (jsonl / csv / mem0-sqlite / \
+                                letta-sqlite / memos-dir). Operator feeds the result to the lagging \
+                                adapter's importer; next `reconcile_sources` shows them in `both`. \
+                                ADMIN-GATED — writes a file. `out` is REQUIRED for every format \
+                                (transport cannot stream); refuses to overwrite an existing path. \
+                                Response carries bounded metadata only — never `content` / `raw_hash`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "left":  { "type": "object", "properties": { "adapter": {"type":"string"}, "instance": {"type":"string"} }, "required": ["adapter"] },
+                        "right": { "type": "object", "properties": { "adapter": {"type":"string"}, "instance": {"type":"string"} }, "required": ["adapter"] },
+                        "bucket": {
+                            "type": "string",
+                            "enum": ["only-left", "only-right"],
+                            "description": "`only-left` writes records on LEFT absent from RIGHT; \
+                                            `only-right` is the inverse. `both`/`conflicts` are not \
+                                            exportable here — they need decision tooling \
+                                            (R143 `merge_preview` / R144 `accept_conflict_variant`)."
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"],
+                            "description": "Output format. Pick the one the lagging adapter reads."
+                        },
+                        "out": {
+                            "type": "string",
+                            "description": "Absolute path for the output file/dir. REQUIRED. Must not exist."
+                        }
+                    },
+                    "required": ["left", "right", "bucket", "format", "out"]
+                }
+            },
+            {
                 "name": "discover_adapters",
                 "description": "Capability discovery. Returns the static catalogue of adapters compiled \
                                 into this binary (`adapters[]`) plus a runtime detection pass of memory \
@@ -5155,12 +5301,12 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_includes_all_when_admin_enabled() {
-        // R146 added reconcile_sources (17 → 18).
+        // R147 added reconcile_export_bucket (18 → 19).
         let store = Store::open_in_memory().unwrap();
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
         for expected in [
             "search_memories",
             "get_record",
@@ -5178,6 +5324,7 @@ mod tests {
             "list_conflicts",
             "accept_conflict_variant",
             "reconcile_sources",
+            "reconcile_export_bucket",
             "discover_adapters",
             "export_memories",
         ] {
@@ -5222,7 +5369,7 @@ mod tests {
         assert_eq!(tools.len(), 9);
     }
 
-    /// Admin-on summary: 18 visible tools (R146 added `reconcile_sources`).
+    /// Admin-on summary: 19 visible tools (R147 added `reconcile_export_bucket`).
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
         let store = Store::open_in_memory().unwrap();
@@ -5231,15 +5378,15 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("18 tools exposed"),
-            "admin-on summary should declare 18 visible tools: {summary}"
+            summary.contains("19 tools exposed"),
+            "admin-on summary should declare 19 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
     }
 
     #[tokio::test]
