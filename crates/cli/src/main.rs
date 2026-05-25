@@ -126,6 +126,26 @@ enum Command {
         /// `~/.mem0/db.sqlite` is wrong).
         #[arg(long)]
         path: Option<PathBuf>,
+        /// After a successful import, run the R146 reconcile diff against
+        /// this `adapter[:instance]` (treating the just-imported side as
+        /// LEFT) and write the `only-left` bucket through the round-trip
+        /// writer chosen by `--reconcile-export-format`. Operator feeds
+        /// the output to the lagging adapter's importer; the next
+        /// `reconcile` shows those records in `both`. All three
+        /// `--reconcile-export-*` flags are required together; skipped
+        /// on `--dry-run` (no commit = no drift artifact).
+        #[arg(long, requires_all = ["reconcile_export_out", "reconcile_export_format"])]
+        reconcile_export_against: Option<String>,
+        /// Output path for the drift artifact (file or directory,
+        /// per `--reconcile-export-format`). Must not exist; refuses
+        /// to overwrite (same contract as `anamnesis export`).
+        #[arg(long, requires = "reconcile_export_against")]
+        reconcile_export_out: Option<PathBuf>,
+        /// Format for the drift artifact: `jsonl` / `csv` /
+        /// `mem0-sqlite` / `letta-sqlite` / `memos-dir`. Pick the one
+        /// the lagging adapter reads natively.
+        #[arg(long, requires = "reconcile_export_against")]
+        reconcile_export_format: Option<String>,
     },
 
     /// Search across all imported records.
@@ -1041,6 +1061,9 @@ async fn run() -> Result<()> {
             dry_run,
             no_embed,
             path,
+            reconcile_export_against,
+            reconcile_export_out,
+            reconcile_export_format,
         } => {
             cmd_import(
                 &data_dir,
@@ -1050,6 +1073,9 @@ async fn run() -> Result<()> {
                 dry_run,
                 no_embed,
                 path.as_deref(),
+                reconcile_export_against.as_deref(),
+                reconcile_export_out.as_deref(),
+                reconcile_export_format.as_deref(),
             )
             .await
         }
@@ -2166,6 +2192,7 @@ fn split_target(t: &str) -> (&str, Option<&str>) {
 // import
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_import(
     data_dir: &std::path::Path,
     target: &str,
@@ -2174,8 +2201,51 @@ async fn cmd_import(
     dry_run: bool,
     no_embed: bool,
     path_override: Option<&std::path::Path>,
+    reconcile_export_against: Option<&str>,
+    reconcile_export_out: Option<&std::path::Path>,
+    reconcile_export_format: Option<&str>,
 ) -> Result<()> {
     let (adapter_id, instance) = split_target(target);
+    // Validate reconcile-export trio up-front (clap already guarantees
+    // all-or-none via `requires_all`/`requires`, but a runtime check
+    // gives a clearer error than parsing a missing format token after
+    // the import has already committed).
+    let reconcile_export = match (
+        reconcile_export_against,
+        reconcile_export_out,
+        reconcile_export_format,
+    ) {
+        (Some(against), Some(out), Some(fmt)) => {
+            // Pre-flight: refuse to start the import if the target path
+            // exists. Operator avoids "import succeeded, drift export
+            // failed" surprise after the writes already landed.
+            if out.exists() {
+                return Err(anyhow!(
+                    "refusing to overwrite existing reconcile-export target {}",
+                    out.display()
+                ));
+            }
+            // Pre-parse the format so a typo errors out before the import.
+            let format = anamnesis_export::ExportFormat::parse(fmt)
+                .map_err(|e| anyhow!("--reconcile-export-format: {e}"))?;
+            let right = parse_source_token(against)?;
+            Some((right, out.to_path_buf(), format))
+        }
+        (None, None, None) => None,
+        _ => {
+            // Clap requires_all should prevent this, but be defensive.
+            return Err(anyhow!(
+                "--reconcile-export-against / --reconcile-export-out / \
+                 --reconcile-export-format must be passed together"
+            ));
+        }
+    };
+    if reconcile_export.is_some() && dry_run {
+        return Err(anyhow!(
+            "--reconcile-export-* is incompatible with --dry-run \
+             (no commit = no drift artifact to write)"
+        ));
+    }
 
     // Reject unknown adapters before doing any registry / filesystem work
     // so the error message is "not wired" rather than the more confusing
@@ -2265,7 +2335,7 @@ async fn cmd_import(
         },
     };
 
-    match adapter_id {
+    let import_result: Result<()> = match adapter_id {
         anamnesis_adapter_claude_code::ADAPTER_ID => {
             let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
                 projects_root: location.clone(),
@@ -2428,7 +2498,55 @@ async fn cmd_import(
         other => Err(anyhow!(
             "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, tdai, openviking, mempalace, memori, memos, memary, generic-mcp"
         )),
+    };
+    import_result?;
+
+    // R148: post-import drift artifact. Runs ONLY after a successful
+    // non-dry-run import; failures inside the hook surface but don't
+    // roll back the import (the data is already persisted).
+    if let Some((right, out, format)) = reconcile_export {
+        let store = Store::open(db_path(data_dir))?;
+        let left = anamnesis_store::ReconcileSourceSelector {
+            adapter: adapter_id.to_string(),
+            instance: instance.map(str::to_owned),
+        };
+        let ids: Vec<String> = store
+            .reconcile_bucket_ids(&left, &right, anamnesis_store::ReconcileBucket::OnlyLeft)?
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        let outcome =
+            anamnesis_export::run_export_with_ids(&store, &ids, format, Some(&out), None)?;
+        audit(data_dir).record(anamnesis_core::AuditEntry::new(
+            "reconcile_export_post_import",
+            serde_json::json!({
+                "left":    { "adapter": left.adapter,  "instance": left.instance.clone().unwrap_or_default() },
+                "right":   { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
+                "bucket":  "only-left",
+                "format":  format.as_token(),
+                "out":     outcome.out.as_ref().map(|p| p.display().to_string()),
+                "records": outcome.records,
+            }),
+        ));
+        let right_label = match &right.instance {
+            Some(inst) => format!("{}:{}", right.adapter, inst),
+            None => right.adapter.clone(),
+        };
+        println!(
+            "reconcile-export: wrote {} record(s) from {target} → {right_label} drift bucket \
+             into {} ({} bytes, format={}). Feed it to {right_label}'s importer and re-import \
+             into Anamnesis to clear the drift.",
+            outcome.records,
+            outcome
+                .out
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            outcome.bytes.unwrap_or(0),
+            format.as_token(),
+        );
     }
+    Ok(())
 }
 
 /// Resolve the effective `ScanOpts` for a CLI `import` invocation.
