@@ -233,6 +233,19 @@ pub fn run_export(
     writer: Option<&mut dyn std::io::Write>,
 ) -> Result<ExportOutcome, ExportError> {
     let ids = select_record_ids(store, filter)?;
+    run_export_with_ids(store, &ids, format, out, writer)
+}
+
+/// Same as [`run_export`] but consumes an explicit id list — skips the
+/// `select_record_ids` SQL pass. Used by R147 reconcile-export to pipe
+/// the diff-bucket ids straight into the format writer.
+pub fn run_export_with_ids(
+    store: &Store,
+    ids: &[String],
+    format: ExportFormat,
+    out: Option<&Path>,
+    writer: Option<&mut dyn std::io::Write>,
+) -> Result<ExportOutcome, ExportError> {
     match format {
         ExportFormat::Jsonl | ExportFormat::Csv => {
             // Materialise file into a local that outlives the borrow.
@@ -248,8 +261,8 @@ pub fn run_export(
                 });
             };
             match format {
-                ExportFormat::Jsonl => export_jsonl(store, &ids, writer_ref)?,
-                ExportFormat::Csv => export_csv(store, &ids, writer_ref)?,
+                ExportFormat::Jsonl => export_jsonl(store, ids, writer_ref)?,
+                ExportFormat::Csv => export_csv(store, ids, writer_ref)?,
                 _ => unreachable!(),
             }
             let bytes = out.and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()));
@@ -263,8 +276,8 @@ pub fn run_export(
         ExportFormat::Mem0Sqlite | ExportFormat::LettaSqlite => {
             let p = validate_sqlite_output(format, out)?;
             match format {
-                ExportFormat::Mem0Sqlite => export_mem0_sqlite(store, &ids, p)?,
-                ExportFormat::LettaSqlite => export_letta_sqlite(store, &ids, p)?,
+                ExportFormat::Mem0Sqlite => export_mem0_sqlite(store, ids, p)?,
+                ExportFormat::LettaSqlite => export_letta_sqlite(store, ids, p)?,
                 _ => unreachable!(),
             }
             let bytes = std::fs::metadata(p).ok().map(|m| m.len());
@@ -277,7 +290,7 @@ pub fn run_export(
         }
         ExportFormat::MemosDir => {
             let p = validate_dir_output(format, out)?;
-            export_memos_dir(store, &ids, p)?;
+            export_memos_dir(store, ids, p)?;
             let bytes = std::fs::metadata(p.join("textual_memory.json"))
                 .ok()
                 .map(|m| m.len());

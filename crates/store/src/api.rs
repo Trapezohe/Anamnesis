@@ -1164,6 +1164,18 @@ pub struct ReconcileOutcome {
     pub samples: ReconcileSamples,
 }
 
+/// Reconcile bucket selector for [`Store::reconcile_bucket_ids`].
+/// (`Both` is intentionally omitted — operators reconcile drift,
+/// not already-in-sync records; `Conflicts` is a separate decision
+/// surfaced via [`Store::accept_native_conflict_variant`].)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileBucket {
+    /// Identities present on left, absent on right.
+    OnlyLeft,
+    /// Identities present on right, absent on left.
+    OnlyRight,
+}
+
 /// Filter for `Store::list_forgotten`. Mirrors
 /// the `(adapter, instance)` natural key the tombstones are
 /// indexed on so the operator can scope to a single source. `limit`
@@ -3269,6 +3281,73 @@ impl Store {
                 conflicts,
             },
         })
+    }
+
+    /// Return the **full** record-id list for a single reconcile bucket
+    /// (uncapped, sorted record_id ASC). Built for R147 reconcile-export
+    /// — `run_export_with_ids` consumes the result and writes the diff
+    /// into a fresh round-trip file. Read-only.
+    pub fn reconcile_bucket_ids(
+        &self,
+        left: &ReconcileSourceSelector,
+        right: &ReconcileSourceSelector,
+        bucket: ReconcileBucket,
+    ) -> Result<Vec<RecordId>> {
+        // Re-uses the same identity-key resolution as `reconcile_sources`
+        // so a follow-up export aligns 1:1 with the diff the operator saw.
+        type SideRow = (String, RecordId);
+        let read_side = |sel: &ReconcileSourceSelector| -> Result<Vec<SideRow>> {
+            let inst = sel.instance.clone().unwrap_or_default();
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, metadata, native_id \
+                 FROM records WHERE adapter = ?1 AND instance = ?2 \
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![sel.adapter, inst], |r| {
+                    let id: String = r.get(0)?;
+                    let metadata_json: Option<String> = r.get(1)?;
+                    let native_id: Option<String> = r.get(2)?;
+                    Ok((id, metadata_json, native_id))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut out: Vec<SideRow> = Vec::with_capacity(rows.len());
+            for (rid, metadata_json, native_id) in rows {
+                let metadata: serde_json::Value = metadata_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let identity = metadata
+                    .get("anamnesis_native_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .or(native_id);
+                if let Some(key) = identity {
+                    out.push((key, RecordId(rid)));
+                }
+            }
+            Ok(out)
+        };
+        let left_rows = read_side(left)?;
+        let right_rows = read_side(right)?;
+        let left_keys: std::collections::HashSet<String> =
+            left_rows.iter().map(|r| r.0.clone()).collect();
+        let right_keys: std::collections::HashSet<String> =
+            right_rows.iter().map(|r| r.0.clone()).collect();
+        let bucket_rows = match bucket {
+            ReconcileBucket::OnlyLeft => left_rows
+                .into_iter()
+                .filter(|(k, _)| !right_keys.contains(k))
+                .map(|(_, id)| id)
+                .collect(),
+            ReconcileBucket::OnlyRight => right_rows
+                .into_iter()
+                .filter(|(k, _)| !left_keys.contains(k))
+                .map(|(_, id)| id)
+                .collect(),
+        };
+        Ok(bucket_rows)
     }
 
     /// Round 78 (PR-78): apply or remove user-tags on a record.
@@ -10120,6 +10199,46 @@ mod tests {
             5,
             "samples respect the cap"
         );
+    }
+
+    #[test]
+    fn reconcile_bucket_ids_returns_only_left_full_ids() {
+        let store = Store::open_in_memory().unwrap();
+        seed_reconcile_fixture(&store);
+        let ids = store
+            .reconcile_bucket_ids(
+                &ReconcileSourceSelector {
+                    adapter: "mem0".into(),
+                    instance: None,
+                },
+                &ReconcileSourceSelector {
+                    adapter: "letta".into(),
+                    instance: None,
+                },
+                ReconcileBucket::OnlyLeft,
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 1, "shared-only-mem0");
+    }
+
+    #[test]
+    fn reconcile_bucket_ids_returns_only_right_full_ids() {
+        let store = Store::open_in_memory().unwrap();
+        seed_reconcile_fixture(&store);
+        let ids = store
+            .reconcile_bucket_ids(
+                &ReconcileSourceSelector {
+                    adapter: "mem0".into(),
+                    instance: None,
+                },
+                &ReconcileSourceSelector {
+                    adapter: "letta".into(),
+                    instance: None,
+                },
+                ReconcileBucket::OnlyRight,
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 1, "shared-only-letta");
     }
 
     #[test]
