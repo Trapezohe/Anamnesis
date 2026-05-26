@@ -3780,6 +3780,15 @@ fn cmd_reconcile_export(
         )
     });
 
+    // Match the MCP path: refuse to overwrite. Streaming jsonl/csv would
+    // otherwise truncate an existing file via File::create.
+    if out.exists() {
+        return Err(anyhow!(
+            "refusing to overwrite existing path {}; pick a fresh --out path",
+            out.display()
+        ));
+    }
+
     let store = Store::open(db_path(data_dir))?;
     let ids: Vec<String> = store
         .reconcile_bucket_ids(&left, &right, bucket)?

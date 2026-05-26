@@ -137,6 +137,34 @@ fn omitted_format_errors_when_lagging_has_no_round_trip_target() {
 }
 
 #[test]
+fn refuses_to_overwrite_existing_jsonl_target() {
+    let dir = tempfile::tempdir().unwrap();
+    init_db(dir.path());
+    seed(dir.path());
+    let out = dir.path().join("exists.jsonl");
+    std::fs::write(&out, b"existing").unwrap();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "reconcile-export",
+            "--left",
+            "mem0",
+            "--right",
+            "letta",
+            "--bucket",
+            "only-left",
+            "--format",
+            "jsonl",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("refusing to overwrite"));
+    assert_eq!(std::fs::read(&out).unwrap(), b"existing");
+}
+
+#[test]
 fn explicit_mismatch_succeeds_with_warning() {
     let dir = tempfile::tempdir().unwrap();
     init_db(dir.path());
