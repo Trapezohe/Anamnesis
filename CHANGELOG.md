@@ -5,6 +5,22 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 ## [Unreleased]
 
 ### Added
+- **`import <target> --reconcile-export-*` derives the format too** — the
+  post-import drift hook's `--reconcile-export-format` is now optional. The
+  hook is always `only-left` (imported side = left), so the lagging adapter
+  is always `--reconcile-export-against`; omit the format and it derives
+  that adapter's canonical round-trip writer, erroring (before the import
+  commits) if it has none. Explicit mismatch still runs with a `warning`.
+  Audit gains `format_source` / `lagging_adapter` /
+  `canonical_round_trip_format`. Brings the post-import hook to parity with
+  the standalone `reconcile-export` (every reconcile-export surface now
+  derives).
+
+### Fixed
+- **`import generic-mcp --reconcile-export-*` now runs the post-import drift
+  hook.** The generic-mcp path early-returned before the shared hook, so the
+  requested drift artifact was silently skipped. Routed through the same
+  `run_post_import_reconcile_export` tail as every other adapter.
 - **`reconcile-export` derives the round-trip format from the lagging
   adapter** (CLI `--format` and MCP `reconcile_export_bucket.format` are now
   optional). Omit it and the lagging side of the bucket (`only-left` → right,

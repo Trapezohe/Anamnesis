@@ -277,3 +277,69 @@ fn cli_source_add_then_import_generic_mcp_pulls_from_upstream() {
         "last_import_at must be set after a successful import"
     );
 }
+
+/// R151 regression: `import generic-mcp ... --reconcile-export-*` must run
+/// the post-import drift hook. Before R151 the generic-mcp path
+/// early-returned and silently skipped it. `against=mem0` derives the
+/// `mem0-sqlite` round-trip format.
+#[test]
+fn generic_mcp_import_runs_post_import_reconcile_export_hook() {
+    let up_dir = tempfile::tempdir().expect("upstream tempdir");
+    let down_dir = tempfile::tempdir().expect("downstream tempdir");
+    let token = "r151-token-9a3f";
+
+    seed_upstream_record(up_dir.path());
+    let (up_child, addr) = spawn_upstream(up_dir.path(), token);
+    let _guard = Guard(up_child);
+
+    for args in [
+        vec!["init"],
+        vec![
+            "source",
+            "add",
+            "generic-mcp",
+            "--instance",
+            "loopback",
+            "--url",
+            &format!("http://{addr}"),
+            "--token-env",
+            "ANAMNESIS_R151_TOKEN",
+        ],
+    ] {
+        let status = Command::new(anamnesis_bin())
+            .env("ANAMNESIS_DATA_DIR", down_dir.path())
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn setup command");
+        assert!(status.success(), "setup failed: {args:?}");
+    }
+
+    let out = down_dir.path().join("drift.db");
+    let output = Command::new(anamnesis_bin())
+        .env("ANAMNESIS_DATA_DIR", down_dir.path())
+        .env("ANAMNESIS_R151_TOKEN", token)
+        .args([
+            "import",
+            "generic-mcp:loopback",
+            "--no-embed",
+            "--reconcile-export-against",
+            "mem0",
+            "--reconcile-export-out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn import with hook");
+    assert!(output.status.success(), "import failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("reconcile-export: wrote"),
+        "post-import hook must run for generic-mcp (was silently skipped): {stdout}"
+    );
+    assert!(
+        stdout.contains("format=mem0-sqlite [derived]"),
+        "format derived from against=mem0: {stdout}"
+    );
+    assert!(out.is_file(), "drift artifact must be written");
+}
