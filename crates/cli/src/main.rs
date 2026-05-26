@@ -130,7 +130,7 @@ enum Command {
         /// this `adapter[:instance]` (treating the just-imported side as
         /// LEFT) and write the `only-left` bucket through a round-trip
         /// writer. The lagging adapter is always this `against` side.
-        /// Requires `--reconcile-export-out`; skipped on `--dry-run`.
+        /// Requires `--reconcile-export-out`; incompatible with `--dry-run`.
         #[arg(long, requires = "reconcile_export_out")]
         reconcile_export_against: Option<String>,
         /// Output path for the drift artifact (file or directory,
@@ -2356,7 +2356,14 @@ async fn cmd_import(
             token.as_deref(),
             instance,
         );
-        return run_import(data_dir, &adapter, dry_run, no_embed, None, true, scan_opts).await;
+        run_import(data_dir, &adapter, dry_run, no_embed, None, true, scan_opts).await?;
+        return run_post_import_reconcile_export(
+            data_dir,
+            target,
+            adapter_id,
+            instance,
+            reconcile_export,
+        );
     }
 
     let (location, source_was_explicit) = match path_override {
@@ -2532,59 +2539,79 @@ async fn cmd_import(
         )),
     };
     import_result?;
+    run_post_import_reconcile_export(data_dir, target, adapter_id, instance, reconcile_export)
+}
 
-    // R148: post-import drift artifact. Runs ONLY after a successful
-    // non-dry-run import; failures inside the hook surface but don't
-    // roll back the import (the data is already persisted).
-    if let Some((right, out, format, format_source, canonical, warning)) = reconcile_export {
-        let store = Store::open(db_path(data_dir))?;
-        let left = anamnesis_store::ReconcileSourceSelector {
-            adapter: adapter_id.to_string(),
-            instance: instance.map(str::to_owned),
-        };
-        let ids: Vec<String> = store
-            .reconcile_bucket_ids(&left, &right, anamnesis_store::ReconcileBucket::OnlyLeft)?
-            .into_iter()
-            .map(|r| r.0)
-            .collect();
-        let outcome =
-            anamnesis_export::run_export_with_ids(&store, &ids, format, Some(&out), None)?;
-        audit(data_dir).record(anamnesis_core::AuditEntry::new(
-            "reconcile_export_post_import",
-            serde_json::json!({
-                "left":    { "adapter": left.adapter,  "instance": left.instance.clone().unwrap_or_default() },
-                "right":   { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
-                "bucket":  "only-left",
-                "format":  format.as_token(),
-                "format_source": format_source,
-                "lagging_adapter": right.adapter,
-                "canonical_round_trip_format": canonical.map(|f| f.as_token()),
-                "out":     outcome.out.as_ref().map(|p| p.display().to_string()),
-                "records": outcome.records,
-            }),
-        ));
-        if let Some(w) = &warning {
-            eprintln!("warning: {w}");
-        }
-        let right_label = match &right.instance {
-            Some(inst) => format!("{}:{}", right.adapter, inst),
-            None => right.adapter.clone(),
-        };
-        println!(
-            "reconcile-export: wrote {} record(s) from {target} → {right_label} drift bucket \
-             into {} ({} bytes, lagging={}, format={} [{format_source}]). Feed it to \
-             {right_label}'s importer and re-import into Anamnesis to clear the drift.",
-            outcome.records,
-            outcome
-                .out
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            outcome.bytes.unwrap_or(0),
-            right.adapter,
-            format.as_token(),
-        );
+/// Resolved reconcile-export hook: (against selector, out, format,
+/// `"derived"`/`"explicit"`, canonical format, optional mismatch warning).
+type ReconcileExportPlan = (
+    anamnesis_store::ReconcileSourceSelector,
+    std::path::PathBuf,
+    anamnesis_export::ExportFormat,
+    &'static str,
+    Option<anamnesis_export::ExportFormat>,
+    Option<String>,
+);
+
+/// R148/R151 post-import drift artifact. Runs after a successful
+/// non-dry-run import for every target; a failure here surfaces but does
+/// not roll back the already-persisted import.
+fn run_post_import_reconcile_export(
+    data_dir: &std::path::Path,
+    target: &str,
+    adapter_id: &str,
+    instance: Option<&str>,
+    plan: Option<ReconcileExportPlan>,
+) -> Result<()> {
+    let Some((right, out, format, format_source, canonical, warning)) = plan else {
+        return Ok(());
+    };
+    let store = Store::open(db_path(data_dir))?;
+    let left = anamnesis_store::ReconcileSourceSelector {
+        adapter: adapter_id.to_string(),
+        instance: instance.map(str::to_owned),
+    };
+    let ids: Vec<String> = store
+        .reconcile_bucket_ids(&left, &right, anamnesis_store::ReconcileBucket::OnlyLeft)?
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    let outcome = anamnesis_export::run_export_with_ids(&store, &ids, format, Some(&out), None)?;
+    audit(data_dir).record(anamnesis_core::AuditEntry::new(
+        "reconcile_export_post_import",
+        serde_json::json!({
+            "left":    { "adapter": left.adapter,  "instance": left.instance.clone().unwrap_or_default() },
+            "right":   { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
+            "bucket":  "only-left",
+            "format":  format.as_token(),
+            "format_source": format_source,
+            "lagging_adapter": right.adapter,
+            "canonical_round_trip_format": canonical.map(|f| f.as_token()),
+            "out":     outcome.out.as_ref().map(|p| p.display().to_string()),
+            "records": outcome.records,
+        }),
+    ));
+    if let Some(w) = &warning {
+        eprintln!("warning: {w}");
     }
+    let right_label = match &right.instance {
+        Some(inst) => format!("{}:{}", right.adapter, inst),
+        None => right.adapter.clone(),
+    };
+    println!(
+        "reconcile-export: wrote {} record(s) from {target} → {right_label} drift bucket \
+         into {} ({} bytes, lagging={}, format={} [{format_source}]). Feed it to \
+         {right_label}'s importer and re-import into Anamnesis to clear the drift.",
+        outcome.records,
+        outcome
+            .out
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        outcome.bytes.unwrap_or(0),
+        right.adapter,
+        format.as_token(),
+    );
     Ok(())
 }
 
