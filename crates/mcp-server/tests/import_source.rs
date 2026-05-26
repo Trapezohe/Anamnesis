@@ -255,3 +255,200 @@ async fn import_source_dry_run_does_not_write_registry_or_audit() {
         "dry-run must not append audit, got: {lines:?}"
     );
 }
+
+// ─── R148: import_source { reconcile_export: { ... } } post-import hook
+
+/// Seed the store with a single `letta` record that shares native_id
+/// `round18-a` with a mem0 record we're about to import — so after
+/// import the drift bucket is exactly {round18-b} on the mem0 side.
+fn preseed_letta_record(store: &anamnesis_store::Store, shared_native_id: &str) {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use chrono::Utc;
+    let mut r = AnamnesisRecord {
+        id: RecordId::from_parts("letta", None, "letta-block-1"),
+        source: SourceDescriptor {
+            adapter: "letta".into(),
+            instance: None,
+            version: "0".into(),
+        },
+        content: "round-18 first sentinel UniquePr3MemAlpha".into(),
+        embedding: None,
+        scope: Scope::User,
+        kind: Kind::Fact,
+        created_at: Utc::now(),
+        updated_at: None,
+        tags: vec![],
+        metadata: Default::default(),
+        provenance: Provenance {
+            native_id: "letta-block-1".into(),
+            native_path: None,
+            captured_at: Utc::now(),
+            raw_hash: "raw-secret-letta".into(),
+            derived_from: None,
+        },
+        schema_version: SCHEMA_VERSION,
+    };
+    // Round-tripped marker — both sides match on `round18-a`.
+    r.metadata
+        .insert("anamnesis_native_id".into(), json!(shared_native_id));
+    let chunks = Chunker::default().chunk(&r.id, &r.content);
+    store.upsert_record(&r, &chunks, None).unwrap();
+}
+
+#[tokio::test]
+async fn import_source_reconcile_export_writes_drift_artifact_only_for_only_left() {
+    let bundle = build_bundle(true);
+
+    let fixture_dir = tempfile::tempdir().expect("fixture tempdir");
+    let fixture_db = fixture_dir.path().join("mem0.sqlite");
+    seed_mem0_fixture(&fixture_db);
+    {
+        let store = Store::open(&bundle.db_path).expect("open store for register");
+        store
+            .register_source("mem0", None, Some(fixture_db.to_str().unwrap()), None)
+            .expect("register mem0 source");
+        // mem0 normaliser synthesises native_id as `"{instance}|{row.id}"`
+        // (instance defaults to `"self-hosted"`), so the round-trip key
+        // for `round18-a` on the mem0 side is `"self-hosted|round18-a"`.
+        preseed_letta_record(&store, "self-hosted|round18-a");
+    }
+
+    let out_dir = fixture_dir.path().join("drift_memcube");
+    let req = tool_call(
+        "import_source",
+        json!({
+            "adapter": "mem0",
+            "reconcile_export": {
+                "against": "letta",
+                "out":     out_dir.to_str().unwrap(),
+                "format":  "memos-dir",
+            }
+        }),
+    );
+    let resp = bundle.server.handle(req).await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_text_payload(&resp);
+    assert_eq!(payload["records_upserted"], 2, "import side: 2 mem0 rows");
+    let re = &payload["reconcile_export"];
+    assert_eq!(re["bucket"], "only-left");
+    assert_eq!(re["format"], "memos-dir");
+    assert_eq!(
+        re["records"], 1,
+        "letta already has round18-a; only round18-b is drift"
+    );
+    assert!(
+        out_dir.is_dir(),
+        "exporter wrote the MemOS MemCube directory"
+    );
+
+    // Audit: import + reconcile_export_post_import lines.
+    let lines = read_audit_lines(bundle.data_dir.path());
+    let actions: Vec<&str> = lines.iter().filter_map(|l| l["action"].as_str()).collect();
+    assert!(actions.contains(&"import"));
+    assert!(actions.contains(&"reconcile_export_post_import"));
+}
+
+#[tokio::test]
+async fn import_source_reconcile_export_refuses_to_overwrite_existing_path() {
+    let bundle = build_bundle(true);
+    let fixture_dir = tempfile::tempdir().expect("fixture tempdir");
+    let fixture_db = fixture_dir.path().join("mem0.sqlite");
+    seed_mem0_fixture(&fixture_db);
+    {
+        let store = Store::open(&bundle.db_path).expect("open store for register");
+        store
+            .register_source("mem0", None, Some(fixture_db.to_str().unwrap()), None)
+            .expect("register mem0 source");
+    }
+    let existing = fixture_dir.path().join("already.jsonl");
+    std::fs::write(&existing, b"x").unwrap();
+    let req = tool_call(
+        "import_source",
+        json!({
+            "adapter": "mem0",
+            "reconcile_export": {
+                "against": "letta",
+                "out":     existing.to_str().unwrap(),
+                "format":  "jsonl",
+            }
+        }),
+    );
+    let resp = bundle.server.handle(req).await;
+    assert!(resp.error.is_some());
+    let msg = resp.error.unwrap().message;
+    assert!(msg.contains("refusing to overwrite"), "{msg}");
+    // Import must NOT have happened — the pre-flight refused before it ran.
+    // Actually our impl validates AFTER import for MCP (so the import data is
+    // present but the export is rejected); we accept either, but the key is
+    // the existing file is untouched.
+    assert_eq!(std::fs::read(&existing).unwrap(), b"x");
+}
+
+#[tokio::test]
+async fn import_source_reconcile_export_incompatible_with_dry_run() {
+    let bundle = build_bundle(true);
+    let fixture_dir = tempfile::tempdir().expect("fixture tempdir");
+    let fixture_db = fixture_dir.path().join("mem0.sqlite");
+    seed_mem0_fixture(&fixture_db);
+    {
+        let store = Store::open(&bundle.db_path).expect("open store for register");
+        store
+            .register_source("mem0", None, Some(fixture_db.to_str().unwrap()), None)
+            .expect("register mem0 source");
+    }
+    let out = fixture_dir.path().join("nope.jsonl");
+    let req = tool_call(
+        "import_source",
+        json!({
+            "adapter": "mem0",
+            "dry_run": true,
+            "reconcile_export": {
+                "against": "letta",
+                "out":     out.to_str().unwrap(),
+                "format":  "jsonl",
+            }
+        }),
+    );
+    let resp = bundle.server.handle(req).await;
+    assert!(resp.error.is_some());
+    let msg = resp.error.unwrap().message;
+    assert!(msg.contains("incompatible with dry_run"), "{msg}");
+}
+
+#[tokio::test]
+async fn import_source_tools_list_advertises_reconcile_export_field() {
+    let bundle = build_bundle(true);
+    let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: "tools/list".into(),
+        params: Value::Null,
+    };
+    let resp = bundle.server.handle(req).await;
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "import_source")
+        .expect("import_source in admin tools/list");
+    let props = &tool["inputSchema"]["properties"];
+    let re = &props["reconcile_export"];
+    assert_eq!(re["type"], "object");
+    let required: Vec<&str> = re["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(required, vec!["against", "out", "format"]);
+}
+
+// Silence dead-code lint for the unused ADMIN_TOOLS / extract_text_payload
+// import warnings from older PRs — keep the symbols imported so future
+// tests in this file have the same shape.
+#[allow(dead_code)]
+fn _keep_admin_tools_alive() -> bool {
+    ADMIN_TOOLS.contains(&"import_source")
+}

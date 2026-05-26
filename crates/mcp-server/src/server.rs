@@ -1746,7 +1746,110 @@ impl AnamnesisServer {
             other => return Err(format!("unknown adapter: {other}")),
         };
 
-        serde_json::to_value(summary).map_err(|e| e.to_string())
+        // R148 — post-import drift artifact hook (admin path already).
+        // Optional. When the operator passes `reconcile_export`, we run
+        // the R146 diff (just-imported = LEFT) and pipe the `only_left`
+        // bucket through the R138/R139/R145 round-trip writers.
+        // Validation up-front: all-or-none, refuse to overwrite, valid
+        // format token. Failures here surface as tool errors but DO NOT
+        // roll back the already-committed import.
+        let reconcile_export_meta = if !dry_run {
+            if let Some(obj) = args.get("reconcile_export") {
+                let against = obj
+                    .get("against")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "import_source.reconcile_export.against is required".to_string()
+                    })?;
+                let against_instance = obj
+                    .get("against_instance")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let out = obj
+                    .get("out")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| "import_source.reconcile_export.out is required".to_string())?;
+                let fmt = obj.get("format").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "import_source.reconcile_export.format is required".to_string()
+                })?;
+                let format = anamnesis_export::ExportFormat::parse(fmt)
+                    .map_err(|e| format!("import_source.reconcile_export.format: {e}"))?;
+                if out.exists() {
+                    return Err(format!(
+                        "import_source.reconcile_export: refusing to overwrite existing path {}",
+                        out.display()
+                    ));
+                }
+                let left = anamnesis_store::ReconcileSourceSelector {
+                    adapter: adapter_id.to_string(),
+                    instance: instance.map(str::to_owned),
+                };
+                let right = anamnesis_store::ReconcileSourceSelector {
+                    adapter: against.to_string(),
+                    instance: against_instance.clone(),
+                };
+                let ids: Vec<String> = self
+                    .store
+                    .reconcile_bucket_ids(&left, &right, anamnesis_store::ReconcileBucket::OnlyLeft)
+                    .map_err(|e| format!("import_source.reconcile_export: {e}"))?
+                    .into_iter()
+                    .map(|r| r.0)
+                    .collect();
+                let outcome = anamnesis_export::run_export_with_ids(
+                    &self.store,
+                    &ids,
+                    format,
+                    Some(&out),
+                    None,
+                )
+                .map_err(|e| format!("import_source.reconcile_export: {e}"))?;
+                anamnesis_core::Audit::new(&self.data_dir).record(
+                    anamnesis_core::AuditEntry::new(
+                        "reconcile_export_post_import",
+                        json!({
+                            "left":     { "adapter": left.adapter, "instance": left.instance.clone().unwrap_or_default() },
+                            "right":    { "adapter": right.adapter, "instance": against_instance.clone().unwrap_or_default() },
+                            "bucket":   "only-left",
+                            "format":   format.as_token(),
+                            "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+                            "records":  outcome.records,
+                            "via":      "mcp",
+                        }),
+                    ),
+                );
+                Some(json!({
+                    "against":         against,
+                    "against_instance": against_instance,
+                    "bucket":          "only-left",
+                    "format":          format.as_token(),
+                    "out":             outcome.out.as_ref().map(|p| p.display().to_string()),
+                    "records":         outcome.records,
+                    "bytes":           outcome.bytes,
+                }))
+            } else {
+                None
+            }
+        } else if args.get("reconcile_export").is_some() {
+            return Err(
+                "import_source.reconcile_export is incompatible with dry_run \
+                 (no commit = no drift artifact)"
+                    .to_string(),
+            );
+        } else {
+            None
+        };
+
+        let mut payload = serde_json::to_value(summary).map_err(|e| e.to_string())?;
+        if let Some(meta) = reconcile_export_meta {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("reconcile_export".into(), meta);
+            }
+        }
+        Ok(payload)
     }
 
     async fn tool_trace_provenance(&self, args: Value) -> Result<Value, String> {
@@ -4425,6 +4528,23 @@ fn tools_list_payload_all() -> Value {
                             "type": "boolean",
                             "description": "Scan-only: count raw records without writing. Source registry and \
                                             audit log are not touched in dry-run."
+                        },
+                        "reconcile_export": {
+                            "type": "object",
+                            "description": "After a successful import, run the R146 reconcile diff against \
+                                            `against` (the just-imported source is LEFT) and write the \
+                                            `only-left` bucket through the round-trip writer chosen by \
+                                            `format`. Closes the import → drift-export loop in one tool call. \
+                                            Incompatible with `dry_run`. Refuses to overwrite an existing \
+                                            output path. Failures here surface as tool errors but do NOT \
+                                            roll back the already-committed import.",
+                            "properties": {
+                                "against":           { "type": "string", "description": "Right-side adapter id." },
+                                "against_instance":  { "type": "string", "description": "Right-side instance (optional)." },
+                                "out":               { "type": "string", "description": "Absolute output path; must not exist." },
+                                "format":            { "type": "string", "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"], "description": "Round-trip writer." }
+                            },
+                            "required": ["against", "out", "format"]
                         }
                     },
                     "required": ["adapter"]
