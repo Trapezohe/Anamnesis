@@ -4,6 +4,19 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+- **`reconcile-export` derives the round-trip format from the lagging
+  adapter** (CLI `--format` and MCP `reconcile_export_bucket.format` are now
+  optional). Omit it and the lagging side of the bucket (`only-left` → right,
+  `only-right` → left) selects its canonical writer
+  (`mem0`→`mem0-sqlite`, `letta`→`letta-sqlite`, `memos`→`memos-dir`); a
+  lagging adapter with no round-trip target errors clearly. An explicit
+  format that disagrees with the canonical one still runs but emits a
+  `warning`. Responses/audit gain `format_source`, `lagging_adapter`, and
+  `canonical_round_trip_format`. The adapter→format map now lives in
+  `anamnesis-export::round_trip_format_for_adapter`, the single source of
+  truth shared with `discover_adapters`.
+
 ### Infrastructure
 - **Crates.io publish prep**: workspace `categories` (`command-line-utilities`,
   `database`, `development-tools`) + `keywords` (`memory`, `agent`, `mcp`,

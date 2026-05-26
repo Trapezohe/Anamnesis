@@ -2938,12 +2938,37 @@ impl AnamnesisServer {
                 ));
             }
         };
-        let format_token = args
-            .get("format")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "reconcile_export_bucket.format is required".to_string())?;
-        let format = anamnesis_export::ExportFormat::parse(format_token)
-            .map_err(|e| format!("reconcile_export_bucket: {e}"))?;
+        // only-left = right lags (receives the export); only-right = left lags.
+        let lagging = match bucket {
+            anamnesis_store::ReconcileBucket::OnlyLeft => right.adapter.clone(),
+            anamnesis_store::ReconcileBucket::OnlyRight => left.adapter.clone(),
+        };
+        let canonical = anamnesis_export::round_trip_format_for_adapter(&lagging);
+        let (format, format_source) = match args.get("format").and_then(|v| v.as_str()) {
+            Some(t) => (
+                anamnesis_export::ExportFormat::parse(t)
+                    .map_err(|e| format!("reconcile_export_bucket: {e}"))?,
+                "explicit",
+            ),
+            None => match canonical {
+                Some(f) => (f, "derived"),
+                None => {
+                    return Err(format!(
+                        "reconcile_export_bucket: no round-trip export format for lagging \
+                         adapter `{lagging}`; pass `format` explicitly (e.g. jsonl/csv)"
+                    ));
+                }
+            },
+        };
+        let warning = (matches!((format_source, canonical), ("explicit", Some(c)) if c != format))
+            .then(|| {
+                format!(
+                    "explicit format `{}` differs from `{lagging}`'s canonical round-trip \
+                     format `{}`; the lagging adapter's importer may not read it natively",
+                    format.as_token(),
+                    canonical.unwrap().as_token(),
+                )
+            });
         let out = args
             .get("out")
             .and_then(|v| v.as_str())
@@ -2977,6 +3002,9 @@ impl AnamnesisServer {
                 "right":    { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
                 "bucket":   bucket_token,
                 "format":   format.as_token(),
+                "format_source": format_source,
+                "lagging_adapter": lagging,
+                "canonical_round_trip_format": canonical.map(|f| f.as_token()),
                 "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
                 "records":  outcome.records,
                 "via":      "mcp",
@@ -2984,7 +3012,7 @@ impl AnamnesisServer {
         ));
 
         let summary = format!(
-            "exported {} record(s) from bucket={} to {} (format={}, {} bytes).",
+            "exported {} record(s) from bucket={} to {} (lagging={lagging}, format={} [{format_source}], {} bytes).",
             outcome.records,
             bucket_token,
             outcome
@@ -2999,6 +3027,10 @@ impl AnamnesisServer {
             "summary":  summary,
             "bucket":   bucket_token,
             "format":   format.as_token(),
+            "format_source": format_source,
+            "lagging_adapter": lagging,
+            "canonical_round_trip_format": canonical.map(|f| f.as_token()),
+            "warning":  warning,
             "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
             "records":  outcome.records,
             "bytes":    outcome.bytes,
@@ -5018,14 +5050,17 @@ fn tools_list_payload_all() -> Value {
                         "format": {
                             "type": "string",
                             "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"],
-                            "description": "Output format. Pick the one the lagging adapter reads."
+                            "description": "Output format. Optional: omit to derive the lagging \
+                                            adapter's canonical round-trip format (mem0/letta/memos); \
+                                            errors if it has none. An explicit value that disagrees \
+                                            with the canonical one is allowed but returns a `warning`."
                         },
                         "out": {
                             "type": "string",
                             "description": "Absolute path for the output file/dir. REQUIRED. Must not exist."
                         }
                     },
-                    "required": ["left", "right", "bucket", "format", "out"]
+                    "required": ["left", "right", "bucket", "out"]
                 }
             },
             {

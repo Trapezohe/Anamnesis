@@ -396,9 +396,10 @@ enum Command {
         #[arg(long, value_parser = ["only-left", "only-right"])]
         bucket: String,
         /// Output format: `jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`,
-        /// or `memos-dir`. Pick the one the lagging adapter reads.
+        /// or `memos-dir`. Omit to derive the lagging adapter's canonical
+        /// round-trip format; errors if it has none.
         #[arg(long)]
-        format: String,
+        format: Option<String>,
         /// Output path. Required for every format; must not exist.
         #[arg(long)]
         out: PathBuf,
@@ -1241,7 +1242,15 @@ async fn run() -> Result<()> {
             format,
             out,
             json,
-        } => cmd_reconcile_export(&data_dir, &left, &right, &bucket, &format, &out, json),
+        } => cmd_reconcile_export(
+            &data_dir,
+            &left,
+            &right,
+            &bucket,
+            format.as_deref(),
+            &out,
+            json,
+        ),
         Command::Unforget {
             record_id,
             json,
@@ -3722,7 +3731,7 @@ fn cmd_reconcile_export(
     left_token: &str,
     right_token: &str,
     bucket_token: &str,
-    format_token: &str,
+    format_token: Option<&str>,
     out: &std::path::Path,
     json: bool,
 ) -> Result<()> {
@@ -3737,7 +3746,49 @@ fn cmd_reconcile_export(
             ));
         }
     };
-    let format = anamnesis_export::ExportFormat::parse(format_token).map_err(|e| anyhow!("{e}"))?;
+    // The lagging adapter is the side missing the bucket's records: it
+    // receives the export. only-left = right lags; only-right = left lags.
+    let lagging = match bucket {
+        anamnesis_store::ReconcileBucket::OnlyLeft => &right.adapter,
+        anamnesis_store::ReconcileBucket::OnlyRight => &left.adapter,
+    };
+    let canonical = anamnesis_export::round_trip_format_for_adapter(lagging);
+
+    let (format, format_source) = match format_token {
+        Some(t) => (
+            anamnesis_export::ExportFormat::parse(t).map_err(|e| anyhow!("{e}"))?,
+            "explicit",
+        ),
+        None => match canonical {
+            Some(f) => (f, "derived"),
+            None => {
+                return Err(anyhow!(
+                    "no round-trip export format for lagging adapter `{lagging}`; \
+                     pass --format explicitly (e.g. jsonl/csv) to export anyway"
+                ));
+            }
+        },
+    };
+    let mismatch = matches!((format_source, canonical), ("explicit", Some(c)) if c != format);
+    let warning = mismatch.then(|| {
+        format!(
+            "explicit format `{}` differs from `{}`'s canonical round-trip format `{}`; \
+             the lagging adapter's importer may not read this file natively",
+            format.as_token(),
+            lagging,
+            canonical.unwrap().as_token(),
+        )
+    });
+
+    // Match the MCP path: refuse to overwrite. Streaming jsonl/csv would
+    // otherwise truncate an existing file via File::create.
+    if out.exists() {
+        return Err(anyhow!(
+            "refusing to overwrite existing path {}; pick a fresh --out path",
+            out.display()
+        ));
+    }
+
     let store = Store::open(db_path(data_dir))?;
     let ids: Vec<String> = store
         .reconcile_bucket_ids(&left, &right, bucket)?
@@ -3745,6 +3796,10 @@ fn cmd_reconcile_export(
         .map(|r| r.0)
         .collect();
     let outcome = anamnesis_export::run_export_with_ids(&store, &ids, format, Some(out), None)?;
+    let out_str = outcome.out.as_ref().map(|p| p.display().to_string());
+    if let Some(w) = &warning {
+        eprintln!("warning: {w}");
+    }
 
     audit(data_dir).record(anamnesis_core::AuditEntry::new(
         "reconcile_export",
@@ -3753,7 +3808,10 @@ fn cmd_reconcile_export(
             "right":    { "adapter": right.adapter, "instance": right.instance.clone().unwrap_or_default() },
             "bucket":   bucket_token,
             "format":   format.as_token(),
-            "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+            "format_source": format_source,
+            "lagging_adapter": lagging,
+            "canonical_round_trip_format": canonical.map(|f| f.as_token()),
+            "out":      out_str,
             "records":  outcome.records,
         }),
     ));
@@ -3762,34 +3820,31 @@ fn cmd_reconcile_export(
         let payload = serde_json::json!({
             "bucket":   bucket_token,
             "format":   format.as_token(),
-            "out":      outcome.out.as_ref().map(|p| p.display().to_string()),
+            "format_source": format_source,
+            "lagging_adapter": lagging,
+            "canonical_round_trip_format": canonical.map(|f| f.as_token()),
+            "warning":  warning,
+            "out":      out_str,
             "records":  outcome.records,
             "bytes":    outcome.bytes,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
+        let out_display = out_str.clone().unwrap_or_default();
         println!(
-            "exported {} record(s) from {} → {} ({} bytes) — bucket={}, format={}",
+            "exported {} record(s) → {} ({} bytes) — bucket={}, lagging={}, format={} ({})",
             outcome.records,
-            outcome
-                .out
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            "lagging adapter",
+            out_display,
             outcome.bytes.unwrap_or(0),
             bucket_token,
+            lagging,
             format.as_token(),
+            format_source,
         );
         println!(
-            "Next: feed `{}` to the lagging adapter's importer, then re-import \
+            "Next: feed `{out_display}` to {lagging}'s importer, then re-import \
              into Anamnesis. The next `reconcile` run should show those records \
-             moved into `both`.",
-            outcome
-                .out
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
+             moved into `both`."
         );
     }
     Ok(())

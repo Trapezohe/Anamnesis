@@ -39,25 +39,16 @@ struct AdapterCapability {
     round_trip_export_format: Option<&'static str>,
 }
 
-/// Format token for an adapter's round-trip export, when one exists.
-/// Single source of truth — the writer the operator should pick to
-/// fill this adapter from another side via the reconcile/export tools.
-/// Must always be a token `anamnesis_export::ExportFormat::parse` accepts.
+/// Round-trip export token for an adapter, when one exists. Delegates to
+/// `anamnesis_export::round_trip_format_for_adapter` — the single source of
+/// truth shared with `reconcile-export`.
 fn round_trip_format_for(adapter: &str) -> Option<&'static str> {
-    match adapter {
-        "mem0" => Some("mem0-sqlite"),
-        "letta" => Some("letta-sqlite"),
-        "memos" => Some("memos-dir"),
-        _ => None,
-    }
+    anamnesis_export::round_trip_format_for_adapter(adapter).map(|f| f.as_token())
 }
 
 /// Compile-time adapter roster — single source of truth.
-/// New adapter: edit this list AND [`registered_detectors`]; if it
-/// gains a round-trip target, edit [`round_trip_format_for`].
+/// New adapter: edit this list AND [`registered_detectors`].
 fn adapter_roster() -> Vec<AdapterCapability> {
-    // Hoisted to a const builder so every entry picks up
-    // `round_trip_export_format` through the shared `round_trip_format_for`.
     let row = |id: &'static str,
                detectable: bool,
                default_location_hint: Option<&'static str>,
