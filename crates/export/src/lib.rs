@@ -58,6 +58,19 @@ impl ExportFormat {
     }
 }
 
+/// Canonical round-trip export format for an adapter — the writer whose
+/// output that adapter's importer reads natively. Single source of truth
+/// shared by `discover_adapters` and `reconcile-export`. `None` = no
+/// round-trip target.
+pub fn round_trip_format_for_adapter(adapter: &str) -> Option<ExportFormat> {
+    match adapter {
+        "mem0" => Some(ExportFormat::Mem0Sqlite),
+        "letta" => Some(ExportFormat::LettaSqlite),
+        "memos" => Some(ExportFormat::MemosDir),
+        _ => None,
+    }
+}
+
 /// Selection filter. `None` everywhere = all live records.
 /// `source` / `instance` use the comma-separated OR grammar.
 #[derive(Debug, Clone, Default)]
@@ -338,6 +351,24 @@ mod tests {
     fn format_parse_rejects_unknown() {
         let err = ExportFormat::parse("yaml").unwrap_err();
         assert!(matches!(err, ExportError::UnknownFormat(_)));
+    }
+
+    #[test]
+    fn round_trip_format_for_adapter_maps_the_three_targets() {
+        assert_eq!(
+            round_trip_format_for_adapter("mem0"),
+            Some(ExportFormat::Mem0Sqlite)
+        );
+        assert_eq!(
+            round_trip_format_for_adapter("letta"),
+            Some(ExportFormat::LettaSqlite)
+        );
+        assert_eq!(
+            round_trip_format_for_adapter("memos"),
+            Some(ExportFormat::MemosDir)
+        );
+        assert_eq!(round_trip_format_for_adapter("claude-code"), None);
+        assert_eq!(round_trip_format_for_adapter("generic-mcp"), None);
     }
 
     #[test]

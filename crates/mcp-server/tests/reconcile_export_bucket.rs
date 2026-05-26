@@ -203,6 +203,104 @@ async fn reconcile_export_bucket_rejects_invalid_bucket() {
 }
 
 #[tokio::test]
+async fn reconcile_export_bucket_derives_format_from_lagging_adapter_when_omitted() {
+    // only-left => right (letta) lags => canonical letta-sqlite.
+    let (server, data) = build_bundle(true);
+    let out = data.path().join("derived.db");
+    let resp = server
+        .handle(tool_call(
+            "reconcile_export_bucket",
+            json!({
+                "left":  {"adapter": "mem0"},
+                "right": {"adapter": "letta"},
+                "bucket": "only-left",
+                "out": out.to_str().unwrap(),
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "letta-sqlite");
+    assert_eq!(payload["format_source"], "derived");
+    assert_eq!(payload["lagging_adapter"], "letta");
+    assert_eq!(payload["canonical_round_trip_format"], "letta-sqlite");
+    assert!(payload["warning"].is_null());
+    assert_eq!(payload["records"], 2);
+}
+
+#[tokio::test]
+async fn reconcile_export_bucket_omitted_format_errors_when_lagging_has_no_target() {
+    // only-left => lagging is claude-code, which has no round-trip target.
+    let (server, data) = build_bundle(true);
+    let out = data.path().join("nope.db");
+    let resp = server
+        .handle(tool_call(
+            "reconcile_export_bucket",
+            json!({
+                "left":  {"adapter": "mem0"},
+                "right": {"adapter": "claude-code"},
+                "bucket": "only-left",
+                "out": out.to_str().unwrap(),
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_some());
+    let msg = resp.error.unwrap().message;
+    assert!(msg.contains("no round-trip export format"), "{msg}");
+    assert!(msg.contains("claude-code"), "{msg}");
+    assert!(!out.exists(), "no file written on the derive-failure path");
+}
+
+#[tokio::test]
+async fn reconcile_export_bucket_explicit_mismatch_succeeds_with_warning() {
+    // Lagging is letta (canonical letta-sqlite); operator forces jsonl.
+    let (server, data) = build_bundle(true);
+    let out = data.path().join("forced.jsonl");
+    let resp = server
+        .handle(tool_call(
+            "reconcile_export_bucket",
+            json!({
+                "left":  {"adapter": "mem0"},
+                "right": {"adapter": "letta"},
+                "bucket": "only-left",
+                "format": "jsonl",
+                "out": out.to_str().unwrap(),
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format"], "jsonl");
+    assert_eq!(payload["format_source"], "explicit");
+    assert_eq!(payload["canonical_round_trip_format"], "letta-sqlite");
+    let warning = payload["warning"].as_str().expect("warning present");
+    assert!(warning.contains("differs"), "{warning}");
+    assert_eq!(payload["records"], 2);
+}
+
+#[tokio::test]
+async fn reconcile_export_bucket_explicit_match_has_no_warning() {
+    let (server, data) = build_bundle(true);
+    let out = data.path().join("match.db");
+    let resp = server
+        .handle(tool_call(
+            "reconcile_export_bucket",
+            json!({
+                "left":  {"adapter": "mem0"},
+                "right": {"adapter": "letta"},
+                "bucket": "only-left",
+                "format": "letta-sqlite",
+                "out": out.to_str().unwrap(),
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let payload = extract_payload(&resp);
+    assert_eq!(payload["format_source"], "explicit");
+    assert!(payload["warning"].is_null());
+}
+
+#[tokio::test]
 async fn reconcile_export_bucket_tools_list_schema() {
     let (server, _data) = build_bundle(true);
     let req = anamnesis_mcp_server::protocol::JsonRpcRequest {
@@ -224,7 +322,7 @@ async fn reconcile_export_bucket_tools_list_schema() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(required, vec!["left", "right", "bucket", "format", "out"]);
+    assert_eq!(required, vec!["left", "right", "bucket", "out"]);
     let bucket_enum: Vec<&str> = schema["properties"]["bucket"]["enum"]
         .as_array()
         .unwrap()
