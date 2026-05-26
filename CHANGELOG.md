@@ -5,6 +5,14 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 ## [Unreleased]
 
 ### Added
+- **`reconcile` / `reconcile_sources` surface the round-trip format per drift
+  direction.** Both the CLI diagnostic and the MCP tool now include a
+  `round_trip` block: for each direction (`only_left` lags right,
+  `only_right` lags left) it reports the lagging `{adapter, instance}` and
+  the `export_format` reconcile-export would derive (null if the lagging
+  adapter has no round-trip target). Closes the discovery→action gap — an
+  agent diagnosing drift no longer cross-references `discover_adapters` to
+  know what the export step will write. Purely additive.
 - **`import <target> --reconcile-export-*` derives the format too** — the
   post-import drift hook's `--reconcile-export-format` is now optional. The
   hook is always `only-left` (imported side = left), so the lagging adapter

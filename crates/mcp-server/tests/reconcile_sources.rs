@@ -155,6 +155,36 @@ async fn reconcile_sources_reports_drift_buckets() {
     assert_eq!(counts["conflicts"], 1);
     assert_eq!(counts["left_total"], 3);
     assert_eq!(counts["right_total"], 3);
+
+    // R152: each drift direction surfaces the lagging side + the format
+    // reconcile-export would derive. only_left lags right (letta);
+    // only_right lags left (mem0).
+    let rt = &payload["round_trip"];
+    assert_eq!(rt["only_left"]["lagging"]["adapter"], "letta");
+    assert_eq!(rt["only_left"]["export_format"], "letta-sqlite");
+    assert_eq!(rt["only_right"]["lagging"]["adapter"], "mem0");
+    assert_eq!(rt["only_right"]["export_format"], "mem0-sqlite");
+}
+
+#[tokio::test]
+async fn reconcile_sources_round_trip_export_format_is_null_for_no_target_adapter() {
+    let (server, _data) = build_bundle(false);
+    let resp = server
+        .handle(tool_call(
+            "reconcile_sources",
+            json!({
+                "left":  {"adapter": "mem0"},
+                "right": {"adapter": "claude-code"},
+            }),
+        ))
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let rt = &extract_payload(&resp)["round_trip"];
+    // only_left lags claude-code, which has no round-trip target.
+    assert_eq!(rt["only_left"]["lagging"]["adapter"], "claude-code");
+    assert!(rt["only_left"]["export_format"].is_null());
+    // only_right lags mem0 → mem0-sqlite.
+    assert_eq!(rt["only_right"]["export_format"], "mem0-sqlite");
 }
 
 #[tokio::test]

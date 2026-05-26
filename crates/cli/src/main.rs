@@ -3715,6 +3715,10 @@ fn cmd_reconcile(
                 "only_right": outcome.samples.only_right.iter().map(&render).collect::<Vec<_>>(),
                 "conflicts":  outcome.samples.conflicts.iter().map(&render).collect::<Vec<_>>(),
             },
+            "round_trip": {
+                "only_left":  reconcile_round_trip_dir(&outcome.right),
+                "only_right": reconcile_round_trip_dir(&outcome.left),
+            },
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -3757,8 +3761,35 @@ fn cmd_reconcile(
         print_bucket("only_left", &outcome.samples.only_left);
         print_bucket("only_right", &outcome.samples.only_right);
         print_bucket("conflicts", &outcome.samples.conflicts);
+        let fmt_hint = |lagging: &anamnesis_store::ReconcileSourceSelector| {
+            anamnesis_export::round_trip_format_for_adapter(&lagging.adapter)
+                .map(|f| f.as_token())
+                .unwrap_or("none")
+        };
+        println!(
+            "  round_trip: only_left -> lagging={} format={}; only_right -> lagging={} format={}",
+            label(&outcome.right),
+            fmt_hint(&outcome.right),
+            label(&outcome.left),
+            fmt_hint(&outcome.left),
+        );
     }
     Ok(())
+}
+
+/// R152 reconcile diagnostic hint: the lagging side of a drift bucket and
+/// the format `reconcile-export` would derive for it (null if none).
+fn reconcile_round_trip_dir(
+    lagging: &anamnesis_store::ReconcileSourceSelector,
+) -> serde_json::Value {
+    serde_json::json!({
+        "lagging": {
+            "adapter":  lagging.adapter,
+            "instance": lagging.instance.clone().unwrap_or_default(),
+        },
+        "export_format": anamnesis_export::round_trip_format_for_adapter(&lagging.adapter)
+            .map(|f| f.as_token()),
+    })
 }
 
 /// Parse `adapter[:instance]` shorthand used by `--left`/`--right`.
