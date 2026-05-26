@@ -119,6 +119,31 @@ fn omitted_format_errors_before_import_when_against_has_no_target() {
 }
 
 #[test]
+fn reconcile_export_with_dry_run_is_rejected() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    init_and_seed(home.path(), data.path());
+    let out = data.path().join("nope.db");
+    cli()
+        .env("HOME", home.path())
+        .env("ANAMNESIS_DATA_DIR", data.path())
+        .args([
+            "import",
+            "claude-code",
+            "--no-embed",
+            "--dry-run",
+            "--reconcile-export-against",
+            "mem0",
+            "--reconcile-export-out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("incompatible with --dry-run"));
+    assert!(!out.exists());
+}
+
+#[test]
 fn format_without_against_is_rejected_by_clap() {
     let home = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
