@@ -2866,6 +2866,15 @@ impl AnamnesisServer {
                 "instance": s.instance.clone().unwrap_or_default(),
             })
         };
+        // R152: per drift direction, the lagging side (only_left lags right,
+        // only_right lags left) and the format reconcile-export would derive.
+        let round_trip_dir = |lagging: &anamnesis_store::ReconcileSourceSelector| {
+            json!({
+                "lagging": render_side(lagging),
+                "export_format": anamnesis_export::round_trip_format_for_adapter(&lagging.adapter)
+                    .map(|f| f.as_token()),
+            })
+        };
         let summary = format!(
             "{} only_left, {} only_right, {} both, {} conflicts (left_total={}, right_total={}, \
              identity_included: {}).",
@@ -2895,6 +2904,10 @@ impl AnamnesisServer {
                 "only_left":  outcome.samples.only_left.iter().map(&render).collect::<Vec<_>>(),
                 "only_right": outcome.samples.only_right.iter().map(&render).collect::<Vec<_>>(),
                 "conflicts":  outcome.samples.conflicts.iter().map(&render).collect::<Vec<_>>(),
+            },
+            "round_trip": {
+                "only_left":  round_trip_dir(&outcome.right),
+                "only_right": round_trip_dir(&outcome.left),
             },
         }))
     }
