@@ -32,103 +32,136 @@ struct AdapterCapability {
     format: &'static str,
     /// Suggested registration command.
     registration_hint: &'static str,
+    /// R149: round-trip export format token an MCP peer can pass to
+    /// `export_memories` / `reconcile_export_bucket` / `import_source
+    /// --reconcile-export` to write a file the adapter's importer
+    /// reads natively. `None` = no round-trip target yet.
+    round_trip_export_format: Option<&'static str>,
+}
+
+/// Format token for an adapter's round-trip export, when one exists.
+/// Single source of truth — the writer the operator should pick to
+/// fill this adapter from another side via the reconcile/export tools.
+/// Must always be a token `anamnesis_export::ExportFormat::parse` accepts.
+fn round_trip_format_for(adapter: &str) -> Option<&'static str> {
+    match adapter {
+        "mem0" => Some("mem0-sqlite"),
+        "letta" => Some("letta-sqlite"),
+        "memos" => Some("memos-dir"),
+        _ => None,
+    }
 }
 
 /// Compile-time adapter roster — single source of truth.
-/// New adapter: edit this list AND [`registered_detectors`].
+/// New adapter: edit this list AND [`registered_detectors`]; if it
+/// gains a round-trip target, edit [`round_trip_format_for`].
 fn adapter_roster() -> Vec<AdapterCapability> {
+    // Hoisted to a const builder so every entry picks up
+    // `round_trip_export_format` through the shared `round_trip_format_for`.
+    let row = |id: &'static str,
+               detectable: bool,
+               default_location_hint: Option<&'static str>,
+               format: &'static str,
+               registration_hint: &'static str| AdapterCapability {
+        id,
+        detectable,
+        default_location_hint,
+        format,
+        registration_hint,
+        round_trip_export_format: round_trip_format_for(id),
+    };
     vec![
-        AdapterCapability {
-            id: "claude-code",
-            detectable: true,
-            default_location_hint: Some("~/.claude/projects/*/memory/*.md"),
-            format: "markdown",
-            registration_hint: "anamnesis source add claude-code --path ~/.claude/projects",
-        },
-        AdapterCapability {
-            id: "codex",
-            detectable: true,
-            default_location_hint: Some("~/.codex/sessions"),
-            format: "jsonl",
-            registration_hint: "anamnesis source add codex --path ~/.codex/sessions",
-        },
-        AdapterCapability {
-            id: "mem0",
-            detectable: true,
-            default_location_hint: Some("~/.mem0/history.db"),
-            format: "sqlite",
-            registration_hint: "anamnesis source add mem0 --path ~/.mem0/history.db",
-        },
-        AdapterCapability {
-            id: "letta",
-            detectable: true,
-            default_location_hint: Some("~/.letta/letta.db"),
-            format: "sqlite",
-            registration_hint: "anamnesis source add letta --path ~/.letta/letta.db",
-        },
-        AdapterCapability {
-            id: "hermes",
-            detectable: true,
-            default_location_hint: Some("~/.hermes/memory"),
-            format: "markdown",
-            registration_hint: "anamnesis source add hermes --path <hermes-home>",
-        },
-        AdapterCapability {
-            id: "openclaw",
-            detectable: true,
-            default_location_hint: Some("~/.openclaw"),
-            format: "json",
-            registration_hint: "anamnesis source add openclaw --path <openclaw-home>",
-        },
-        AdapterCapability {
-            id: "tdai",
-            detectable: true,
-            default_location_hint: Some("~/.tdai"),
-            format: "json",
-            registration_hint: "anamnesis source add tdai --path <tdai-home>",
-        },
-        AdapterCapability {
-            id: "openviking",
-            detectable: true,
-            default_location_hint: Some("~/.openviking"),
-            format: "json",
-            registration_hint: "anamnesis source add openviking --path <openviking-home>",
-        },
-        AdapterCapability {
-            id: "mempalace",
-            detectable: true,
-            default_location_hint: Some("~/.mempalace"),
-            format: "json",
-            registration_hint: "anamnesis source add mempalace --path <mempalace-home>",
-        },
-        AdapterCapability {
-            id: "memori",
-            detectable: true,
-            default_location_hint: Some("~/.memori"),
-            format: "json",
-            registration_hint: "anamnesis source add memori --path <memori-home>",
-        },
-        AdapterCapability {
-            id: "memos",
-            detectable: true,
-            default_location_hint: Some("~/.memos"),
-            format: "json",
-            registration_hint: "anamnesis source add memos --path <memos-home>",
-        },
-        AdapterCapability {
-            id: "memary",
-            detectable: true,
-            default_location_hint: Some("~/.memary"),
-            format: "json",
-            registration_hint: "anamnesis source add memary --path <memary-home>",
-        },
-        AdapterCapability {
-            id: "generic-mcp",
-            detectable: false,
-            default_location_hint: None,
-            format: "mcp-http",
-            registration_hint: "anamnesis source add generic-mcp --url <mcp-endpoint>",
-        },
+        row(
+            "claude-code",
+            true,
+            Some("~/.claude/projects/*/memory/*.md"),
+            "markdown",
+            "anamnesis source add claude-code --path ~/.claude/projects",
+        ),
+        row(
+            "codex",
+            true,
+            Some("~/.codex/sessions"),
+            "jsonl",
+            "anamnesis source add codex --path ~/.codex/sessions",
+        ),
+        row(
+            "mem0",
+            true,
+            Some("~/.mem0/history.db"),
+            "sqlite",
+            "anamnesis source add mem0 --path ~/.mem0/history.db",
+        ),
+        row(
+            "letta",
+            true,
+            Some("~/.letta/letta.db"),
+            "sqlite",
+            "anamnesis source add letta --path ~/.letta/letta.db",
+        ),
+        row(
+            "hermes",
+            true,
+            Some("~/.hermes/memory"),
+            "markdown",
+            "anamnesis source add hermes --path <hermes-home>",
+        ),
+        row(
+            "openclaw",
+            true,
+            Some("~/.openclaw"),
+            "json",
+            "anamnesis source add openclaw --path <openclaw-home>",
+        ),
+        row(
+            "tdai",
+            true,
+            Some("~/.tdai"),
+            "json",
+            "anamnesis source add tdai --path <tdai-home>",
+        ),
+        row(
+            "openviking",
+            true,
+            Some("~/.openviking"),
+            "json",
+            "anamnesis source add openviking --path <openviking-home>",
+        ),
+        row(
+            "mempalace",
+            true,
+            Some("~/.mempalace"),
+            "json",
+            "anamnesis source add mempalace --path <mempalace-home>",
+        ),
+        row(
+            "memori",
+            true,
+            Some("~/.memori"),
+            "json",
+            "anamnesis source add memori --path <memori-home>",
+        ),
+        row(
+            "memos",
+            true,
+            Some("~/.memos"),
+            "json",
+            "anamnesis source add memos --path <memos-home>",
+        ),
+        row(
+            "memary",
+            true,
+            Some("~/.memary"),
+            "json",
+            "anamnesis source add memary --path <memary-home>",
+        ),
+        row(
+            "generic-mcp",
+            false,
+            None,
+            "mcp-http",
+            "anamnesis source add generic-mcp --url <mcp-endpoint>",
+        ),
     ]
 }
 
@@ -208,23 +241,29 @@ pub async fn build_discover_adapters_payload(home_override: Option<&Path>) -> Va
     };
     let detected: Vec<DetectedSource> = discovery.detect_all(&opts).await;
     let detector_count = roster.iter().filter(|a| a.detectable).count();
+    let round_trip_count = roster
+        .iter()
+        .filter(|a| a.round_trip_export_format.is_some())
+        .count();
 
     let adapter_count = roster.len();
     let detected_count = detected.len();
     let summary = format!(
-        "{} adapters compiled in ({} auto-detectable); {} candidate source(s) detected on this machine.",
-        adapter_count, detector_count, detected_count,
+        "{} adapters compiled in ({} auto-detectable, {} round-trip export targets); \
+         {} candidate source(s) detected on this machine.",
+        adapter_count, detector_count, round_trip_count, detected_count,
     );
 
     let adapters: Vec<Value> = roster
         .iter()
         .map(|a| {
             json!({
-                "adapter":               a.id,
-                "detectable":            a.detectable,
-                "default_location_hint": a.default_location_hint,
-                "format":                a.format,
-                "registration_hint":     a.registration_hint,
+                "adapter":                  a.id,
+                "detectable":               a.detectable,
+                "default_location_hint":    a.default_location_hint,
+                "format":                   a.format,
+                "registration_hint":        a.registration_hint,
+                "round_trip_export_format": a.round_trip_export_format,
             })
         })
         .collect();
@@ -252,9 +291,10 @@ pub async fn build_discover_adapters_payload(home_override: Option<&Path>) -> Va
         "adapters":    adapters,
         "detected":    detected_json,
         "stats": {
-            "adapter_count":  adapter_count,
-            "detector_count": detector_count,
-            "detected_count": detected_count,
+            "adapter_count":    adapter_count,
+            "detector_count":   detector_count,
+            "detected_count":   detected_count,
+            "round_trip_count": round_trip_count,
         },
     })
 }
@@ -348,6 +388,65 @@ mod tests {
         let summary = payload["summary"].as_str().unwrap();
         assert!(summary.contains("13 adapters"));
         assert!(summary.contains("12 auto-detectable"));
+        assert!(summary.contains("3 round-trip export targets"));
         assert!(summary.contains("0 candidate source(s) detected"));
+    }
+
+    /// R149: exactly the three round-trip-capable adapters surface a
+    /// non-null `round_trip_export_format`; everyone else is `null`.
+    #[test]
+    fn round_trip_export_format_is_set_only_for_the_three_round_trip_targets() {
+        let roster = adapter_roster();
+        let with_target: std::collections::BTreeMap<&str, &str> = roster
+            .iter()
+            .filter_map(|a| a.round_trip_export_format.map(|f| (a.id, f)))
+            .collect();
+        assert_eq!(with_target.get("mem0"), Some(&"mem0-sqlite"));
+        assert_eq!(with_target.get("letta"), Some(&"letta-sqlite"));
+        assert_eq!(with_target.get("memos"), Some(&"memos-dir"));
+        assert_eq!(
+            with_target.len(),
+            3,
+            "exactly three round-trip targets today"
+        );
+    }
+
+    /// Every advertised `round_trip_export_format` must be a token the
+    /// shared `anamnesis_export::ExportFormat::parse` accepts — that's
+    /// the contract MCP peers rely on when they pipe the value into
+    /// `export_memories` / `reconcile_export_bucket`.
+    #[test]
+    fn round_trip_export_format_tokens_parse_via_anamnesis_export() {
+        let roster = adapter_roster();
+        for a in roster.iter() {
+            if let Some(token) = a.round_trip_export_format {
+                anamnesis_export::ExportFormat::parse(token).unwrap_or_else(|e| {
+                    panic!(
+                        "{}.round_trip_export_format={:?} must parse: {e}",
+                        a.id, token
+                    )
+                });
+            }
+        }
+    }
+
+    /// JSON payload surfaces `round_trip_export_format` per adapter and
+    /// `stats.round_trip_count` for quick agent-side discovery.
+    #[tokio::test]
+    async fn discover_adapters_payload_surfaces_round_trip_capability() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let payload = build_discover_adapters_payload(Some(tempdir.path())).await;
+        assert_eq!(payload["stats"]["round_trip_count"], 3);
+        let by_id: std::collections::BTreeMap<String, Value> = payload["adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["adapter"].as_str().unwrap().to_owned(), a.clone()))
+            .collect();
+        assert_eq!(by_id["mem0"]["round_trip_export_format"], "mem0-sqlite");
+        assert_eq!(by_id["letta"]["round_trip_export_format"], "letta-sqlite");
+        assert_eq!(by_id["memos"]["round_trip_export_format"], "memos-dir");
+        assert!(by_id["claude-code"]["round_trip_export_format"].is_null());
+        assert!(by_id["generic-mcp"]["round_trip_export_format"].is_null());
     }
 }

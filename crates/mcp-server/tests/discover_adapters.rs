@@ -76,6 +76,8 @@ async fn discover_adapters_returns_capability_roster_even_when_nothing_detected(
     assert_eq!(stats["adapter_count"], 13);
     assert_eq!(stats["detector_count"], 12);
     assert_eq!(stats["detected_count"], 0);
+    // R149: round-trip count surfaces alongside the adapter/detector counts.
+    assert_eq!(stats["round_trip_count"], 3);
 
     let adapters = payload["adapters"].as_array().unwrap();
     assert_eq!(adapters.len(), 13);
@@ -88,10 +90,25 @@ async fn discover_adapters_returns_capability_roster_even_when_nothing_detected(
         .collect();
     assert_eq!(non_detectable, vec!["generic-mcp"]);
 
+    // R149: every adapter row carries `round_trip_export_format`
+    // (string or null). The three round-trip targets carry tokens
+    // the MCP peer can pass straight into export_memories /
+    // reconcile_export_bucket / import_source --reconcile-export.
+    let by_id: std::collections::BTreeMap<String, &Value> = adapters
+        .iter()
+        .map(|a| (a["adapter"].as_str().unwrap().to_owned(), a))
+        .collect();
+    assert_eq!(by_id["mem0"]["round_trip_export_format"], "mem0-sqlite");
+    assert_eq!(by_id["letta"]["round_trip_export_format"], "letta-sqlite");
+    assert_eq!(by_id["memos"]["round_trip_export_format"], "memos-dir");
+    assert!(by_id["claude-code"]["round_trip_export_format"].is_null());
+    assert!(by_id["generic-mcp"]["round_trip_export_format"].is_null());
+
     assert!(payload["detected"].as_array().unwrap().is_empty());
     let summary = payload["summary"].as_str().unwrap();
     assert!(summary.contains("13 adapters"));
     assert!(summary.contains("12 auto-detectable"));
+    assert!(summary.contains("3 round-trip export targets"));
 }
 
 #[tokio::test]
