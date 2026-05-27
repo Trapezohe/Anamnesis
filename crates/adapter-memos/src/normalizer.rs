@@ -119,6 +119,15 @@ pub fn normalize(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamnesis
         .unwrap_or_default();
     if let Some(meta_raw) = raw.payload.get("metadata_raw") {
         if !meta_raw.is_null() {
+            // Surface round-trip provenance (`anamnesis_*`) to the top level so
+            // reconcile's identity key sees it; keep the raw blob untouched.
+            if let Some(obj) = meta_raw.as_object() {
+                for (k, v) in obj {
+                    if k.starts_with("anamnesis_") && !matches!(v.as_str(), Some("")) {
+                        metadata.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
             metadata.insert("memos_metadata_raw".into(), meta_raw.clone());
         }
     }
@@ -226,6 +235,45 @@ mod tests {
         .unwrap();
         assert_eq!(r[0].kind, Kind::Reference);
         assert_eq!(r[0].scope, Scope::Ephemeral);
+    }
+
+    /// R156: a round-trip export's `anamnesis_*` provenance (carried in the
+    /// item `metadata`) is surfaced to top-level metadata so reconcile's
+    /// identity key finds `anamnesis_native_id`; the raw blob is kept too.
+    #[test]
+    fn normalize_surfaces_anamnesis_metadata_top_level() {
+        let mut it = item(Some("UserMemory"), "round-trip body");
+        it.metadata_raw = json!({
+            "anamnesis_native_id": "orig-9",
+            "anamnesis_source_adapter": "letta",
+            "memory_type": "UserMemory"
+        });
+        let r = &normalize(raw_from_item(&it, None), None).unwrap()[0];
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_native_id")
+                .and_then(|v| v.as_str()),
+            Some("orig-9")
+        );
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("letta")
+        );
+        assert!(r.metadata.contains_key("memos_metadata_raw"));
+    }
+
+    /// Native memos data (no anamnesis_*) gains no spurious top-level keys.
+    #[test]
+    fn normalize_native_metadata_adds_no_anamnesis_keys() {
+        let r = &normalize(
+            raw_from_item(&item(Some("UserMemory"), "native"), None),
+            None,
+        )
+        .unwrap()[0];
+        assert!(!r.metadata.keys().any(|k| k.starts_with("anamnesis_")));
+        assert!(r.metadata.contains_key("memos_metadata_raw"));
     }
 
     #[test]
