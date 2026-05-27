@@ -39,7 +39,8 @@ pub struct MemoriEntityFact {
     pub date_created: Option<String>,
     /// Optional `metadata` JSON column. Native Memori has no such column;
     /// Anamnesis round-trip exports write the provenance block here so
-    /// re-import restores the original `anamnesis_native_id` / raw_hash.
+    /// re-import restores the original `anamnesis_native_id` (raw_hash is
+    /// preserved in metadata for lineage, not written back to provenance).
     pub metadata: Option<String>,
 }
 

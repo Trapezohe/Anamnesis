@@ -170,7 +170,8 @@ pub fn export_letta_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<
 /// Write `memori_entity_fact` (+ a single synthetic `memori_entity`)
 /// matching Memori's scanner probe. The `metadata` JSON column carries the
 /// Anamnesis provenance block so re-import restores the original
-/// `anamnesis_native_id` / raw_hash. Memori-origin rows reuse their native
+/// `anamnesis_native_id` (raw_hash stays in metadata for lineage; the
+/// re-imported record's raw_hash is recomputed from content). Memori-origin rows reuse their native
 /// `memori_num_times`; foreign rows default to 1.
 pub fn export_memori_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<(), ExportError> {
     let conn = rusqlite::Connection::open(out)?;
