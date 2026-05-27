@@ -86,14 +86,7 @@ fn reconcile_json_round_trip_null_for_no_target_adapter() {
     seed(dir.path());
     let assert = cli()
         .env("ANAMNESIS_DATA_DIR", dir.path())
-        .args([
-            "reconcile",
-            "--left",
-            "mem0",
-            "--right",
-            "claude-code",
-            "--json",
-        ])
+        .args(["reconcile", "--left", "mem0", "--right", "codex", "--json"])
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();

@@ -1456,6 +1456,70 @@ fn export_tdai_dir_round_trips_through_tdai_adapter() {
     }
 }
 
+// ─── R155: export --format claude-code-dir (6th round-trip target) ───
+
+/// `export --format claude-code-dir` writes a Claude Code projects root the
+/// claude-code scanner reads, and re-normalizing restores the original
+/// `anamnesis_native_id` + content (reconciles as `both`, not drift).
+#[test]
+fn export_claude_code_dir_round_trips_through_claude_code_adapter() {
+    use anamnesis_adapter_claude_code::normalizer::{normalize, raw_memory};
+    use anamnesis_adapter_claude_code::scanner::scan_projects_root;
+
+    let dir = tmp_dir();
+    let native_ids = seed_foreign_for_memori_export(dir.path());
+    let out_root = dir.path().join("exported_cc");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "claude-code-dir",
+            "--out",
+            out_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let projects = scan_projects_root(&out_root).expect("scan exported projects root");
+    let memory_files: Vec<_> = projects
+        .iter()
+        .flat_map(|p| p.memory_files.clone())
+        .collect();
+    assert_eq!(
+        memory_files.len(),
+        3,
+        "claude-code scanner finds exported memory files"
+    );
+
+    let mut restored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in &memory_files {
+        let body = std::fs::read_to_string(path).unwrap();
+        let rec = normalize(raw_memory(path, body, None, None), None).unwrap();
+        let r = &rec[0];
+        restored.insert(r.provenance.native_id.clone());
+        // Content round-trips byte-exact (the seed body for native id N is
+        // exactly "memori round-trip body N").
+        assert_eq!(
+            r.content,
+            format!("memori round-trip body {}", r.provenance.native_id),
+            "content must round-trip exactly"
+        );
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("claude-code"),
+        );
+    }
+    for native in &native_ids {
+        assert!(
+            restored.contains(native),
+            "native_id {native} must round-trip"
+        );
+    }
+}
+
 #[test]
 fn verify_reports_healthy_on_fresh_db() {
     let dir = tmp_dir();

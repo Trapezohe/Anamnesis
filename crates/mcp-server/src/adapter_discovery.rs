@@ -379,11 +379,11 @@ mod tests {
         let summary = payload["summary"].as_str().unwrap();
         assert!(summary.contains("13 adapters"));
         assert!(summary.contains("12 auto-detectable"));
-        assert!(summary.contains("5 round-trip export targets"));
+        assert!(summary.contains("6 round-trip export targets"));
         assert!(summary.contains("0 candidate source(s) detected"));
     }
 
-    /// R154: exactly the five round-trip-capable adapters surface a
+    /// R155: exactly the six (was five) round-trip-capable adapters surface a
     /// non-null `round_trip_export_format`; everyone else is `null`.
     #[test]
     fn round_trip_export_format_is_set_only_for_the_round_trip_targets() {
@@ -397,11 +397,8 @@ mod tests {
         assert_eq!(with_target.get("memos"), Some(&"memos-dir"));
         assert_eq!(with_target.get("memori"), Some(&"memori-sqlite"));
         assert_eq!(with_target.get("tdai"), Some(&"tdai-dir"));
-        assert_eq!(
-            with_target.len(),
-            5,
-            "exactly five round-trip targets today"
-        );
+        assert_eq!(with_target.get("claude-code"), Some(&"claude-code-dir"));
+        assert_eq!(with_target.len(), 6, "exactly six round-trip targets today");
     }
 
     /// Every advertised `round_trip_export_format` must be a token the
@@ -429,7 +426,7 @@ mod tests {
     async fn discover_adapters_payload_surfaces_round_trip_capability() {
         let tempdir = tempfile::tempdir().unwrap();
         let payload = build_discover_adapters_payload(Some(tempdir.path())).await;
-        assert_eq!(payload["stats"]["round_trip_count"], 5);
+        assert_eq!(payload["stats"]["round_trip_count"], 6);
         let by_id: std::collections::BTreeMap<String, Value> = payload["adapters"]
             .as_array()
             .unwrap()
@@ -441,7 +438,10 @@ mod tests {
         assert_eq!(by_id["memos"]["round_trip_export_format"], "memos-dir");
         assert_eq!(by_id["memori"]["round_trip_export_format"], "memori-sqlite");
         assert_eq!(by_id["tdai"]["round_trip_export_format"], "tdai-dir");
-        assert!(by_id["claude-code"]["round_trip_export_format"].is_null());
+        assert_eq!(
+            by_id["claude-code"]["round_trip_export_format"],
+            "claude-code-dir"
+        );
         assert!(by_id["generic-mcp"]["round_trip_export_format"].is_null());
     }
 }

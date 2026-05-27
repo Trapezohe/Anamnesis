@@ -131,7 +131,6 @@ pub fn normalize(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamnesis
 fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> AnamnesisRecord {
     let split = frontmatter::split(raw_text);
     let (kind, scope) = map_memory_type(split.frontmatter.mem_type.as_deref());
-    let body = split.body.trim();
     let tags = split
         .frontmatter
         .name
@@ -140,7 +139,23 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
         .chain(split.frontmatter.description.iter().cloned())
         .collect::<Vec<_>>();
     let raw_hash = blake3::hash(raw_text.as_bytes()).to_hex().to_string();
-    let id = RecordId::from_parts(crate::ADAPTER_ID, instance, &raw.native_id);
+    // Round-trip exports (`claude-code-dir`) carry the original identity in a
+    // frontmatter `anamnesis_native_id`; restore it so re-import reconciles as
+    // `both`. Files without it keep the path-synthesized native_id.
+    let restored = split
+        .frontmatter
+        .extras
+        .get("anamnesis_native_id")
+        .filter(|s| !s.is_empty());
+    // Round-trip bodies are written verbatim after the fence, so preserve them
+    // byte-exact; authored memory files keep the historical trim.
+    let body = if restored.is_some() {
+        split.body
+    } else {
+        split.body.trim()
+    };
+    let native_id = restored.cloned().unwrap_or_else(|| raw.native_id.clone());
+    let id = RecordId::from_parts(crate::ADAPTER_ID, instance, &native_id);
 
     // Always carry source_file for provenance; flow every preserved
     // frontmatter extra (originSessionId, node_type, custom annotations…)
@@ -174,7 +189,7 @@ fn normalize_memory(raw: &RawRecord, instance: Option<&str>, raw_text: &str) -> 
         tags: tags.into_iter().filter(|t| !t.is_empty()).collect(),
         metadata,
         provenance: Provenance {
-            native_id: raw.native_id.clone(),
+            native_id,
             native_path: raw.native_path.clone(),
             captured_at: raw.captured_at,
             raw_hash,
@@ -336,6 +351,27 @@ mod tests {
         assert_eq!(r.source.adapter, "claude-code");
         assert_eq!(r.source.instance.as_deref(), Some("default"));
         assert!(!r.provenance.raw_hash.is_empty());
+        // Backward compat: no anamnesis sentinel → path-synthesized native_id.
+        assert!(r.provenance.native_id.starts_with("default|memory|"));
+    }
+
+    /// R155: a `claude-code-dir` round-trip file carries the original identity
+    /// in a frontmatter `anamnesis_native_id`; restore it on re-import and
+    /// preserve the body byte-exact (no trim) so content round-trips.
+    #[test]
+    fn normalize_memory_restores_anamnesis_native_id() {
+        let path = fixture_path("anamnesis-export");
+        // Body has leading/trailing whitespace that must survive intact.
+        let body = "---\nname: note\nmetadata:\n  type: user\nanamnesis_native_id: note-42\nanamnesis_source_adapter: mem0\n---\n  the body  ";
+        let r = &normalize(raw_memory(&path, body.into(), None, None), None).unwrap()[0];
+        assert_eq!(r.provenance.native_id, "note-42");
+        assert_eq!(r.content, "  the body  ", "sentinel body is not trimmed");
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("mem0")
+        );
     }
 
     #[test]

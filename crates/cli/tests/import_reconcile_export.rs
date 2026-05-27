@@ -91,7 +91,7 @@ fn omitted_format_errors_before_import_when_against_has_no_target() {
     let data = tempfile::tempdir().unwrap();
     init_and_seed(home.path(), data.path());
     let out = data.path().join("nope.db");
-    // against=claude-code has no round-trip target → preflight error.
+    // against=codex has no round-trip target → preflight error.
     cli()
         .env("HOME", home.path())
         .env("ANAMNESIS_DATA_DIR", data.path())
@@ -100,7 +100,7 @@ fn omitted_format_errors_before_import_when_against_has_no_target() {
             "claude-code",
             "--no-embed",
             "--reconcile-export-against",
-            "claude-code",
+            "codex",
             "--reconcile-export-out",
             out.to_str().unwrap(),
         ])

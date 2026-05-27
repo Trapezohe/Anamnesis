@@ -230,7 +230,7 @@ async fn reconcile_export_bucket_derives_format_from_lagging_adapter_when_omitte
 
 #[tokio::test]
 async fn reconcile_export_bucket_omitted_format_errors_when_lagging_has_no_target() {
-    // only-left => lagging is claude-code, which has no round-trip target.
+    // only-left => lagging is codex, which has no round-trip target.
     let (server, data) = build_bundle(true);
     let out = data.path().join("nope.db");
     let resp = server
@@ -238,7 +238,7 @@ async fn reconcile_export_bucket_omitted_format_errors_when_lagging_has_no_targe
             "reconcile_export_bucket",
             json!({
                 "left":  {"adapter": "mem0"},
-                "right": {"adapter": "claude-code"},
+                "right": {"adapter": "codex"},
                 "bucket": "only-left",
                 "out": out.to_str().unwrap(),
             }),
@@ -247,7 +247,7 @@ async fn reconcile_export_bucket_omitted_format_errors_when_lagging_has_no_targe
     assert!(resp.error.is_some());
     let msg = resp.error.unwrap().message;
     assert!(msg.contains("no round-trip export format"), "{msg}");
-    assert!(msg.contains("claude-code"), "{msg}");
+    assert!(msg.contains("codex"), "{msg}");
     assert!(!out.exists(), "no file written on the derive-failure path");
 }
 

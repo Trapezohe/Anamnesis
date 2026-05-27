@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

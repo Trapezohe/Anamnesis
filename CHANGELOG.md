@@ -5,6 +5,16 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 ## [Unreleased]
 
 ### Added
+- **Claude Code is the 6th round-trip export target** (the first agent
+  runtime, not just a framework). `export --format claude-code-dir` (and the
+  `export_memories` / `reconcile-export` derive paths) writes a fresh projects
+  root with `anamnesis-export/memory/<slug>.md` files — markdown whose
+  frontmatter carries the provenance block. The claude-code scanner reads them
+  as memory files; the normalizer restores the original `anamnesis_native_id`
+  from frontmatter (files without it keep today's path-synthesized id, so
+  existing imports are unaffected). `content` round-trips exactly via the
+  markdown body; `kind`/`scope` are best-effort via the frontmatter `type`.
+  `discover_adapters` round-trip count goes 5→6.
 - **TDAI is the 5th round-trip export target.** `export --format tdai-dir`
   (and the `export_memories` / `reconcile-export` derive paths) writes a fresh
   directory with `anamnesis_facts.jsonl` — one JSON envelope per record, each
