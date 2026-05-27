@@ -4,6 +4,16 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+- **letta + memos round-trip now preserves identity.** End-to-end dogfooding
+  surfaced that, of the 6 round-trip targets, `letta-sqlite` and `memos-dir`
+  re-imported records reconciled as full drift instead of `both`: their
+  normalizers nested the round-trip provenance under `letta_metadata` /
+  `memos_metadata_raw`, so reconcile's top-level `anamnesis_native_id` lookup
+  missed it. Both normalizers now also surface `anamnesis_*` keys to top-level
+  metadata (nested blobs retained; native data unaffected). All 6 targets
+  (mem0 / letta / memos / memori / tdai / claude-code) now round-trip identity.
+
 ### Added
 - **Claude Code is the 6th round-trip export target** (the first agent
   runtime, not just a framework). `export --format claude-code-dir` (and the

@@ -147,6 +147,15 @@ pub fn normalize(raw: RawRecord, instance: Option<&str>) -> Result<Vec<Anamnesis
         metadata.insert("letta_extra".into(), extras);
     }
     if let Some(lmeta) = raw.payload.get("letta_metadata").cloned() {
+        // Surface round-trip provenance (`anamnesis_*`) to the top level so
+        // reconcile's identity key sees it; keep the nested blob untouched.
+        if let Some(obj) = lmeta.as_object() {
+            for (k, v) in obj {
+                if k.starts_with("anamnesis_") && !matches!(v.as_str(), Some("")) {
+                    metadata.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
         metadata.insert("letta_metadata".into(), lmeta);
     }
 
@@ -271,6 +280,48 @@ mod tests {
         assert!(r.metadata.contains_key("letta_metadata"));
         // raw_hash is deterministic blake3 of content.
         assert_eq!(r.provenance.raw_hash.len(), 64);
+    }
+
+    /// R156: a round-trip export's `anamnesis_*` provenance (carried in
+    /// `metadata_`) is surfaced to top-level metadata so reconcile's identity
+    /// key finds `anamnesis_native_id`; the nested blob is kept too.
+    #[test]
+    fn normalize_surfaces_anamnesis_metadata_top_level() {
+        let row = LettaBlockRow {
+            metadata_json: Some(
+                r#"{"anamnesis_native_id":"orig-1","anamnesis_source_adapter":"mem0","v":1}"#
+                    .into(),
+            ),
+            ..block("b1", "round-trip body")
+        };
+        let r = &normalize(raw_from_block(&row, Some("local")), Some("local")).unwrap()[0];
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_native_id")
+                .and_then(|v| v.as_str()),
+            Some("orig-1")
+        );
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("mem0")
+        );
+        // Non-anamnesis keys are NOT promoted; nested blob retained.
+        assert!(!r.metadata.contains_key("v"));
+        assert!(r.metadata.contains_key("letta_metadata"));
+    }
+
+    /// Native letta data (no anamnesis_*) gains no spurious top-level keys.
+    #[test]
+    fn normalize_native_metadata_adds_no_anamnesis_keys() {
+        let row = LettaBlockRow {
+            metadata_json: Some(r#"{"v":1}"#.into()),
+            ..block("b1", "native body")
+        };
+        let r = &normalize(raw_from_block(&row, Some("local")), Some("local")).unwrap()[0];
+        assert!(!r.metadata.keys().any(|k| k.starts_with("anamnesis_")));
+        assert!(r.metadata.contains_key("letta_metadata"));
     }
 
     #[test]
