@@ -123,7 +123,7 @@ fn omitted_format_errors_when_lagging_has_no_round_trip_target() {
             "--left",
             "mem0",
             "--right",
-            "claude-code",
+            "codex",
             "--bucket",
             "only-left",
             "--out",
@@ -132,7 +132,7 @@ fn omitted_format_errors_when_lagging_has_no_round_trip_target() {
         .assert()
         .failure()
         .stderr(contains("no round-trip export format"))
-        .stderr(contains("claude-code"));
+        .stderr(contains("codex"));
     assert!(!out.exists());
 }
 

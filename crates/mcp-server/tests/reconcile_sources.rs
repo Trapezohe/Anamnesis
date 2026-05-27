@@ -174,14 +174,14 @@ async fn reconcile_sources_round_trip_export_format_is_null_for_no_target_adapte
             "reconcile_sources",
             json!({
                 "left":  {"adapter": "mem0"},
-                "right": {"adapter": "claude-code"},
+                "right": {"adapter": "codex"},
             }),
         ))
         .await;
     assert!(resp.error.is_none(), "{:?}", resp.error);
     let rt = &extract_payload(&resp)["round_trip"];
-    // only_left lags claude-code, which has no round-trip target.
-    assert_eq!(rt["only_left"]["lagging"]["adapter"], "claude-code");
+    // only_left lags codex, which has no round-trip target.
+    assert_eq!(rt["only_left"]["lagging"]["adapter"], "codex");
     assert!(rt["only_left"]["export_format"].is_null());
     // only_right lags mem0 → mem0-sqlite.
     assert_eq!(rt["only_right"]["export_format"], "mem0-sqlite");

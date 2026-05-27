@@ -329,7 +329,8 @@ async fn export_memories_schema_advertises_required_fields() {
             "letta-sqlite",
             "memos-dir",
             "memori-sqlite",
-            "tdai-dir"
+            "tdai-dir",
+            "claude-code-dir"
         ]
     );
 }

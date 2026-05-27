@@ -362,6 +362,7 @@ version = "0.1.0"
 dependencies = [
  "anamnesis-core",
  "anamnesis-store",
+ "blake3",
  "chrono",
  "rusqlite",
  "serde",

@@ -2914,7 +2914,7 @@ impl AnamnesisServer {
 
     /// MCP `reconcile_export_bucket` — ADMIN-GATED. Pipes a reconcile
     /// drift bucket's record ids through the existing round-trip writers
-    /// (`mem0-sqlite` / `letta-sqlite` / `memos-dir` / `memori-sqlite` / `tdai-dir` / `jsonl` / `csv`).
+    /// (`mem0-sqlite` / `letta-sqlite` / `memos-dir` / `memori-sqlite` / `tdai-dir` / `claude-code-dir` / `jsonl` / `csv`).
     /// `out` is required (transport can't stream); target must not exist.
     /// Audit-logged. Response carries bounded metadata only — record
     /// count + bytes + echoed filter, never `content` / `raw_hash`.
@@ -4587,7 +4587,7 @@ fn tools_list_payload_all() -> Value {
                                 "against":           { "type": "string", "description": "Right-side adapter id." },
                                 "against_instance":  { "type": "string", "description": "Right-side instance (optional)." },
                                 "out":               { "type": "string", "description": "Absolute output path; must not exist." },
-                                "format":            { "type": "string", "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir"], "description": "Round-trip writer." }
+                                "format":            { "type": "string", "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir", "claude-code-dir"], "description": "Round-trip writer." }
                             },
                             "required": ["against", "out", "format"]
                         }
@@ -4601,7 +4601,8 @@ fn tools_list_payload_all() -> Value {
                                 `jsonl`, `csv`, `mem0-sqlite` (mem0's `memories` table), `letta-sqlite` \
                                 (Letta's `block` table), `memos-dir` (a fresh MemOS MemCube directory \
                                 with `textual_memory.json`), `memori-sqlite` (Memori's `memori_entity_fact` \
-                                table), or `tdai-dir` (a TDAI L1 `anamnesis_facts.jsonl` directory). \
+                                table), `tdai-dir` (a TDAI L1 `anamnesis_facts.jsonl` directory), or \
+                                `claude-code-dir` (a Claude Code `*/memory/*.md` projects root). \
                                 SQLite formats reconstruct native columns from \
                                 metadata for the originating adapter; all round-trip formats add an \
                                 `anamnesis_*` provenance backlink so a re-import preserves lineage. \
@@ -4614,8 +4615,8 @@ fn tools_list_payload_all() -> Value {
                     "properties": {
                         "format": {
                             "type": "string",
-                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir"],
-                            "description": "Output format. SQLite + directory formats (memos-dir / tdai-dir) round-trip into the named framework."
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir", "claude-code-dir"],
+                            "description": "Output format. SQLite + directory formats (memos-dir / tdai-dir / claude-code-dir) round-trip into the named framework."
                         },
                         "out": {
                             "type": "string",
@@ -5044,7 +5045,7 @@ fn tools_list_payload_all() -> Value {
                 "name": "reconcile_export_bucket",
                 "description": "Pipe one reconcile drift bucket (`only-left` or `only-right`) through \
                                 the existing round-trip writers (jsonl / csv / mem0-sqlite / \
-                                letta-sqlite / memos-dir / memori-sqlite / tdai-dir). Operator feeds the result to the lagging \
+                                letta-sqlite / memos-dir / memori-sqlite / tdai-dir / claude-code-dir). Operator feeds the result to the lagging \
                                 adapter's importer; next `reconcile_sources` shows them in `both`. \
                                 ADMIN-GATED — writes a file. `out` is REQUIRED for every format \
                                 (transport cannot stream); refuses to overwrite an existing path. \
@@ -5064,9 +5065,9 @@ fn tools_list_payload_all() -> Value {
                         },
                         "format": {
                             "type": "string",
-                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir"],
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir", "claude-code-dir"],
                             "description": "Output format. Optional: omit to derive the lagging \
-                                            adapter's canonical round-trip format (mem0/letta/memos/memori/tdai); \
+                                            adapter's canonical round-trip format (mem0/letta/memos/memori/tdai/claude-code); \
                                             errors if it has none. An explicit value that disagrees \
                                             with the canonical one is allowed but returns a `warning`."
                         },
