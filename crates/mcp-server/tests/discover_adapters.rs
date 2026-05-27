@@ -77,7 +77,7 @@ async fn discover_adapters_returns_capability_roster_even_when_nothing_detected(
     assert_eq!(stats["detector_count"], 12);
     assert_eq!(stats["detected_count"], 0);
     // R149/R153: round-trip count surfaces alongside the adapter/detector counts.
-    assert_eq!(stats["round_trip_count"], 4);
+    assert_eq!(stats["round_trip_count"], 5);
 
     let adapters = payload["adapters"].as_array().unwrap();
     assert_eq!(adapters.len(), 13);
@@ -102,6 +102,7 @@ async fn discover_adapters_returns_capability_roster_even_when_nothing_detected(
     assert_eq!(by_id["letta"]["round_trip_export_format"], "letta-sqlite");
     assert_eq!(by_id["memos"]["round_trip_export_format"], "memos-dir");
     assert_eq!(by_id["memori"]["round_trip_export_format"], "memori-sqlite");
+    assert_eq!(by_id["tdai"]["round_trip_export_format"], "tdai-dir");
     assert!(by_id["claude-code"]["round_trip_export_format"].is_null());
     assert!(by_id["generic-mcp"]["round_trip_export_format"].is_null());
 
@@ -109,7 +110,7 @@ async fn discover_adapters_returns_capability_roster_even_when_nothing_detected(
     let summary = payload["summary"].as_str().unwrap();
     assert!(summary.contains("13 adapters"));
     assert!(summary.contains("12 auto-detectable"));
-    assert!(summary.contains("4 round-trip export targets"));
+    assert!(summary.contains("5 round-trip export targets"));
 }
 
 #[tokio::test]

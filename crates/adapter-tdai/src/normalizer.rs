@@ -37,7 +37,27 @@ pub fn raw_from_l0(r: &TdaiL0Ref, instance: Option<&str>) -> RawRecord {
 }
 
 /// Build a `RawRecord` from one L1 fact. Normalizer → Kind::Fact, Scope::User.
+///
+/// An Anamnesis `tdai-dir` round-trip line is a JSON object carrying
+/// `anamnesis_native_id` + a string `content`; recognised here, it restores
+/// the original native_id and merges provenance. Any other line keeps the
+/// existing opaque-whole-line behaviour (backward compatible).
 pub fn raw_from_l1(f: &TdaiL1Fact, instance: Option<&str>) -> RawRecord {
+    if let Some(env) = anamnesis_envelope(&f.content) {
+        return RawRecord {
+            native_id: env.native_id,
+            native_path: Some(format!("{}#{}", f.source_path.display(), f.line_no)),
+            payload: json!({
+                "payload_kind": PAYLOAD_KIND_L1_FACT,
+                "source_path": f.source_path.display().to_string(),
+                "line_no": f.line_no,
+                "content": env.content,
+                "mtime_unix": f.mtime_unix,
+                "anamnesis_meta": env.meta,
+            }),
+            captured_at: Utc::now(),
+        };
+    }
     let native_id = synth_id(
         instance,
         &format!("l1|{}|{}", f.source_path.display(), f.line_no),
@@ -54,6 +74,30 @@ pub fn raw_from_l1(f: &TdaiL1Fact, instance: Option<&str>) -> RawRecord {
         }),
         captured_at: Utc::now(),
     }
+}
+
+struct AnamnesisEnvelope {
+    native_id: String,
+    content: String,
+    meta: Value,
+}
+
+/// Recognise an Anamnesis round-trip L1 line: a JSON object with a non-empty
+/// string `anamnesis_native_id` and a string `content`. `None` otherwise.
+fn anamnesis_envelope(line: &str) -> Option<AnamnesisEnvelope> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let obj = value.as_object()?;
+    let native_id = obj
+        .get("anamnesis_native_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_owned();
+    let content = obj.get("content").and_then(|v| v.as_str())?.to_owned();
+    Some(AnamnesisEnvelope {
+        native_id,
+        content,
+        meta: value,
+    })
 }
 
 /// Build a `RawRecord` from an L2 scenario. Normalizer → Kind::Reference, Scope::User.
@@ -143,6 +187,19 @@ fn one(
     if let Some(src) = raw.payload.get("source_path").and_then(|v| v.as_str()) {
         metadata.insert("tdai_source_path".into(), Value::String(src.into()));
     }
+    // Round-trip lines carry the original provenance; merge anamnesis_* keys
+    // for lineage (raw_hash stays content-derived, not written to provenance).
+    if let Some(m) = raw
+        .payload
+        .get("anamnesis_meta")
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in m {
+            if k.starts_with("anamnesis_") {
+                metadata.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
 
     Ok(vec![AnamnesisRecord {
         id: record_id,
@@ -215,6 +272,33 @@ mod tests {
             .as_deref()
             .unwrap()
             .ends_with("#2"));
+        // Backward compat: a non-Anamnesis JSON line is kept opaque — the
+        // whole line is the content and native_id stays path/line-synthesized.
+        assert_eq!(r[0].content, r#"{"fact":"likes rust"}"#);
+        assert!(r[0].provenance.native_id.contains('|'));
+    }
+
+    /// R154: an Anamnesis round-trip envelope line restores native_id +
+    /// content and merges provenance, instead of the opaque-line path.
+    #[test]
+    fn l1_anamnesis_envelope_restores_identity() {
+        let f = TdaiL1Fact {
+            source_path: PathBuf::from("/fake/anamnesis_facts.jsonl"),
+            line_no: 0,
+            content: r#"{"content":"user likes rust","anamnesis_native_id":"note-42","anamnesis_source_adapter":"claude-code","anamnesis_raw_hash":"hash-note-42"}"#.into(),
+            mtime_unix: None,
+        };
+        let r = normalize(raw_from_l1(&f, None), None).unwrap();
+        assert_eq!(r[0].provenance.native_id, "note-42");
+        assert_eq!(r[0].content, "user likes rust");
+        assert_eq!(
+            r[0].metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("claude-code")
+        );
+        // raw_hash is re-derived from content, not the restored original.
+        assert_ne!(r[0].provenance.raw_hash, "hash-note-42");
     }
 
     #[test]

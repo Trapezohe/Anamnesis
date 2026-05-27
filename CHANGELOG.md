@@ -5,6 +5,14 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 ## [Unreleased]
 
 ### Added
+- **TDAI is the 5th round-trip export target.** `export --format tdai-dir`
+  (and the `export_memories` / `reconcile-export` derive paths) writes a fresh
+  directory with `anamnesis_facts.jsonl` — one JSON envelope per record, each
+  carrying `content` + the provenance block. The TDAI scanner reads each line
+  as an L1 fact; the normalizer recognises the `anamnesis_native_id` sentinel
+  and restores the original identity (any non-envelope line keeps the existing
+  opaque-whole-line behaviour, so existing TDAI imports are unaffected).
+  `discover_adapters` round-trip count goes 4→5.
 - **Memori is the 4th round-trip export target.** `export --format
   memori-sqlite` (and `export_memories` / `reconcile-export` derive) writes a
   fresh SQLite DB with Memori's `memori_entity_fact` table (+ a synthetic

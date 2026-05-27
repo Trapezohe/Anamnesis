@@ -28,6 +28,8 @@ pub enum ExportFormat {
     MemosDir,
     /// Fresh SQLite DB with Memori's `memori_entity_fact` table.
     MemoriSqlite,
+    /// Fresh directory with a TDAI `anamnesis_facts.jsonl` L1 file.
+    TdaiDir,
 }
 
 impl ExportFormat {
@@ -40,6 +42,7 @@ impl ExportFormat {
             "letta-sqlite" => Ok(Self::LettaSqlite),
             "memos-dir" => Ok(Self::MemosDir),
             "memori-sqlite" => Ok(Self::MemoriSqlite),
+            "tdai-dir" => Ok(Self::TdaiDir),
             other => Err(ExportError::UnknownFormat(other.to_owned())),
         }
     }
@@ -53,6 +56,7 @@ impl ExportFormat {
             Self::LettaSqlite => "letta-sqlite",
             Self::MemosDir => "memos-dir",
             Self::MemoriSqlite => "memori-sqlite",
+            Self::TdaiDir => "tdai-dir",
         }
     }
 
@@ -60,7 +64,11 @@ impl ExportFormat {
     pub fn requires_out_path(self) -> bool {
         matches!(
             self,
-            Self::Mem0Sqlite | Self::LettaSqlite | Self::MemosDir | Self::MemoriSqlite
+            Self::Mem0Sqlite
+                | Self::LettaSqlite
+                | Self::MemosDir
+                | Self::MemoriSqlite
+                | Self::TdaiDir
         )
     }
 }
@@ -75,6 +83,7 @@ pub fn round_trip_format_for_adapter(adapter: &str) -> Option<ExportFormat> {
         "letta" => Some(ExportFormat::LettaSqlite),
         "memos" => Some(ExportFormat::MemosDir),
         "memori" => Some(ExportFormat::MemoriSqlite),
+        "tdai" => Some(ExportFormat::TdaiDir),
         _ => None,
     }
 }
@@ -95,7 +104,7 @@ pub struct ExportFilter {
 #[derive(Debug, Error)]
 pub enum ExportError {
     /// Format token unknown.
-    #[error("unsupported format: {0} (try jsonl, csv, mem0-sqlite, letta-sqlite, memos-dir, or memori-sqlite)")]
+    #[error("unsupported format: {0} (try jsonl, csv, mem0-sqlite, letta-sqlite, memos-dir, memori-sqlite, or tdai-dir)")]
     UnknownFormat(String),
     /// SQLite format requested without `--out`.
     #[error("--format {format} requires --out <path>: SQLite output cannot stream to stdout")]
@@ -237,10 +246,12 @@ pub fn render_filter_summary(filter: &ExportFilter) -> String {
 
 mod memos_exporter;
 mod sqlite_exporters;
+mod tdai_exporter;
 mod text_exporters;
 
 pub use memos_exporter::export_memos_dir;
 pub use sqlite_exporters::{export_letta_sqlite, export_mem0_sqlite, export_memori_sqlite};
+pub use tdai_exporter::export_tdai_dir;
 pub use text_exporters::{export_csv, export_jsonl};
 
 /// Entry point: select + route to format writer. CLI/MCP both call this.
@@ -323,6 +334,19 @@ pub fn run_export_with_ids(
                 bytes,
             })
         }
+        ExportFormat::TdaiDir => {
+            let p = validate_dir_output(format, out)?;
+            export_tdai_dir(store, ids, p)?;
+            let bytes = std::fs::metadata(p.join(tdai_exporter::TDAI_FACTS_FILE))
+                .ok()
+                .map(|m| m.len());
+            Ok(ExportOutcome {
+                format,
+                out: Some(p.to_path_buf()),
+                records: ids.len() as u64,
+                bytes,
+            })
+        }
     }
 }
 
@@ -351,6 +375,7 @@ mod tests {
             ("letta-sqlite", ExportFormat::LettaSqlite),
             ("memos-dir", ExportFormat::MemosDir),
             ("memori-sqlite", ExportFormat::MemoriSqlite),
+            ("tdai-dir", ExportFormat::TdaiDir),
         ] {
             assert_eq!(ExportFormat::parse(token).unwrap(), expected);
             assert_eq!(expected.as_token(), token);
@@ -364,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_format_for_adapter_maps_the_four_targets() {
+    fn round_trip_format_for_adapter_maps_the_five_targets() {
         assert_eq!(
             round_trip_format_for_adapter("mem0"),
             Some(ExportFormat::Mem0Sqlite)
@@ -381,6 +406,10 @@ mod tests {
             round_trip_format_for_adapter("memori"),
             Some(ExportFormat::MemoriSqlite)
         );
+        assert_eq!(
+            round_trip_format_for_adapter("tdai"),
+            Some(ExportFormat::TdaiDir)
+        );
         assert_eq!(round_trip_format_for_adapter("claude-code"), None);
         assert_eq!(round_trip_format_for_adapter("generic-mcp"), None);
     }
@@ -393,6 +422,7 @@ mod tests {
         assert!(ExportFormat::LettaSqlite.requires_out_path());
         assert!(ExportFormat::MemosDir.requires_out_path());
         assert!(ExportFormat::MemoriSqlite.requires_out_path());
+        assert!(ExportFormat::TdaiDir.requires_out_path());
     }
 
     #[test]
