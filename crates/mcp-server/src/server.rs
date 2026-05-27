@@ -4615,7 +4615,7 @@ fn tools_list_payload_all() -> Value {
                         "format": {
                             "type": "string",
                             "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite", "tdai-dir"],
-                            "description": "Output format. SQLite + memos-dir formats round-trip into the named framework."
+                            "description": "Output format. SQLite + directory formats (memos-dir / tdai-dir) round-trip into the named framework."
                         },
                         "out": {
                             "type": "string",

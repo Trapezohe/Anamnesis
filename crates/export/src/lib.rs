@@ -106,8 +106,8 @@ pub enum ExportError {
     /// Format token unknown.
     #[error("unsupported format: {0} (try jsonl, csv, mem0-sqlite, letta-sqlite, memos-dir, memori-sqlite, or tdai-dir)")]
     UnknownFormat(String),
-    /// SQLite format requested without `--out`.
-    #[error("--format {format} requires --out <path>: SQLite output cannot stream to stdout")]
+    /// A non-streaming (SQLite or directory) format requested without `--out`.
+    #[error("--format {format} requires --out <path>: this format cannot stream to stdout")]
     OutPathRequired {
         /// The format that requires `--out`.
         format: &'static str,
