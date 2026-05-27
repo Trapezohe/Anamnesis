@@ -2914,7 +2914,7 @@ impl AnamnesisServer {
 
     /// MCP `reconcile_export_bucket` — ADMIN-GATED. Pipes a reconcile
     /// drift bucket's record ids through the existing round-trip writers
-    /// (`mem0-sqlite` / `letta-sqlite` / `memos-dir` / `jsonl` / `csv`).
+    /// (`mem0-sqlite` / `letta-sqlite` / `memos-dir` / `memori-sqlite` / `jsonl` / `csv`).
     /// `out` is required (transport can't stream); target must not exist.
     /// Audit-logged. Response carries bounded metadata only — record
     /// count + bytes + echoed filter, never `content` / `raw_hash`.
@@ -5043,7 +5043,7 @@ fn tools_list_payload_all() -> Value {
                 "name": "reconcile_export_bucket",
                 "description": "Pipe one reconcile drift bucket (`only-left` or `only-right`) through \
                                 the existing round-trip writers (jsonl / csv / mem0-sqlite / \
-                                letta-sqlite / memos-dir). Operator feeds the result to the lagging \
+                                letta-sqlite / memos-dir / memori-sqlite). Operator feeds the result to the lagging \
                                 adapter's importer; next `reconcile_sources` shows them in `both`. \
                                 ADMIN-GATED — writes a file. `out` is REQUIRED for every format \
                                 (transport cannot stream); refuses to overwrite an existing path. \
@@ -5065,7 +5065,7 @@ fn tools_list_payload_all() -> Value {
                             "type": "string",
                             "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite"],
                             "description": "Output format. Optional: omit to derive the lagging \
-                                            adapter's canonical round-trip format (mem0/letta/memos); \
+                                            adapter's canonical round-trip format (mem0/letta/memos/memori); \
                                             errors if it has none. An explicit value that disagrees \
                                             with the canonical one is allowed but returns a `warning`."
                         },

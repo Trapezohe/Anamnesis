@@ -256,18 +256,17 @@ fn one(
         .unwrap_or(raw.captured_at);
 
     let record_id = RecordId::from_parts(ADAPTER_ID, instance, &raw.native_id);
+    // raw_hash MUST stay a pure function of current content so the store's
+    // change-detection keeps working; the original is preserved in metadata
+    // (anamnesis_raw_hash) for lineage, not restored into provenance.
+    let raw_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+
     // Round-trip exports carry the original provenance under `anamnesis_meta`;
-    // restore raw_hash from it so identity matches, else hash the content.
+    // merge the anamnesis_* keys back so lineage survives the re-import.
     let anamnesis_meta = raw
         .payload
         .get("anamnesis_meta")
         .and_then(|v| v.as_object());
-    let raw_hash = anamnesis_meta
-        .and_then(|m| m.get("anamnesis_raw_hash"))
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| blake3::hash(content.as_bytes()).to_hex().to_string());
-
     let mut metadata = serde_json::Map::new();
     metadata.insert("memori_tier".into(), Value::String(tier.into()));
     if let Some(m) = anamnesis_meta {

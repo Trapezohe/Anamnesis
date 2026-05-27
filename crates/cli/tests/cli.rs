@@ -1346,6 +1346,15 @@ fn export_memori_sqlite_round_trips_through_memori_adapter() {
             Some("claude-code"),
             "provenance backlink survives the round-trip"
         );
+        // raw_hash stays content-derived (NOT the restored original
+        // `hash-<native>`) so the store's change-detection keeps working.
+        assert!(
+            !r.provenance.raw_hash.starts_with("hash-"),
+            "raw_hash must be re-derived from content, not the original: {}",
+            r.provenance.raw_hash
+        );
+        // The original raw_hash is preserved in metadata for lineage.
+        assert!(r.metadata.contains_key("anamnesis_raw_hash"));
     }
     for native in &native_ids {
         assert!(
