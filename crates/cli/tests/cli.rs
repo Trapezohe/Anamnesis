@@ -1498,10 +1498,12 @@ fn export_claude_code_dir_round_trips_through_claude_code_adapter() {
         let rec = normalize(raw_memory(path, body, None, None), None).unwrap();
         let r = &rec[0];
         restored.insert(r.provenance.native_id.clone());
-        assert!(
-            r.content.starts_with("memori round-trip body"),
-            "content survives round-trip: {}",
-            r.content
+        // Content round-trips byte-exact (the seed body for native id N is
+        // exactly "memori round-trip body N").
+        assert_eq!(
+            r.content,
+            format!("memori round-trip body {}", r.provenance.native_id),
+            "content must round-trip exactly"
         );
         assert_eq!(
             r.metadata

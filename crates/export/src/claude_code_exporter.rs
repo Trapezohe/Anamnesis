@@ -49,9 +49,10 @@ fn slug(rec: &AnamnesisRecord) -> String {
     } else {
         cleaned
     };
-    // Hash the full record id so distinct records never collide on slug.
+    // 128-bit blake3 of the full record id — collision-resistant enough that
+    // distinct records get distinct filenames in practice.
     let hash = blake3::hash(rec.id.0.as_bytes()).to_hex();
-    format!("{stem}-{}", &hash[..16])
+    format!("{stem}-{}", &hash[..32])
 }
 
 /// One frontmatter scalar: collapse newlines so it stays single-line.
@@ -115,8 +116,10 @@ pub fn export_claude_code_dir(
         }
         fm.push_str("---\n");
 
+        // Body follows the closing fence directly (no extra newlines) so the
+        // normalizer's sentinel path recovers `content` byte-exactly.
         let mut file = std::fs::File::create(memory_dir.join(format!("{}.md", slug(&rec))))?;
-        write!(file, "{fm}\n{}\n", rec.content)?;
+        write!(file, "{fm}{}", rec.content)?;
     }
     Ok(())
 }
