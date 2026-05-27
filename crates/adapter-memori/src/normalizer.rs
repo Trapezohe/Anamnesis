@@ -25,21 +25,39 @@ pub const PAYLOAD_KIND_CONV_SUMMARY: &str = "memori_conversation_summary";
 /// `payload_kind` discriminator: one `memori_knowledge_graph` triple.
 pub const PAYLOAD_KIND_KG_TRIPLE: &str = "memori_kg_triple";
 
-/// Build a `RawRecord` from an entity fact.
+/// Build a `RawRecord` from an entity fact. An Anamnesis round-trip export
+/// carries the original provenance in `f.metadata`; when present, restore
+/// the original `anamnesis_native_id` so re-import reproduces the same
+/// identity (reconcile stays `both`).
 pub fn raw_from_entity_fact(f: &MemoriEntityFact, instance: Option<&str>) -> RawRecord {
-    let native_id = synth_id(instance, &format!("entfact|{}", f.uuid));
+    let anamnesis_meta = f
+        .metadata
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<Value>(m).ok())
+        .filter(|v| v.is_object());
+    let restored_native_id = anamnesis_meta
+        .as_ref()
+        .and_then(|m| m.get("anamnesis_native_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let native_id =
+        restored_native_id.unwrap_or_else(|| synth_id(instance, &format!("entfact|{}", f.uuid)));
+    let mut payload = json!({
+        "payload_kind": PAYLOAD_KIND_ENTITY_FACT,
+        "uuid": f.uuid,
+        "entity_external_id": f.entity_external_id,
+        "content": f.content,
+        "num_times": f.num_times,
+        "date_last_time": f.date_last_time,
+        "date_created": f.date_created,
+    });
+    if let Some(meta) = anamnesis_meta {
+        payload["anamnesis_meta"] = meta;
+    }
     RawRecord {
         native_id,
         native_path: Some(format!("memori_entity_fact::{}", f.uuid)),
-        payload: json!({
-            "payload_kind": PAYLOAD_KIND_ENTITY_FACT,
-            "uuid": f.uuid,
-            "entity_external_id": f.entity_external_id,
-            "content": f.content,
-            "num_times": f.num_times,
-            "date_last_time": f.date_last_time,
-            "date_created": f.date_created,
-        }),
+        payload,
         captured_at: Utc::now(),
     }
 }
@@ -238,10 +256,27 @@ fn one(
         .unwrap_or(raw.captured_at);
 
     let record_id = RecordId::from_parts(ADAPTER_ID, instance, &raw.native_id);
-    let raw_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    // Round-trip exports carry the original provenance under `anamnesis_meta`;
+    // restore raw_hash from it so identity matches, else hash the content.
+    let anamnesis_meta = raw
+        .payload
+        .get("anamnesis_meta")
+        .and_then(|v| v.as_object());
+    let raw_hash = anamnesis_meta
+        .and_then(|m| m.get("anamnesis_raw_hash"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| blake3::hash(content.as_bytes()).to_hex().to_string());
 
     let mut metadata = serde_json::Map::new();
     metadata.insert("memori_tier".into(), Value::String(tier.into()));
+    if let Some(m) = anamnesis_meta {
+        for (k, v) in m {
+            if k.starts_with("anamnesis_") {
+                metadata.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
     for k in [
         "entity_external_id",
         "process_external_id",
@@ -297,6 +332,7 @@ mod tests {
             num_times: 3,
             date_last_time: Some("2026-05-01 10:00:00".into()),
             date_created: Some("2026-04-01 10:00:00".into()),
+            metadata: None,
         }
     }
 

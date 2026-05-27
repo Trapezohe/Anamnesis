@@ -37,6 +37,10 @@ pub struct MemoriEntityFact {
     pub date_last_time: Option<String>,
     /// Initial creation timestamp.
     pub date_created: Option<String>,
+    /// Optional `metadata` JSON column. Native Memori has no such column;
+    /// Anamnesis round-trip exports write the provenance block here so
+    /// re-import restores the original `anamnesis_native_id` / raw_hash.
+    pub metadata: Option<String>,
 }
 
 /// One `memori_process_attribute` row.
@@ -206,13 +210,20 @@ pub fn scan_memori(db_path: &Path) -> MemoriScan {
 
 fn read_entity_facts(conn: &Connection) -> Result<Vec<MemoriEntityFact>, String> {
     // Join to `memori_entity` so we have the external user id for provenance.
+    // `f.metadata` exists only on Anamnesis round-trip exports; select NULL
+    // when the column is absent so native Memori DBs still scan.
+    let meta_col = if has_column(conn, "memori_entity_fact", "metadata") {
+        "f.metadata"
+    } else {
+        "NULL"
+    };
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT f.uuid, e.external_id, f.content, f.num_times, \
-                    f.date_last_time, f.date_created \
+                    f.date_last_time, f.date_created, {meta_col} \
              FROM memori_entity_fact f \
-             LEFT JOIN memori_entity e ON e.id = f.entity_id",
-        )
+             LEFT JOIN memori_entity e ON e.id = f.entity_id"
+        ))
         .map_err(|e| format!("entity_fact prepare: {e}"))?;
     let rows = stmt
         .query_map([], |r: &Row<'_>| {
@@ -223,6 +234,7 @@ fn read_entity_facts(conn: &Connection) -> Result<Vec<MemoriEntityFact>, String>
                 num_times: r.get::<_, i64>(3).unwrap_or(0),
                 date_last_time: r.get(4).ok(),
                 date_created: r.get(5).ok(),
+                metadata: r.get(6).ok(),
             })
         })
         .map_err(|e| format!("entity_fact query: {e}"))?;
@@ -366,6 +378,18 @@ fn has_table(conn: &Connection, name: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut stmt| {
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(Result::ok)
+                .any(|c| c == column);
+            Ok(names)
+        })
+        .unwrap_or(false)
 }
 
 /// Parse Memori's `datetime('now')`-style ISO-8601 timestamps into unix

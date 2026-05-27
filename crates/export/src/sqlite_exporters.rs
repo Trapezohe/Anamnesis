@@ -166,3 +166,63 @@ pub fn export_letta_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<
     tx.commit()?;
     Ok(())
 }
+
+/// Write `memori_entity_fact` (+ a single synthetic `memori_entity`)
+/// matching Memori's scanner probe. The `metadata` JSON column carries the
+/// Anamnesis provenance block so re-import restores the original
+/// `anamnesis_native_id` / raw_hash. Memori-origin rows reuse their native
+/// `memori_num_times`; foreign rows default to 1.
+pub fn export_memori_sqlite(store: &Store, ids: &[String], out: &Path) -> Result<(), ExportError> {
+    let conn = rusqlite::Connection::open(out)?;
+    conn.execute_batch(
+        "CREATE TABLE memori_entity ( \
+            id          INTEGER PRIMARY KEY, \
+            uuid        TEXT, \
+            external_id TEXT \
+        ); \
+        CREATE TABLE memori_entity_fact ( \
+            id             INTEGER PRIMARY KEY, \
+            uuid           TEXT NOT NULL, \
+            entity_id      INTEGER, \
+            content        TEXT NOT NULL, \
+            num_times      INTEGER, \
+            date_last_time TEXT, \
+            date_created   TEXT, \
+            metadata       TEXT \
+        ); \
+        INSERT INTO memori_entity (id, uuid, external_id) \
+            VALUES (1, 'anamnesis-export-entity', 'anamnesis-export');",
+    )?;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO memori_entity_fact \
+                (uuid, entity_id, content, num_times, date_last_time, date_created, metadata) \
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for id in ids {
+            let Some(rec) = store.get_record(&RecordId(id.clone()))? else {
+                continue;
+            };
+            let num_times = rec
+                .metadata
+                .get("memori_num_times")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
+            let metadata_json =
+                serde_json::to_string(&Value::Object(anamnesis_provenance_block(&rec)))?;
+            let created_iso = rec.created_at.to_rfc3339();
+            let last_iso = rec.updated_at.unwrap_or(rec.created_at).to_rfc3339();
+            stmt.execute(rusqlite::params![
+                rec.provenance.native_id,
+                rec.content,
+                num_times,
+                last_iso,
+                created_iso,
+                metadata_json,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}

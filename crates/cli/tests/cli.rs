@@ -1252,6 +1252,127 @@ fn export_letta_sqlite_refuses_to_overwrite_existing_file() {
     );
 }
 
+// ─── R153: export --format memori-sqlite (4th round-trip target) ────
+
+/// Seed N foreign (claude-code) records via the Store with known native
+/// ids so the memori round-trip can assert identity restoration.
+fn seed_foreign_for_memori_export(dir: &std::path::Path) -> Vec<String> {
+    use anamnesis_core::chunker::Chunker;
+    use anamnesis_core::model::{
+        AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
+    };
+    use anamnesis_store::Store;
+    use chrono::Utc;
+
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir)
+        .args(["init"])
+        .assert()
+        .success();
+    let store = Store::open(dir.join("anamnesis.sqlite")).unwrap();
+    let mut native_ids = Vec::new();
+    for native in ["note-1", "note-2", "note-3"] {
+        let r = AnamnesisRecord {
+            id: RecordId::from_parts("claude-code", None, native),
+            source: SourceDescriptor {
+                adapter: "claude-code".into(),
+                instance: None,
+                version: "0".into(),
+            },
+            content: format!("memori round-trip body {native}"),
+            embedding: None,
+            scope: Scope::User,
+            kind: Kind::Fact,
+            created_at: Utc::now(),
+            updated_at: None,
+            tags: vec![],
+            metadata: Default::default(),
+            provenance: Provenance {
+                native_id: native.into(),
+                native_path: Some(format!("/p/{native}.md")),
+                captured_at: Utc::now(),
+                raw_hash: format!("hash-{native}"),
+                derived_from: None,
+            },
+            schema_version: SCHEMA_VERSION,
+        };
+        let chunks = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &chunks, None).unwrap();
+        native_ids.push(native.to_string());
+    }
+    native_ids
+}
+
+/// `export --format memori-sqlite` writes a DB the memori scanner reads,
+/// and re-normalizing restores the original `anamnesis_native_id` +
+/// provenance so a re-import reconciles as `both` rather than drift.
+#[test]
+fn export_memori_sqlite_round_trips_through_memori_adapter() {
+    use anamnesis_adapter_memori::normalizer::{normalize, raw_from_entity_fact};
+    use anamnesis_adapter_memori::scanner::scan_memori;
+
+    let dir = tmp_dir();
+    let native_ids = seed_foreign_for_memori_export(dir.path());
+    let out_path = dir.path().join("exported_memori.sqlite");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "memori-sqlite",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let scan = scan_memori(&out_path);
+    assert_eq!(
+        scan.entity_facts.len(),
+        3,
+        "memori scanner reads exported facts"
+    );
+
+    let mut restored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &scan.entity_facts {
+        let rec = normalize(raw_from_entity_fact(f, None), None).unwrap();
+        let r = &rec[0];
+        // anamnesis_native_id is restored from the exported metadata column.
+        restored.insert(r.provenance.native_id.clone());
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("claude-code"),
+            "provenance backlink survives the round-trip"
+        );
+    }
+    for native in &native_ids {
+        assert!(
+            restored.contains(native),
+            "original native_id {native} must round-trip; got {restored:?}"
+        );
+    }
+}
+
+/// Negative: `memori-sqlite` requires `--out` (SQLite can't stream).
+#[test]
+fn export_memori_sqlite_requires_out_path() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["export", "--format", "memori-sqlite"])
+        .output()
+        .expect("run cli");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires --out"));
+}
+
 #[test]
 fn verify_reports_healthy_on_fresh_db() {
     let dir = tmp_dir();

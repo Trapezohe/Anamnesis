@@ -4587,7 +4587,7 @@ fn tools_list_payload_all() -> Value {
                                 "against":           { "type": "string", "description": "Right-side adapter id." },
                                 "against_instance":  { "type": "string", "description": "Right-side instance (optional)." },
                                 "out":               { "type": "string", "description": "Absolute output path; must not exist." },
-                                "format":            { "type": "string", "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"], "description": "Round-trip writer." }
+                                "format":            { "type": "string", "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite"], "description": "Round-trip writer." }
                             },
                             "required": ["against", "out", "format"]
                         }
@@ -4599,8 +4599,9 @@ fn tools_list_payload_all() -> Value {
                 "name": "export_memories",
                 "description": "Programmatic round-trip export. Writes Anamnesis records to a fresh file in \
                                 `jsonl`, `csv`, `mem0-sqlite` (mem0's `memories` table), `letta-sqlite` \
-                                (Letta's `block` table), or `memos-dir` (a fresh MemOS MemCube directory \
-                                with `textual_memory.json`). SQLite formats reconstruct native columns from \
+                                (Letta's `block` table), `memos-dir` (a fresh MemOS MemCube directory \
+                                with `textual_memory.json`), or `memori-sqlite` (Memori's `memori_entity_fact` \
+                                table). SQLite formats reconstruct native columns from \
                                 metadata for the originating adapter; all round-trip formats add an \
                                 `anamnesis_*` provenance backlink so a re-import preserves lineage. \
                                 ADMIN-GATED — writes a file and can dump the entire corpus. `out` is REQUIRED \
@@ -4612,7 +4613,7 @@ fn tools_list_payload_all() -> Value {
                     "properties": {
                         "format": {
                             "type": "string",
-                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"],
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite"],
                             "description": "Output format. SQLite + memos-dir formats round-trip into the named framework."
                         },
                         "out": {
@@ -5062,7 +5063,7 @@ fn tools_list_payload_all() -> Value {
                         },
                         "format": {
                             "type": "string",
-                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"],
+                            "enum": ["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir", "memori-sqlite"],
                             "description": "Output format. Optional: omit to derive the lagging \
                                             adapter's canonical round-trip format (mem0/letta/memos); \
                                             errors if it has none. An explicit value that disagrees \

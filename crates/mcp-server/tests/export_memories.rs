@@ -322,6 +322,13 @@ async fn export_memories_schema_advertises_required_fields() {
         .collect();
     assert_eq!(
         format_enum,
-        vec!["jsonl", "csv", "mem0-sqlite", "letta-sqlite", "memos-dir"]
+        vec![
+            "jsonl",
+            "csv",
+            "mem0-sqlite",
+            "letta-sqlite",
+            "memos-dir",
+            "memori-sqlite"
+        ]
     );
 }

@@ -379,14 +379,14 @@ mod tests {
         let summary = payload["summary"].as_str().unwrap();
         assert!(summary.contains("13 adapters"));
         assert!(summary.contains("12 auto-detectable"));
-        assert!(summary.contains("3 round-trip export targets"));
+        assert!(summary.contains("4 round-trip export targets"));
         assert!(summary.contains("0 candidate source(s) detected"));
     }
 
-    /// R149: exactly the three round-trip-capable adapters surface a
+    /// R153: exactly the four round-trip-capable adapters surface a
     /// non-null `round_trip_export_format`; everyone else is `null`.
     #[test]
-    fn round_trip_export_format_is_set_only_for_the_three_round_trip_targets() {
+    fn round_trip_export_format_is_set_only_for_the_round_trip_targets() {
         let roster = adapter_roster();
         let with_target: std::collections::BTreeMap<&str, &str> = roster
             .iter()
@@ -395,10 +395,11 @@ mod tests {
         assert_eq!(with_target.get("mem0"), Some(&"mem0-sqlite"));
         assert_eq!(with_target.get("letta"), Some(&"letta-sqlite"));
         assert_eq!(with_target.get("memos"), Some(&"memos-dir"));
+        assert_eq!(with_target.get("memori"), Some(&"memori-sqlite"));
         assert_eq!(
             with_target.len(),
-            3,
-            "exactly three round-trip targets today"
+            4,
+            "exactly four round-trip targets today"
         );
     }
 
@@ -427,7 +428,7 @@ mod tests {
     async fn discover_adapters_payload_surfaces_round_trip_capability() {
         let tempdir = tempfile::tempdir().unwrap();
         let payload = build_discover_adapters_payload(Some(tempdir.path())).await;
-        assert_eq!(payload["stats"]["round_trip_count"], 3);
+        assert_eq!(payload["stats"]["round_trip_count"], 4);
         let by_id: std::collections::BTreeMap<String, Value> = payload["adapters"]
             .as_array()
             .unwrap()
@@ -437,6 +438,7 @@ mod tests {
         assert_eq!(by_id["mem0"]["round_trip_export_format"], "mem0-sqlite");
         assert_eq!(by_id["letta"]["round_trip_export_format"], "letta-sqlite");
         assert_eq!(by_id["memos"]["round_trip_export_format"], "memos-dir");
+        assert_eq!(by_id["memori"]["round_trip_export_format"], "memori-sqlite");
         assert!(by_id["claude-code"]["round_trip_export_format"].is_null());
         assert!(by_id["generic-mcp"]["round_trip_export_format"].is_null());
     }

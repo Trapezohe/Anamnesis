@@ -5,6 +5,13 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 ## [Unreleased]
 
 ### Added
+- **Memori is the 4th round-trip export target.** `export --format
+  memori-sqlite` (and `export_memories` / `reconcile-export` derive) writes a
+  fresh SQLite DB with Memori's `memori_entity_fact` table (+ a synthetic
+  `memori_entity`). The provenance block lands in a `metadata` JSON column;
+  the memori scanner reads it schema-tolerantly and the normalizer restores
+  the original `anamnesis_native_id` / raw_hash, so a re-import reconciles as
+  `both` rather than drift. `discover_adapters` round-trip count goes 3→4.
 - **`reconcile` / `reconcile_sources` surface the round-trip format per drift
   direction.** Both the CLI diagnostic and the MCP tool now include a
   `round_trip` block: for each direction (`only_left` lags right,
