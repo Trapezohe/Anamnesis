@@ -137,8 +137,8 @@ enum Command {
         /// per the format). Must not exist; refuses to overwrite.
         #[arg(long, requires = "reconcile_export_against")]
         reconcile_export_out: Option<PathBuf>,
-        /// Format for the drift artifact: `jsonl` / `csv` /
-        /// `mem0-sqlite` / `letta-sqlite` / `memos-dir`. Omit to derive
+        /// Format for the drift artifact: `jsonl` / `csv` / `mem0-sqlite`
+        /// / `letta-sqlite` / `memos-dir` / `memori-sqlite`. Omit to derive
         /// the `against` adapter's canonical round-trip format.
         #[arg(long, requires_all = ["reconcile_export_against", "reconcile_export_out"])]
         reconcile_export_format: Option<String>,
@@ -392,8 +392,8 @@ enum Command {
         #[arg(long, value_parser = ["only-left", "only-right"])]
         bucket: String,
         /// Output format: `jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`,
-        /// or `memos-dir`. Omit to derive the lagging adapter's canonical
-        /// round-trip format; errors if it has none.
+        /// `memos-dir`, or `memori-sqlite`. Omit to derive the lagging
+        /// adapter's canonical round-trip format; errors if it has none.
         #[arg(long)]
         format: Option<String>,
         /// Output path. Required for every format; must not exist.
@@ -525,16 +525,16 @@ enum Command {
     Audit(AuditCmd),
 
     /// Export records as `jsonl`, `csv`, `mem0-sqlite`, `letta-sqlite`,
-    /// or `memos-dir` (a fresh MemOS MemCube directory). All non-text
-    /// formats refuse to overwrite an existing target.
+    /// `memos-dir` (a fresh MemOS MemCube directory), or `memori-sqlite`.
+    /// All non-text formats refuse to overwrite an existing target.
     Export {
         /// Output path. `jsonl`/`csv`: defaults to stdout. Other formats:
         /// required (can't stream); the path must not already exist.
         #[arg(long)]
         out: Option<PathBuf>,
         /// `jsonl` (default), `csv`, `mem0-sqlite`, `letta-sqlite`,
-        /// or `memos-dir`. Letta-origin records round-trip native `block`
-        /// columns; MemOS-origin records round-trip `memory_type`.
+        /// `memos-dir`, or `memori-sqlite`. Letta-origin records round-trip
+        /// native `block` columns; MemOS-origin records round-trip `memory_type`.
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// Restrict to one source (adapter id).
