@@ -14,7 +14,7 @@ use crate::ExportError;
 
 /// `anamnesis_*` provenance keys layered onto the record's metadata.
 /// Shared by both SQLite exporters so the round-trip contract stays uniform.
-fn anamnesis_provenance_block(
+pub(crate) fn anamnesis_provenance_block(
     rec: &anamnesis_core::AnamnesisRecord,
 ) -> serde_json::Map<String, Value> {
     let mut meta: serde_json::Map<String, Value> = rec.metadata.clone();

@@ -1382,6 +1382,80 @@ fn export_memori_sqlite_requires_out_path() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("requires --out"));
 }
 
+// ─── R154: export --format tdai-dir (5th round-trip target) ─────────
+
+/// `export --format tdai-dir` writes a TDAI L1 jsonl directory the tdai
+/// scanner reads, and re-normalizing restores the original
+/// `anamnesis_native_id` + provenance (reconciles as `both`, not drift).
+#[test]
+fn export_tdai_dir_round_trips_through_tdai_adapter() {
+    use anamnesis_adapter_tdai::normalizer::{normalize, raw_from_l1};
+    use anamnesis_adapter_tdai::scanner::scan_tdai;
+
+    let dir = tmp_dir();
+    let native_ids = seed_foreign_for_memori_export(dir.path());
+    let out_dir = dir.path().join("exported_tdai");
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args([
+            "export",
+            "--format",
+            "tdai-dir",
+            "--out",
+            out_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let facts_file = out_dir.join("anamnesis_facts.jsonl");
+    assert!(
+        facts_file.is_file(),
+        "tdai-dir writes anamnesis_facts.jsonl"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&facts_file)
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+
+    let scan = scan_tdai(&out_dir);
+    assert_eq!(
+        scan.l1_facts.len(),
+        3,
+        "tdai scanner reads exported L1 facts"
+    );
+
+    let mut restored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &scan.l1_facts {
+        let rec = normalize(raw_from_l1(f, None), None).unwrap();
+        let r = &rec[0];
+        restored.insert(r.provenance.native_id.clone());
+        assert!(
+            r.content.starts_with("memori round-trip body"),
+            "content survives round-trip: {}",
+            r.content
+        );
+        assert_eq!(
+            r.metadata
+                .get("anamnesis_source_adapter")
+                .and_then(|v| v.as_str()),
+            Some("claude-code"),
+        );
+        assert!(
+            !r.provenance.raw_hash.starts_with("hash-"),
+            "raw_hash re-derived from content, not restored"
+        );
+    }
+    for native in &native_ids {
+        assert!(
+            restored.contains(native),
+            "native_id {native} must round-trip"
+        );
+    }
+}
+
 #[test]
 fn verify_reports_healthy_on_fresh_db() {
     let dir = tmp_dir();
