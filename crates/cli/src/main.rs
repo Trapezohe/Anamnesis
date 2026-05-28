@@ -5503,7 +5503,7 @@ fn render_forgotten_counts_json(
 /// For each query the harness builds a `SearchFilter` from the
 /// optional `source / instance / kind / scope` fields, runs the
 /// same `HybridSearcher` + `pack` path `search` uses, converts the
-/// resulting `PackedRecord`s into [`RankedRecordRef`]s, and scores
+/// resulting `PackedRecord`s into `RankedRecordRef`s, and scores
 /// them with `evaluate_query_at`. The aggregate is gated by
 /// `--min-mrr` / `--min-ndcg` — exit 1 on threshold violation so
 /// CI can fail loudly.

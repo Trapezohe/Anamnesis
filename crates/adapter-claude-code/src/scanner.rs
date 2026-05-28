@@ -7,7 +7,7 @@
 //!
 //! Modern Claude Code nests session files as
 //! `<project>/<session-uuid>/subagents/*.jsonl`. We recurse `*.jsonl`
-//! discovery up to [`MAX_JSONL_DEPTH`] levels under each project dir,
+//! discovery up to `MAX_JSONL_DEPTH` levels under each project dir,
 //! skipping `memory/` (handled separately) and hidden entries. Memory
 //! markdown remains exactly one level deep (`<project>/memory/*.md`).
 

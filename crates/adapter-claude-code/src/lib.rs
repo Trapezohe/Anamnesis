@@ -2,9 +2,11 @@
 //!
 //! Data sources (see `docs/BLUEPRINT.md §6.8`):
 //!
+//! ```text
 //!   ~/.claude/projects/<hash>/*.jsonl          — conversation history
 //!   ~/.claude/projects/<hash>/memory/MEMORY.md — index (NOT imported)
 //!   ~/.claude/projects/<hash>/memory/*.md      — typed memory files
+//! ```
 //!
 //! Mapping rules:
 //!   - `memory/*.md` frontmatter `type` → `Kind` / `Scope`

@@ -5,8 +5,10 @@
 //! The adapter speaks the same minimal HTTP JSON-RPC profile that
 //! `anamnesis-mcp --sse` serves:
 //!
-//!   POST {url}/mcp                   — JSON-RPC body
+//! ```text
+//!   POST {url}/mcp                  — JSON-RPC body
 //!   Authorization: Bearer <token>   — required when the server demands it
+//! ```
 //!
 //! Behaviour:
 //!   - `detect` hits `{url}/healthz` (no auth) to verify reachability.

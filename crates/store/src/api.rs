@@ -1630,7 +1630,7 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Dry-run [`forget_record`]: per-table cascade counts inside a
+    /// Dry-run [`Store::forget_record`]: per-table cascade counts inside a
     /// rolled-back transaction. Read-only; callers must not record audit.
     /// vec0 counts traverse the same path as the real delete to prevent drift.
     pub fn preview_forget_record(
@@ -1998,7 +1998,7 @@ impl Store {
         }))
     }
 
-    /// Round 95 (PR-78q): dry-run preview for [`unforget_record`].
+    /// Round 95 (PR-78q): dry-run preview for [`Store::unforget_record`].
     ///
     /// Returns the existing tombstone (so the operator can verify
     /// they're targeting the right row) or
@@ -2865,7 +2865,7 @@ impl Store {
         Ok(out)
     }
 
-    /// Dry-run [`accept_native_conflict_variant`]: partitions the conflict
+    /// Dry-run [`Store::accept_native_conflict_variant`]: partitions the conflict
     /// group into keep/forget sets without mutating the store.
     pub fn preview_accept_native_conflict_variant(
         &self,

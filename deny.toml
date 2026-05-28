@@ -1,0 +1,92 @@
+# cargo-deny config for Anamnesis. Read by both local `cargo deny check`
+# and CI. Aligns with §-1.2.4 (Apache-2.0 binaries, OSI-compatible deps).
+#
+# To run locally:
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# Sections:
+#   [advisories]  — RustSec vulnerability gate (fails CI on known CVE).
+#   [licenses]    — allowlist of license families we ship.
+#   [bans]        — forbid known-bad crates and detect duplicate deps.
+#   [sources]     — only allow crates.io + the git deps we already pull.
+
+[graph]
+all-features = false
+no-default-features = false
+exclude-dev = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail on any unmaintained / yanked crate hits; tighten later if too noisy.
+yanked = "deny"
+ignore = [
+    # `paste`, `fxhash`, `number_prefix` reach us only as transitive
+    # deps through fastembed → tokenizers / hf-hub / image. They're
+    # tagged "unmaintained" (not vulnerable). Acceptable until the
+    # upstream ML stack migrates; revisit when bumping fastembed.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 transitive via fastembed/tokenizers — unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash transitive via fastembed stack — unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix transitive via hf-hub → fastembed — unmaintained, not vulnerable" },
+]
+
+[licenses]
+# §-1.2.4: binaries are Apache-2.0. Dep licenses must be OSI-approved
+# and non-copyleft so the redistribution story stays clean.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "NCSA",                # libfuzzer-sys transitively via rav1e/image
+    "CDLA-Permissive-2.0", # webpki-roots — permissive community data license
+    "CC0-1.0",
+    "Zlib",
+    "OpenSSL",
+    "MPL-2.0",      # weak copyleft, file-level; acceptable for libs
+    "BSL-1.0",
+]
+confidence-threshold = 0.93
+
+# Per-crate license overrides for crates that bundle non-machine-readable
+# license text. Each entry must list the crate's actual license under
+# `allow` so cargo-deny doesn't fall back to UNLICENSED.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Multiple-versions warns by default; pin to "warn" so we see drift but
+# don't block on the inevitable transitive duplication (e.g. windows-sys
+# major-version splits). Promote to "deny" once the tree is clean.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Crates we will not accept under any name. Empty for now; populate when
+# we identify a specific bad actor.
+deny = []
+
+# Crates we explicitly skip in multi-version checks because the duplication
+# comes from upstream and can't be deduped without a fork.
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# sqlite-vec is currently fetched via git in some adapter paths;
+# any git dep we deliberately pull goes here. Empty = enforce
+# "only crates.io" by default.
+allow-git = []
