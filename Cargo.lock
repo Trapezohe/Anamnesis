@@ -316,6 +316,7 @@ dependencies = [
  "predicates",
  "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
