@@ -56,7 +56,8 @@ This README describes the current source tree. “Supported” means an adapter 
 | Retrieval | Keyword, vector, and hybrid search with source, instance, kind, scope, and time filters |
 | Embeddings | Local deterministic embeddings by default, provider-ready interface |
 | Import | Shared importer service used by CLI and MCP admin import path |
-| MCP | stdio and HTTP/SSE transports; search, read, list, doctor, and gated admin import tools |
+| Auto-sync | `anamnesis watch` daemon keeps the store current — fs-watches local sources, polls URL sources, refreshes embeddings; optional auto-start at login (launchd/systemd) |
+| MCP | stdio and HTTP/SSE transports; search, read, list, doctor, watch_status, and gated admin import tools |
 | Extraction | Session extraction crate and CLI command with mock/OpenAI/Anthropic provider options |
 
 ## Supported Sources
@@ -176,6 +177,7 @@ flowchart LR
     Tools --> Read["read_memory"]
     Tools --> List["list_sources"]
     Tools --> Doctor["doctor"]
+    Tools --> WatchStatus["watch_status"]
     Tools --> Import["import_source"]
     Import --> Gate["Admin gate disabled by default"]
     Server --> Resources["MCP resources/list + resources/read"]
@@ -227,6 +229,14 @@ Import and embed:
 ```bash
 anamnesis import codex
 anamnesis import generic-mcp:upstream
+```
+
+Keep it synced automatically (instead of re-running `import` by hand):
+
+```bash
+anamnesis watch            # foreground daemon: auto-import on change + poll URL sources
+anamnesis watch install    # or auto-start at login (launchd on macOS, systemd on Linux)
+anamnesis watch status     # is the daemon live, and how fresh is each source?
 ```
 
 Search:
@@ -309,6 +319,8 @@ anamnesis source add <adapter> [--instance <name>] [--path <path>]
 anamnesis source add generic-mcp [--instance <name>] --url <url> [--token-env <ENV_NAME>]
 anamnesis source list [--json]
 anamnesis import <source[:instance]> [--dry-run] [--no-embed] [--full] [--since <RFC3339>]
+anamnesis watch [--no-embed]
+anamnesis watch install | uninstall | status
 anamnesis search <query> [--mode keyword|vector|hybrid] [--source <id>] [--instance <name>] [--kind <kind>] [--scope <scope>] [--since <RFC3339>] [--until <RFC3339>] [--json]
 anamnesis extract <source[:instance]> [--provider mock|openai|anthropic] [--audit]
 anamnesis lineage <record-id>

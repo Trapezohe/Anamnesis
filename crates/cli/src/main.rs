@@ -153,16 +153,16 @@ enum Command {
     ///
     /// Bare `anamnesis watch` runs the long-running foreground daemon:
     /// monitors each source's filesystem location, debounces bursts, and
-    /// runs an incremental import when data changes — keeping the local
-    /// store continuously in sync without re-running `import` by hand.
-    /// Runs a one-shot catch-up import on start, then watches until
-    /// Ctrl-C. URL sources (`generic-mcp`) are skipped (interval polling
-    /// lands later).
+    /// runs an incremental import when data changes — then refreshes
+    /// embeddings — keeping the local store continuously in sync without
+    /// re-running `import` by hand. Runs a one-shot catch-up import on
+    /// start, then watches until Ctrl-C. URL sources (`generic-mcp`) can't
+    /// be fs-watched, so they're re-imported on a 60s poll instead (R155).
     ///
-    /// Subcommands (R152) make it auto-start at login:
+    /// Subcommands make it auto-start at login + introspectable:
     ///   `watch install`   — register an OS service (launchd / systemd).
     ///   `watch uninstall` — remove it.
-    ///   `watch status`    — is it installed?
+    ///   `watch status`    — is the service installed + is the daemon live?
     Watch {
         /// `install` / `uninstall` / `status`. Omit to run the daemon.
         #[command(subcommand)]
@@ -854,7 +854,8 @@ enum WatchAction {
     Install,
     /// Stop + remove the auto-start service.
     Uninstall,
-    /// Report whether the auto-start service is installed.
+    /// Report auto-start service install state, whether the daemon is
+    /// live (heartbeat), and each source's last-sync age.
     Status,
 }
 
