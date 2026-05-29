@@ -18,18 +18,18 @@ mod watch_service;
 
 use std::path::PathBuf;
 
-use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
-use anamnesis_adapter_codex::{codex_adapter, CodexDetector};
-use anamnesis_adapter_hermes::{hermes_adapter, HermesDetector};
-use anamnesis_adapter_letta::{letta_adapter, LettaSqliteDetector};
-use anamnesis_adapter_mem0::{sqlite_adapter as mem0_sqlite_adapter, Mem0SqliteDetector};
-use anamnesis_adapter_memary::{memary_adapter, MemaryDetector};
-use anamnesis_adapter_memori::{memori_adapter, MemoriDetector};
-use anamnesis_adapter_memos::{memos_adapter, MemosDetector};
-use anamnesis_adapter_mempalace::{mempalace_adapter, MempalaceDetector};
-use anamnesis_adapter_openclaw::{openclaw_adapter, OpenClawDetector};
-use anamnesis_adapter_openviking::{openviking_adapter, OpenVikingDetector};
-use anamnesis_adapter_tdai::{tdai_adapter, TdaiDetector};
+use anamnesis_adapter_claude_code::ClaudeCodeDetector;
+use anamnesis_adapter_codex::CodexDetector;
+use anamnesis_adapter_hermes::HermesDetector;
+use anamnesis_adapter_letta::LettaSqliteDetector;
+use anamnesis_adapter_mem0::Mem0SqliteDetector;
+use anamnesis_adapter_memary::MemaryDetector;
+use anamnesis_adapter_memori::MemoriDetector;
+use anamnesis_adapter_memos::MemosDetector;
+use anamnesis_adapter_mempalace::MempalaceDetector;
+use anamnesis_adapter_openclaw::OpenClawDetector;
+use anamnesis_adapter_openviking::OpenVikingDetector;
+use anamnesis_adapter_tdai::TdaiDetector;
 use anamnesis_core::discovery::{DetectOpts, Discovery};
 use anamnesis_embedder::registry;
 use anamnesis_importer::{ImportOptions, ImportService};
@@ -6512,102 +6512,43 @@ async fn run_adapter_health(
     src: &anamnesis_store::SourceRow,
 ) -> Option<anamnesis_core::adapter::HealthStatus> {
     use anamnesis_core::adapter::MemoryAdapter;
-    let location_path = src.location.as_deref().map(std::path::PathBuf::from);
     let instance = if src.instance.is_empty() {
         None
     } else {
         Some(src.instance.as_str())
     };
 
-    match src.adapter.as_str() {
-        anamnesis_adapter_claude_code::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".claude", "projects"]).unwrap_or_default());
-            let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
-                projects_root: path,
-                instance: instance.map(str::to_owned),
+    // generic-mcp health is a cheap `<url>/healthz` GET (not the
+    // resources/list pull that import does), so it keeps a bespoke arm.
+    if src.adapter == anamnesis_adapter_generic_mcp::ADAPTER_ID {
+        let Some(url) = src.location.clone() else {
+            return Some(anamnesis_core::adapter::HealthStatus {
+                ok: false,
+                detail: "generic-mcp registered without --url".to_string(),
             });
-            Some(adapter.health().await)
-        }
-        anamnesis_adapter_codex::ADAPTER_ID => {
-            let path = location_path.unwrap_or_else(|| home_join(&[".codex"]).unwrap_or_default());
-            Some(codex_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_mem0::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".mem0", "db.sqlite"]).unwrap_or_default());
-            Some(mem0_sqlite_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_letta::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".letta", "letta.db"]).unwrap_or_default());
-            Some(letta_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_hermes::ADAPTER_ID => {
-            let path = location_path.unwrap_or_else(|| home_join(&[".hermes"]).unwrap_or_default());
-            Some(hermes_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_openclaw::ADAPTER_ID => {
-            let path =
-                location_path.unwrap_or_else(|| home_join(&[".openclaw"]).unwrap_or_default());
-            Some(openclaw_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_tdai::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".openclaw", "memory-tdai"]).unwrap_or_default());
-            Some(tdai_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_openviking::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".openviking", "data"]).unwrap_or_default());
-            Some(openviking_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_mempalace::ADAPTER_ID => {
-            let path =
-                location_path.unwrap_or_else(|| home_join(&[".mempalace"]).unwrap_or_default());
-            Some(mempalace_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_memori::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".memori", "memori.db"]).unwrap_or_default());
-            Some(memori_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_memos::ADAPTER_ID => {
-            let path = location_path.unwrap_or_else(|| home_join(&[".memos"]).unwrap_or_default());
-            Some(memos_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_memary::ADAPTER_ID => {
-            let path = location_path
-                .unwrap_or_else(|| home_join(&[".memary", "data"]).unwrap_or_default());
-            Some(memary_adapter(path, instance).health().await)
-        }
-        anamnesis_adapter_generic_mcp::ADAPTER_ID => {
-            // `MemoryAdapter::health()` on generic-mcp is a single GET
-            // to `<url>/healthz` — much cheaper than the resources/list
-            // pull that import does. The bearer token (if any) is
-            // resolved from `src.config_json` the same way `cmd_import`
-            // resolves it, so token-env discrepancies show up here too.
-            let Some(url) = src.location.clone() else {
+        };
+        let token = match resolve_generic_mcp_token(src.config_json.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
                 return Some(anamnesis_core::adapter::HealthStatus {
                     ok: false,
-                    detail: "generic-mcp registered without --url".to_string(),
+                    detail: format!("generic-mcp token resolution failed: {e}"),
                 });
-            };
-            let token = match resolve_generic_mcp_token(src.config_json.as_deref()) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Some(anamnesis_core::adapter::HealthStatus {
-                        ok: false,
-                        detail: format!("generic-mcp token resolution failed: {e}"),
-                    });
-                }
-            };
-            let adapter =
-                anamnesis_adapter_generic_mcp::generic_mcp_adapter(url, token.as_deref(), instance);
-            Some(adapter.health().await)
-        }
-        _ => None,
+            }
+        };
+        let adapter =
+            anamnesis_adapter_generic_mcp::generic_mcp_adapter(url, token.as_deref(), instance);
+        return Some(adapter.health().await);
     }
+
+    // Every fs adapter: the registry location (or the adapter default),
+    // built via the shared factory. Unknown ids -> None ("not wired").
+    let location = match src.location.as_deref() {
+        Some(loc) => std::path::PathBuf::from(loc),
+        None => default_path_for(&src.adapter).unwrap_or_default(),
+    };
+    let adapter = adapters::build_fs_adapter(&src.adapter, location, instance)?;
+    Some(adapter.health().await)
 }
 
 /// Run every detector we know about. Single place to keep this list in
