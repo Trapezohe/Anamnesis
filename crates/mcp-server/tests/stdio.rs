@@ -90,10 +90,10 @@ fn binary_responds_to_initialize_and_tools_list() {
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_owned))
         .collect();
-    // R146 added `reconcile_sources` to the non-admin catalogue (8 → 9).
+    // R146 added `reconcile_sources` (8 → 9); R156 added `watch_status` (9 → 10).
     assert_eq!(
         names.len(),
-        9,
+        10,
         "import_source should be hidden by default; got {names:?}"
     );
     assert!(!names.contains(&"import_source".to_string()));

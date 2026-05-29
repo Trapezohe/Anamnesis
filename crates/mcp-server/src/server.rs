@@ -843,6 +843,7 @@ impl AnamnesisServer {
             "import_source" => self.tool_import_source(args.clone()).await,
             "trace_provenance" => self.tool_trace_provenance(args.clone()).await,
             "doctor" => self.tool_doctor(args.clone()).await,
+            "watch_status" => self.tool_watch_status(args.clone()).await,
             "forget_record" => self.tool_forget_record(args.clone()).await,
             "unforget_record" => self.tool_unforget_record(args.clone()).await,
             "list_forgotten" => self.tool_list_forgotten(args.clone()).await,
@@ -2108,6 +2109,58 @@ impl AnamnesisServer {
                 "tools": tool_metrics_payload,
             },
         }))
+    }
+
+    /// MCP `watch_status` — read-only auto-sync health. Reads the `watch`
+    /// daemon's heartbeat (shared type in `anamnesis_core::watch`) and joins
+    /// per-source `last_import_at`. Mirrors `anamnesis watch status` so an
+    /// agent can introspect sync freshness over the protocol.
+    async fn tool_watch_status(&self, _args: Value) -> Result<Value, String> {
+        use anamnesis_core::watch::{
+            heartbeat_path, is_heartbeat_live, WatchHeartbeat, HEARTBEAT_STALE_SECS,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Read the heartbeat (absent / unparsable → not_running).
+        let hb: Option<WatchHeartbeat> = std::fs::read_to_string(heartbeat_path(&self.data_dir))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let daemon = match &hb {
+            Some(h) if is_heartbeat_live(now, h.last_beat, HEARTBEAT_STALE_SECS) => json!({
+                "state": "running",
+                "pid": h.pid,
+                "roots": h.roots,
+                "last_beat_age_secs": now - h.last_beat,
+                "uptime_secs": now - h.started_at,
+            }),
+            Some(h) => json!({
+                "state": "stale",
+                "pid": h.pid,
+                "last_beat_age_secs": now - h.last_beat,
+            }),
+            None => json!({ "state": "not_running" }),
+        };
+
+        let sources = self
+            .store
+            .list_sources_full()
+            .map_err(|e| format!("list sources: {e}"))?;
+        let source_rows: Vec<Value> = sources
+            .iter()
+            .map(|s| {
+                json!({
+                    "adapter": s.adapter,
+                    "instance": s.instance,
+                    "last_import_at": s.last_import_at,
+                    "age_secs": s.last_import_at.map(|t| now - t),
+                    // generic-mcp is polled on an interval; everything else
+                    // is filesystem-watched (see cli `is_fs_watchable`).
+                    "fs_watchable": s.adapter != anamnesis_adapter_generic_mcp::ADAPTER_ID,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "daemon": daemon, "sources": source_rows }))
     }
 
     /// MCP `forget_record` — admin-gated. Writes tombstone, cascades
@@ -4699,6 +4752,16 @@ fn tools_list_payload_all() -> Value {
                 }
             },
             {
+                "name": "watch_status",
+                "description": "Is auto-sync running, and how fresh is each source? Reads the \
+                                `anamnesis watch` daemon's heartbeat (it keeps the local store \
+                                continuously in sync with the user's memory frameworks) and joins \
+                                per-source `last_import_at`. Use this when `search_memories` looks \
+                                stale to tell \"the daemon is down\" from \"nothing changed upstream\". \
+                                `daemon.state` is `running` / `stale` / `not_running`. Read-only.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
                 "name": "forget_record",
                 "description": "Permanently forget a record. Writes an `(adapter, instance, native_id)` \
                                 tombstone so re-import can't resurrect it. ADMIN-GATED. Does NOT modify \
@@ -5459,6 +5522,8 @@ mod tests {
             "list_conflicts",
             // Round 137: programmatic capability discovery, not admin-gated.
             "discover_adapters",
+            // R156: read-only auto-sync health, not admin-gated.
+            "watch_status",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -5469,18 +5534,18 @@ mod tests {
             !names.contains(&"import_source".to_string()),
             "import_source MUST be hidden by default — found in tools/list",
         );
-        // R146 added `reconcile_sources` to the non-admin catalogue (8 → 9).
-        assert_eq!(names.len(), 9, "expect exactly 9 non-admin tools");
+        // R146 added `reconcile_sources` (8 → 9); R156 added `watch_status` (9 → 10).
+        assert_eq!(names.len(), 10, "expect exactly 10 non-admin tools");
     }
 
     #[tokio::test]
     async fn tools_list_includes_all_when_admin_enabled() {
-        // R147 added reconcile_export_bucket (18 → 19).
+        // R147 added reconcile_export_bucket (18 → 19); R156 added watch_status (19 → 20).
         let store = Store::open_in_memory().unwrap();
         let s = AnamnesisServer::new(store, None, std::env::temp_dir()).with_admin_tools(true);
         let resp = s.handle(req("tools/list", Value::Null)).await;
         let names = tool_names_from(&resp.result.unwrap());
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         for expected in [
             "search_memories",
             "get_record",
@@ -5488,6 +5553,7 @@ mod tests {
             "import_source",
             "trace_provenance",
             "doctor",
+            "watch_status",
             "forget_record",
             "unforget_record",
             "list_forgotten",
@@ -5524,10 +5590,10 @@ mod tests {
         let summary = payload["summary"]
             .as_str()
             .expect("tools/list must carry top-level `summary` for discovery");
-        // R146 added reconcile_sources to non-admin (8 → 9).
+        // R146 added reconcile_sources (8 → 9); R156 added watch_status (9 → 10).
         assert!(
-            summary.contains("9 tools exposed"),
-            "non-admin summary should declare 9 visible tools: {summary}"
+            summary.contains("10 tools exposed"),
+            "non-admin summary should declare 10 visible tools: {summary}"
         );
         // Operator must learn which tools are gated even when
         // they're hidden.
@@ -5540,10 +5606,10 @@ mod tests {
             "summary should name a representative admin tool: {summary}"
         );
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
-    /// Admin-on summary: 19 visible tools (R147 added `reconcile_export_bucket`).
+    /// Admin-on summary: 20 visible tools (R156 added `watch_status`).
     #[tokio::test]
     async fn tools_list_carries_top_level_summary_admin_on() {
         let store = Store::open_in_memory().unwrap();
@@ -5552,15 +5618,15 @@ mod tests {
         let payload = resp.result.unwrap();
         let summary = payload["summary"].as_str().unwrap();
         assert!(
-            summary.contains("19 tools exposed"),
-            "admin-on summary should declare 19 visible tools: {summary}"
+            summary.contains("20 tools exposed"),
+            "admin-on summary should declare 20 visible tools: {summary}"
         );
         assert!(
             summary.contains("admin tools enabled"),
             "admin-on summary should switch to enabled verb: {summary}"
         );
         let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
     }
 
     #[tokio::test]
@@ -7406,6 +7472,63 @@ mod tests {
             ))
             .await;
         assert!(resp.error.is_some());
+    }
+
+    // ─── R156: `watch_status` tool ────────────────────────────────────
+
+    /// No heartbeat file → `not_running`; sources still listed with their
+    /// fs-watchable flag (generic-mcp is polled, everything else watched).
+    #[tokio::test]
+    async fn watch_status_not_running_lists_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("anamnesis.sqlite")).unwrap();
+        store
+            .register_source("mem0", None, Some("/tmp/m.db"), None)
+            .unwrap();
+        store
+            .register_source("generic-mcp", None, Some("http://x/mcp"), None)
+            .unwrap();
+        let s = AnamnesisServer::new(store, None, dir.path().to_path_buf());
+
+        let resp = s
+            .handle(req("tools/call", json!({"name": "watch_status"})))
+            .await;
+        let body = resp.result.expect("watch_status must succeed")["structuredContent"].clone();
+        assert_eq!(body["daemon"]["state"], "not_running");
+        let sources = body["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2);
+        let by = |a: &str| sources.iter().find(|s| s["adapter"] == a).unwrap().clone();
+        assert_eq!(by("mem0")["fs_watchable"], true);
+        assert_eq!(by("generic-mcp")["fs_watchable"], false);
+    }
+
+    /// A fresh heartbeat → `running`, carrying pid + uptime.
+    #[tokio::test]
+    async fn watch_status_reads_live_heartbeat() {
+        use anamnesis_core::watch::{heartbeat_path, WatchHeartbeat};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("anamnesis.sqlite")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let hb = WatchHeartbeat {
+            pid: 9988,
+            started_at: now - 30,
+            last_beat: now,
+            roots: 2,
+        };
+        std::fs::write(
+            heartbeat_path(dir.path()),
+            serde_json::to_string(&hb).unwrap(),
+        )
+        .unwrap();
+        let s = AnamnesisServer::new(store, None, dir.path().to_path_buf());
+
+        let resp = s
+            .handle(req("tools/call", json!({"name": "watch_status"})))
+            .await;
+        let daemon = resp.result.unwrap()["structuredContent"]["daemon"].clone();
+        assert_eq!(daemon["state"], "running");
+        assert_eq!(daemon["pid"], 9988);
+        assert_eq!(daemon["roots"], 2);
     }
 
     // ─── Round-54: `doctor` tool ──────────────────────────────────────

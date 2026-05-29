@@ -17,6 +17,7 @@ pub mod embedding;
 pub mod error;
 pub mod model;
 pub mod query;
+pub mod watch;
 
 pub use audit::{
     parse_audit_actions, Audit, AuditEntry, AuditTailOptions, AuditTailRow,
