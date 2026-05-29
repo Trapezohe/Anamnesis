@@ -8,6 +8,9 @@
 // Near-dedupe merge-preview ranking lives in `anamnesis-store` so the
 // MCP `dedupe` tool can share the heuristic.
 
+// R151: `anamnesis watch` install-and-auto-sync daemon.
+mod watch;
+
 use std::path::PathBuf;
 
 use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeDetector};
@@ -142,6 +145,22 @@ enum Command {
         /// `claude-code-dir`. Omit to derive the `against` adapter's format.
         #[arg(long, requires_all = ["reconcile_export_against", "reconcile_export_out"])]
         reconcile_export_format: Option<String>,
+    },
+
+    /// Watch every registered source and auto-import on change (R151).
+    ///
+    /// Long-running foreground daemon: monitors each source's filesystem
+    /// location, debounces bursts, and runs an incremental import when
+    /// data changes — keeping the local store continuously in sync
+    /// without re-running `import` by hand. Runs a one-shot catch-up
+    /// import on start, then watches until Ctrl-C. Background it with
+    /// nohup / systemd / launchd. URL sources (`generic-mcp`) are not
+    /// fs-watchable and are skipped (interval polling lands in a later PR).
+    Watch {
+        /// Skip the embedding worker (PR 1: embedding scheduling under
+        /// watch is deferred; flag reserved for forward-compat).
+        #[arg(long)]
+        no_embed: bool,
     },
 
     /// Search across all imported records.
@@ -1077,6 +1096,7 @@ async fn run() -> Result<()> {
             )
             .await
         }
+        Command::Watch { no_embed } => watch::run_watch(&data_dir, no_embed).await,
         Command::Search {
             query,
             source,

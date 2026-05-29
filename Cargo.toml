@@ -91,6 +91,10 @@ clap = { version = "4", features = ["derive", "env"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
 
+# Filesystem watching (R151 watch daemon — auto-sync). Driven from a
+# background thread; events bridged into the async orchestrator.
+notify = "8"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
