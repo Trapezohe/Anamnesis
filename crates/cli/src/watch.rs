@@ -55,6 +55,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// absorb a slow sweep without false "running" reports.
 const HEARTBEAT_STALE_SECS: i64 = 45;
 
+/// URL adapters (`generic-mcp`) can't be fs-watched, so the daemon
+/// re-imports them on this interval. Each poll is `since`-bounded, so a
+/// quiet upstream costs one cheap incremental scan per tick (R155).
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Identifies a registered source: `(adapter, instance)`. Empty instance
 /// is the default instance (mirrors `SourceRow.instance`).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -192,8 +197,8 @@ fn incremental_since(last_import_at: Option<i64>) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp((ts - SINCE_OVERLAP_SECS).max(0), 0)
 }
 
-/// fs-watchable sources only — `generic-mcp` (URL) has no local path and
-/// is deferred to PR 2's interval poller.
+/// fs-watchable sources only — `generic-mcp` (URL) has no local path, so
+/// it's synced by the interval poller ([`poll_url_source`]) instead.
 fn is_fs_watchable(adapter: &str) -> bool {
     adapter != anamnesis_adapter_generic_mcp::ADAPTER_ID
 }
@@ -310,6 +315,49 @@ async fn import_one_source(
         }
         other => Err(anyhow!("watch: adapter {other:?} is not fs-watchable")),
     }
+}
+
+/// Incremental import of one URL (`generic-mcp`) source — the polling
+/// counterpart to [`import_one_source`]. Resolves the bearer token from
+/// the registry `config_json` (via `super::resolve_generic_mcp_token`) and
+/// runs the same `ImportService` pipeline against the upstream MCP server.
+async fn poll_url_source(
+    data_dir: &Path,
+    key: &SourceKey,
+    url: &str,
+    config: Option<&str>,
+    since: Option<DateTime<Utc>>,
+) -> Result<anamnesis_importer::ImportSummary> {
+    use anamnesis_importer::{ImportOptions, ImportService};
+
+    let token = super::resolve_generic_mcp_token(config)?;
+    let instance = if key.instance.is_empty() {
+        None
+    } else {
+        Some(key.instance.as_str())
+    };
+    let adapter =
+        anamnesis_adapter_generic_mcp::generic_mcp_adapter(url, token.as_deref(), instance);
+
+    let store = Store::open(super::db_path(data_dir))?;
+    let service = ImportService::new(&store, super::audit(data_dir));
+    let opts = ImportOptions {
+        dry_run: false,
+        canonical_location: Some(url.to_string()),
+        source_was_explicit: true,
+        scan_opts: ScanOpts { since, full: false },
+    };
+    service
+        .import(&adapter, opts)
+        .await
+        .map_err(|e| anyhow!("watch poll {}: {e}", key.label()))
+}
+
+/// A registered URL source the daemon polls on [`POLL_INTERVAL`].
+struct UrlSource {
+    key: SourceKey,
+    url: String,
+    config: Option<String>,
 }
 
 /// Whether to drain the embedding worker after a sweep that wrote
@@ -450,7 +498,7 @@ pub fn report_runtime_status(data_dir: &Path) -> Result<()> {
         let note = if is_fs_watchable(&s.adapter) {
             ""
         } else {
-            " (not fs-watchable — manual import)"
+            " (URL — polled, not fs-watched)"
         };
         println!("  {} — {fresh}{note}", key.label());
     }
@@ -466,15 +514,34 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
         store.list_sources_full()?
     };
     let router = build_router(&sources);
-    if router.is_empty() {
+    // URL (generic-mcp) sources can't be fs-watched — collect them for the
+    // interval poller. A daemon with only URL sources is still valid.
+    let url_sources: Vec<UrlSource> = sources
+        .iter()
+        .filter(|s| !is_fs_watchable(&s.adapter))
+        .filter_map(|s| {
+            s.location.clone().map(|url| UrlSource {
+                key: SourceKey {
+                    adapter: s.adapter.clone(),
+                    instance: s.instance.clone(),
+                },
+                url,
+                config: s.config_json.clone(),
+            })
+        })
+        .collect();
+    if router.is_empty() && url_sources.is_empty() {
         return Err(anyhow!(
-            "watch: no fs-watchable sources registered. Run `anamnesis source add <adapter> \
-             --path <location>` (and at least one `anamnesis import`) first."
+            "watch: no watchable sources registered. Run `anamnesis source add <adapter> \
+             --path <location>` (or `... generic-mcp --url <url>`) and at least one \
+             `anamnesis import` first."
         ));
     }
 
     // last_import_at lookup keyed by source for the incremental `since`.
-    let last_import: HashMap<SourceKey, Option<i64>> = sources
+    // Mutable: advanced after each successful import so a long-running
+    // daemon's `since` tracks forward instead of re-scanning from startup.
+    let mut last_import: HashMap<SourceKey, Option<i64>> = sources
         .iter()
         .map(|s| {
             (
@@ -510,12 +577,22 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
     for (key, loc) in &location_of {
         println!("  {} → {}", key.label(), loc.display());
     }
+    for src in &url_sources {
+        println!(
+            "  {} → {} (poll every {}s)",
+            src.key.label(),
+            src.url,
+            POLL_INTERVAL.as_secs()
+        );
+    }
 
     // 1. Catch-up sweep: import anything that changed while watch was down.
     //    Tally chunks so we drain embeddings ONCE for the whole sweep.
+    //    URL sources catch up on the poller's immediate first tick below.
     let mut catch_up_chunks = 0u64;
     for (key, loc) in &location_of {
         let since = incremental_since(*last_import.get(key).unwrap_or(&None));
+        let now_epoch = Utc::now().timestamp();
         match import_one_source(data_dir, key, loc, since).await {
             Ok(s) => {
                 println!(
@@ -525,6 +602,7 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
                     s.records_upserted
                 );
                 catch_up_chunks += s.chunks_written;
+                last_import.insert(key.clone(), Some(now_epoch));
             }
             Err(e) => eprintln!("  catch-up {} failed: {e}", key.label()),
         }
@@ -562,11 +640,17 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
         pid: std::process::id(),
         started_at,
         last_beat: started_at,
-        roots: router.roots().count(),
+        roots: router.roots().count() + url_sources.len(),
     };
     refresh_heartbeat(data_dir, &mut hb);
     let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Poll URL sources on an interval. The first tick fires immediately,
+    // giving them a startup catch-up (the fs catch-up sweep above only
+    // covers path sources).
+    let mut poll = tokio::time::interval(POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // 3. Event loop: debounce changes → incremental import. Sleep until
     //    either the next deadline or a new event, whichever comes first.
@@ -603,6 +687,7 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
                 for key in planner.take_due(Instant::now()) {
                     let Some(loc) = location_of.get(&key) else { continue };
                     let since = incremental_since(*last_import.get(&key).unwrap_or(&None));
+                    let now_epoch = Utc::now().timestamp();
                     match import_one_source(data_dir, &key, loc, since).await {
                         Ok(s) => {
                             println!(
@@ -610,6 +695,7 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
                                 key.label(), s.raw_seen, s.records_upserted, s.chunks_written
                             );
                             due_chunks += s.chunks_written;
+                            last_import.insert(key, Some(now_epoch));
                         }
                         Err(e) => eprintln!("auto-sync {} failed: {e}", key.label()),
                     }
@@ -617,6 +703,30 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
                 if should_embed(no_embed, due_chunks) {
                     if let Err(e) = embed_after_import(data_dir).await {
                         eprintln!("auto-sync embed failed: {e}");
+                    }
+                }
+                refresh_heartbeat(data_dir, &mut hb);
+            }
+            _ = poll.tick(), if !url_sources.is_empty() => {
+                let mut poll_chunks = 0u64;
+                for src in &url_sources {
+                    let since = incremental_since(*last_import.get(&src.key).unwrap_or(&None));
+                    let now_epoch = Utc::now().timestamp();
+                    match poll_url_source(data_dir, &src.key, &src.url, src.config.as_deref(), since).await {
+                        Ok(s) => {
+                            println!(
+                                "poll {} — {} raw, {} upserted, {} chunks",
+                                src.key.label(), s.raw_seen, s.records_upserted, s.chunks_written
+                            );
+                            poll_chunks += s.chunks_written;
+                            last_import.insert(src.key.clone(), Some(now_epoch));
+                        }
+                        Err(e) => eprintln!("poll {} failed: {e}", src.key.label()),
+                    }
+                }
+                if should_embed(no_embed, poll_chunks) {
+                    if let Err(e) = embed_after_import(data_dir).await {
+                        eprintln!("poll embed failed: {e}");
                     }
                 }
                 refresh_heartbeat(data_dir, &mut hb);
@@ -734,6 +844,17 @@ mod tests {
         std::fs::write(heartbeat_path(dir.path()), "{}").unwrap();
         remove_heartbeat(dir.path());
         assert!(read_heartbeat(dir.path()).is_none());
+    }
+
+    #[test]
+    fn fs_and_url_sources_partition_cleanly() {
+        // The poller and the fs router rely on this partition being a
+        // clean split: generic-mcp is the only URL adapter, everything
+        // else is fs-watchable.
+        assert!(!is_fs_watchable(anamnesis_adapter_generic_mcp::ADAPTER_ID));
+        assert!(is_fs_watchable("mem0"));
+        assert!(is_fs_watchable("claude-code"));
+        assert!(is_fs_watchable("letta"));
     }
 
     #[test]
