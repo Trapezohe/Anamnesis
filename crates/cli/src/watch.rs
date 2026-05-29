@@ -1,11 +1,13 @@
-//! `anamnesis watch` — install-and-auto-sync daemon (R151, PR 1 of N).
+//! `anamnesis watch` — install-and-auto-sync daemon (R151).
 //!
 //! Long-running foreground process that keeps the local store current
 //! with the user's memory frameworks without re-running `import` by hand.
 //! Watches every registered source's filesystem location; a change
 //! debounces into one incremental import (the same pipeline `import`
-//! drives). Operator backgrounds it via nohup / systemd / launchd; PR 2
-//! wires "auto-start on install".
+//! drives), then drains the embedding worker so synced memory is
+//! immediately semantically searchable (R153, unless `--no-embed`).
+//! `anamnesis watch install` registers an OS service so it auto-starts at
+//! login (R152, see `watch_service.rs`).
 //!
 //! ## Layering (keeps CI non-flaky)
 //!
@@ -301,12 +303,28 @@ async fn import_one_source(
     }
 }
 
+/// Whether to drain the embedding worker after a sweep that wrote
+/// `chunks_written` chunks. Pure decision (no clock / store / model) so
+/// it unit-tests cleanly; the actual drain lives in [`embed_after_import`].
+/// `--no-embed` wins, and we skip the (model-opening) drain entirely when
+/// nothing new landed — keeping idle watch cheap.
+fn should_embed(no_embed: bool, chunks_written: u64) -> bool {
+    !no_embed && chunks_written > 0
+}
+
+/// Drain pending embedding jobs after a watch import so auto-synced
+/// memory is immediately semantically searchable, not just FTS. Thin IO
+/// wrapper over `super::run_embed_worker` (opens its own store). Drains
+/// the GLOBAL job queue, so callers run it ONCE per sweep, not per source.
+async fn embed_after_import(data_dir: &Path) -> Result<()> {
+    let store = Store::open(super::db_path(data_dir))?;
+    super::run_embed_worker(data_dir, &store).await
+}
+
 /// `anamnesis watch` entry point. Enumerates registered sources, runs a
 /// one-shot catch-up import, then watches their filesystem roots and
 /// re-imports on debounced change until Ctrl-C.
 pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
-    let _ = no_embed; // PR 1: embedding worker scheduling deferred to PR 2.
-
     let sources = {
         let store = Store::open(super::db_path(data_dir))?;
         store.list_sources_full()?
@@ -358,16 +376,26 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
     }
 
     // 1. Catch-up sweep: import anything that changed while watch was down.
+    //    Tally chunks so we drain embeddings ONCE for the whole sweep.
+    let mut catch_up_chunks = 0u64;
     for (key, loc) in &location_of {
         let since = incremental_since(*last_import.get(key).unwrap_or(&None));
         match import_one_source(data_dir, key, loc, since).await {
-            Ok(s) => println!(
-                "  catch-up {} — {} raw, {} upserted",
-                key.label(),
-                s.raw_seen,
-                s.records_upserted
-            ),
+            Ok(s) => {
+                println!(
+                    "  catch-up {} — {} raw, {} upserted",
+                    key.label(),
+                    s.raw_seen,
+                    s.records_upserted
+                );
+                catch_up_chunks += s.chunks_written;
+            }
             Err(e) => eprintln!("  catch-up {} failed: {e}", key.label()),
+        }
+    }
+    if should_embed(no_embed, catch_up_chunks) {
+        if let Err(e) = embed_after_import(data_dir).await {
+            eprintln!("  catch-up embed failed: {e}");
         }
     }
 
@@ -421,15 +449,24 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
                 }
             }
             _ = sleep => {
+                let mut due_chunks = 0u64;
                 for key in planner.take_due(Instant::now()) {
                     let Some(loc) = location_of.get(&key) else { continue };
                     let since = incremental_since(*last_import.get(&key).unwrap_or(&None));
                     match import_one_source(data_dir, &key, loc, since).await {
-                        Ok(s) => println!(
-                            "auto-sync {} — {} raw, {} upserted, {} chunks",
-                            key.label(), s.raw_seen, s.records_upserted, s.chunks_written
-                        ),
+                        Ok(s) => {
+                            println!(
+                                "auto-sync {} — {} raw, {} upserted, {} chunks",
+                                key.label(), s.raw_seen, s.records_upserted, s.chunks_written
+                            );
+                            due_chunks += s.chunks_written;
+                        }
                         Err(e) => eprintln!("auto-sync {} failed: {e}", key.label()),
+                    }
+                }
+                if should_embed(no_embed, due_chunks) {
+                    if let Err(e) = embed_after_import(data_dir).await {
+                        eprintln!("auto-sync embed failed: {e}");
                     }
                 }
             }
@@ -496,6 +533,17 @@ mod tests {
         p.observe(key("b", ""), t0 + Duration::from_secs(1));
         // Earliest deadline = b's = (t0+1s)+2s = t0+3s.
         assert_eq!(p.next_deadline(), Some(t0 + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn should_embed_gates_on_flag_and_chunks() {
+        // Default path: chunks landed, embedding not suppressed → drain.
+        assert!(should_embed(false, 7));
+        // --no-embed always wins, even with fresh chunks.
+        assert!(!should_embed(true, 7));
+        // No new chunks → skip the model-opening drain entirely.
+        assert!(!should_embed(false, 0));
+        assert!(!should_embed(true, 0));
     }
 
     #[test]
