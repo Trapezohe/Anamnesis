@@ -46,6 +46,15 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_secs(2);
 /// so the overlap is free correctness insurance.
 const SINCE_OVERLAP_SECS: i64 = 5;
 
+/// How often the running daemon refreshes its heartbeat file so
+/// `watch status` can tell a live daemon from a dead one (R154).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A heartbeat older than this is treated as STALE (the daemon likely
+/// died without cleaning up). Three missed beats — generous enough to
+/// absorb a slow sweep without false "running" reports.
+const HEARTBEAT_STALE_SECS: i64 = 45;
+
 /// Identifies a registered source: `(adapter, instance)`. Empty instance
 /// is the default instance (mirrors `SourceRow.instance`).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -321,6 +330,133 @@ async fn embed_after_import(data_dir: &Path) -> Result<()> {
     super::run_embed_worker(data_dir, &store).await
 }
 
+/// On-disk liveness record the daemon refreshes every
+/// [`HEARTBEAT_INTERVAL`]. A detached launchd/systemd daemon is otherwise
+/// invisible; `watch status` reads this to report RUNNING / STALE / absent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WatchHeartbeat {
+    /// PID of the daemon process (for the operator to `kill` if needed).
+    pid: u32,
+    /// Unix epoch (secs) when this daemon started.
+    started_at: i64,
+    /// Unix epoch (secs) of the most recent heartbeat.
+    last_beat: i64,
+    /// Number of filesystem roots under watch.
+    roots: usize,
+}
+
+/// Heartbeat file location — alongside the store under `data_dir`.
+fn heartbeat_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("watch.state.json")
+}
+
+/// Whether a heartbeat at `last_beat` is still live as of `now` (both Unix
+/// epoch secs). Pure so it unit-tests without a clock. A `last_beat` in the
+/// future (clock skew / DST) counts as live, never stale.
+fn is_heartbeat_live(now: i64, last_beat: i64, stale_after_secs: i64) -> bool {
+    now - last_beat <= stale_after_secs
+}
+
+/// Render an age in seconds as a compact `s`/`m`/`h`/`d` string. Pure;
+/// negative inputs (clock skew) clamp to `0s`.
+fn humanize_age(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// Serialize the heartbeat to `data_dir/watch.state.json`.
+fn write_heartbeat(data_dir: &Path, hb: &WatchHeartbeat) -> Result<()> {
+    let json = serde_json::to_string(hb).map_err(|e| anyhow!("serialize heartbeat: {e}"))?;
+    std::fs::write(heartbeat_path(data_dir), json).map_err(|e| anyhow!("write heartbeat: {e}"))?;
+    Ok(())
+}
+
+/// Read the heartbeat, or `None` if absent / unparsable.
+fn read_heartbeat(data_dir: &Path) -> Option<WatchHeartbeat> {
+    let s = std::fs::read_to_string(heartbeat_path(data_dir)).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// Best-effort removal on clean shutdown so `status` reports "not running".
+fn remove_heartbeat(data_dir: &Path) {
+    let _ = std::fs::remove_file(heartbeat_path(data_dir));
+}
+
+/// Stamp `last_beat = now` and persist. Errors are logged, never fatal —
+/// a heartbeat write failure must not take the daemon down.
+fn refresh_heartbeat(data_dir: &Path, hb: &mut WatchHeartbeat) {
+    hb.last_beat = Utc::now().timestamp();
+    if let Err(e) = write_heartbeat(data_dir, hb) {
+        eprintln!("watch: heartbeat write failed: {e}");
+    }
+}
+
+/// `anamnesis watch status` runtime half: is the daemon alive, and how
+/// fresh is each source? Read-only; pairs with `watch_service::status`
+/// (which reports whether the auto-start *service* is installed).
+pub fn report_runtime_status(data_dir: &Path) -> Result<()> {
+    let now = Utc::now().timestamp();
+    match read_heartbeat(data_dir) {
+        Some(hb) if is_heartbeat_live(now, hb.last_beat, HEARTBEAT_STALE_SECS) => println!(
+            "watch daemon: RUNNING (pid {}, {} root(s), last beat {} ago, up {})",
+            hb.pid,
+            hb.roots,
+            humanize_age(now - hb.last_beat),
+            humanize_age(now - hb.started_at),
+        ),
+        Some(hb) => println!(
+            "watch daemon: STALE — last beat {} ago (pid {} likely died). \
+             Restart with `anamnesis watch`.",
+            humanize_age(now - hb.last_beat),
+            hb.pid,
+        ),
+        None => println!(
+            "watch daemon: not running. Start it with `anamnesis watch` \
+             (or `anamnesis watch install` to auto-start at login)."
+        ),
+    }
+
+    // A status command must never hard-fail just because nothing is set
+    // up yet — on a fresh machine the store file doesn't exist.
+    let db = super::db_path(data_dir);
+    if !db.exists() {
+        println!("sources: none — no store yet. Run `anamnesis import <adapter>` first.");
+        return Ok(());
+    }
+    let store = Store::open(db)?;
+    let sources = store.list_sources_full()?;
+    if sources.is_empty() {
+        println!("sources: none registered.");
+        return Ok(());
+    }
+    println!("sources ({}):", sources.len());
+    for s in &sources {
+        let key = SourceKey {
+            adapter: s.adapter.clone(),
+            instance: s.instance.clone(),
+        };
+        let fresh = match s.last_import_at {
+            Some(t) => format!("last synced {} ago", humanize_age(now - t)),
+            None => "never synced".to_string(),
+        };
+        let note = if is_fs_watchable(&s.adapter) {
+            ""
+        } else {
+            " (not fs-watchable — manual import)"
+        };
+        println!("  {} — {fresh}{note}", key.label());
+    }
+    Ok(())
+}
+
 /// `anamnesis watch` entry point. Enumerates registered sources, runs a
 /// one-shot catch-up import, then watches their filesystem roots and
 /// re-imports on debounced change until Ctrl-C.
@@ -418,6 +554,20 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
 
     println!("anamnesis watch: live. Ctrl-C to stop.");
 
+    // Publish a heartbeat so `watch status` can see this daemon is alive
+    // (it runs detached under launchd/systemd). Refreshed every
+    // HEARTBEAT_INTERVAL and after each sweep; removed on clean shutdown.
+    let started_at = Utc::now().timestamp();
+    let mut hb = WatchHeartbeat {
+        pid: std::process::id(),
+        started_at,
+        last_beat: started_at,
+        roots: router.roots().count(),
+    };
+    refresh_heartbeat(data_dir, &mut hb);
+    let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // 3. Event loop: debounce changes → incremental import. Sleep until
     //    either the next deadline or a new event, whichever comes first.
     let mut planner = DebouncePlanner::new(DEBOUNCE_WINDOW);
@@ -469,6 +619,10 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
                         eprintln!("auto-sync embed failed: {e}");
                     }
                 }
+                refresh_heartbeat(data_dir, &mut hb);
+            }
+            _ = beat.tick() => {
+                refresh_heartbeat(data_dir, &mut hb);
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("\nanamnesis watch: stopping.");
@@ -476,6 +630,7 @@ pub async fn run_watch(data_dir: &Path, no_embed: bool) -> Result<()> {
             }
         }
     }
+    remove_heartbeat(data_dir);
     Ok(())
 }
 
@@ -533,6 +688,52 @@ mod tests {
         p.observe(key("b", ""), t0 + Duration::from_secs(1));
         // Earliest deadline = b's = (t0+1s)+2s = t0+3s.
         assert_eq!(p.next_deadline(), Some(t0 + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn heartbeat_liveness_window() {
+        // Fresh beat → live.
+        assert!(is_heartbeat_live(1000, 1000, 45));
+        // Exactly at the stale boundary → still live.
+        assert!(is_heartbeat_live(1045, 1000, 45));
+        // One second past → stale.
+        assert!(!is_heartbeat_live(1046, 1000, 45));
+        // Future beat (clock skew) → live, never stale.
+        assert!(is_heartbeat_live(1000, 1010, 45));
+    }
+
+    #[test]
+    fn humanize_age_units() {
+        assert_eq!(humanize_age(-5), "0s"); // clock skew clamps to 0
+        assert_eq!(humanize_age(0), "0s");
+        assert_eq!(humanize_age(59), "59s");
+        assert_eq!(humanize_age(60), "1m");
+        assert_eq!(humanize_age(3599), "59m");
+        assert_eq!(humanize_age(3600), "1h");
+        assert_eq!(humanize_age(86_399), "23h");
+        assert_eq!(humanize_age(86_400), "1d");
+    }
+
+    #[test]
+    fn heartbeat_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent → None.
+        assert!(read_heartbeat(dir.path()).is_none());
+        let hb = WatchHeartbeat {
+            pid: 4242,
+            started_at: 1_700_000_000,
+            last_beat: 1_700_000_030,
+            roots: 3,
+        };
+        write_heartbeat(dir.path(), &hb).unwrap();
+        assert_eq!(read_heartbeat(dir.path()).unwrap(), hb);
+        // Garbage in the file → None, not a panic.
+        std::fs::write(heartbeat_path(dir.path()), "not json").unwrap();
+        assert!(read_heartbeat(dir.path()).is_none());
+        // Removal makes it absent again.
+        std::fs::write(heartbeat_path(dir.path()), "{}").unwrap();
+        remove_heartbeat(dir.path());
+        assert!(read_heartbeat(dir.path()).is_none());
     }
 
     #[test]

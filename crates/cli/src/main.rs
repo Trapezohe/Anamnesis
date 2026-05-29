@@ -1124,7 +1124,10 @@ async fn run() -> Result<()> {
             None => watch::run_watch(&data_dir, no_embed).await,
             Some(WatchAction::Install) => watch_service::install(&data_dir),
             Some(WatchAction::Uninstall) => watch_service::uninstall(),
-            Some(WatchAction::Status) => watch_service::status(),
+            Some(WatchAction::Status) => {
+                watch_service::status()?;
+                watch::report_runtime_status(&data_dir)
+            }
         },
         Command::Search {
             query,
