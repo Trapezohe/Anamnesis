@@ -54,8 +54,8 @@ pub trait LlmProvider: Send + Sync {
 /// exercised end-to-end in tests and on machines where no real
 /// provider is configured.
 ///
-/// The output is intentionally trivial (one item, content = "[mock]
-/// {first 80 chars of input}"). Calling code that wants more
+/// The output is intentionally trivial (one item, content = `"[mock]
+/// {first 80 chars of input}"`). Calling code that wants more
 /// interesting fixtures should write a custom `LlmProvider` impl —
 /// `MockProvider` is for the no-LLM-available default.
 #[derive(Debug, Clone)]

@@ -5,6 +5,13 @@ on:
     branches: [main, master]
   pull_request:
 
+# R150: cancel superseded runs on the same PR/branch to stop double-billing
+# CI minutes on rapid pushes. `main`/`master` excluded so post-merge runs
+# always complete (their tag/version artefacts are load-bearing).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -92,3 +99,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
+
+  # R150: doctests — the main test matrix runs `--lib --bins --tests
+  # --examples`, deliberately not `--doc`. Run them once on linux so a
+  # broken doctest in a public API doesn't sneak past CI.
+  doctests:
+    name: doctests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --doc --no-default-features
+
+  # R150: rustdoc warnings as errors. Catches broken intra-doc links and
+  # rustdoc lints (`missing_docs` is already `warn` in several crates) so
+  # the public API docs don't quietly rot.
+  doc:
+    name: doc (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --no-default-features
+
+  # R150: supply-chain advisories. Pulls the latest RustSec database
+  # and fails on any CVE / yanked crate / unmaintained advisory not
+  # explicitly ignored in `deny.toml`.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # R150: license + duplicate-version + source allowlist. Reads
+  # `deny.toml` at repo root. Distinct from `audit` because cargo-deny
+  # also enforces our Apache-2.0 license-compatibility story (§-1.2.4).
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check

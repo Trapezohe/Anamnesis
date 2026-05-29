@@ -11,9 +11,12 @@
 //!   doctor(source?, instance?, since?)
 //!
 //! Resources:
+//!
+//! ```text
 //!   anamnesis://record/{id}
 //!   anamnesis://source/{adapter}[:instance]
 //!   anamnesis://timeline/{YYYY-MM-DD}
+//! ```
 
 use std::path::PathBuf;
 
