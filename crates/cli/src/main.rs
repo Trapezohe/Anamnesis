@@ -167,8 +167,9 @@ enum Command {
         /// `install` / `uninstall` / `status`. Omit to run the daemon.
         #[command(subcommand)]
         action: Option<WatchAction>,
-        /// Skip the embedding worker (PR 1: embedding scheduling under
-        /// watch is deferred; flag reserved for forward-compat).
+        /// Skip the embedding worker after each auto-sync. Default:
+        /// embeddings are refreshed so synced memory is immediately
+        /// semantically searchable (R153). Pass to stay FTS-only.
         #[arg(long)]
         no_embed: bool,
     },
@@ -2828,7 +2829,7 @@ async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
     );
 
     if !no_embed {
-        run_embed_worker(&store).await?;
+        run_embed_worker(data_dir, &store).await?;
     }
     Ok(())
 }
@@ -7503,16 +7504,18 @@ fn parse_model_key(model_id: &str) -> Result<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "local-fastembed")]
-async fn run_embed_worker(store: &Store) -> Result<()> {
+async fn run_embed_worker(data_dir: &std::path::Path, store: &Store) -> Result<()> {
     let Some(active) = store.active_model()? else {
         return Ok(());
     };
     let key = parse_model_key(&active)?;
-    let data_dir_guess = home_join(&[".local", "share", "anamnesis"]).unwrap_or_default();
-    // The CLI keeps models under {data_dir}/models — get data_dir from
-    // the store path. For simplicity, we always use the standard location;
-    // the model is downloaded once and re-used.
-    let cache = data_dir_guess.join("models");
+    // Models live under {data_dir}/models — the SAME location `serve`,
+    // `model install`, and `model rebuild` use. Earlier this guessed
+    // ~/.local/share/anamnesis/models, which is wrong on macOS (default
+    // data_dir is ~/Library/Application Support/anamnesis) and under any
+    // explicit --data-dir, so the post-import worker silently failed to
+    // open the model. Thread the real data_dir through instead.
+    let cache = models_dir(data_dir);
     let provider = anamnesis_embedder::LocalFastembedProvider::new(&key, &cache)
         .map_err(|e| anyhow!("open local model for embedding worker: {e}"))?;
     let worker = anamnesis_embedder::EmbeddingWorker::new(&provider);
@@ -7528,7 +7531,7 @@ async fn run_embed_worker(store: &Store) -> Result<()> {
 }
 
 #[cfg(not(feature = "local-fastembed"))]
-async fn run_embed_worker(_store: &Store) -> Result<()> {
+async fn run_embed_worker(_data_dir: &std::path::Path, _store: &Store) -> Result<()> {
     println!("local-fastembed feature disabled; skipping embedding worker");
     Ok(())
 }
@@ -7586,7 +7589,7 @@ async fn cmd_model(data_dir: &std::path::Path, sub: ModelCmd) -> Result<()> {
             println!("active model now: {new_id} ({n} chunks re-queued)");
             if !no_embed && n > 0 {
                 let store = Store::open(db_path(data_dir))?;
-                run_embed_worker(&store).await?;
+                run_embed_worker(data_dir, &store).await?;
             }
             Ok(())
         }
@@ -7612,7 +7615,7 @@ async fn cmd_model(data_dir: &std::path::Path, sub: ModelCmd) -> Result<()> {
             println!("re-queued {n} chunks under {active}");
             if !no_embed && n > 0 {
                 let store = Store::open(db_path(data_dir))?;
-                run_embed_worker(&store).await?;
+                run_embed_worker(data_dir, &store).await?;
             }
             Ok(())
         }
