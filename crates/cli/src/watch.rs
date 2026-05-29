@@ -229,12 +229,11 @@ fn build_router(sources: &[anamnesis_store::SourceRow]) -> PathRouter {
     router
 }
 
-/// Run an incremental import for one source, reusing the full
-/// normalize → chunk → index → embed pipeline via `ImportService`.
-///
-/// Mirrors `cmd_import`'s adapter construction (kept in sync by hand;
-/// PR 2+ can extract a shared `build_adapter` helper). URL adapters are
-/// rejected — they never reach here (filtered by [`is_fs_watchable`]).
+/// Run an incremental import for one fs source, reusing the full
+/// normalize → chunk → index → embed pipeline via `ImportService`. The
+/// concrete adapter comes from the shared [`crate::adapters::build_fs_adapter`]
+/// factory (same one `import` + `doctor` use). URL adapters are rejected —
+/// they never reach here (filtered by [`is_fs_watchable`]).
 async fn import_one_source(
     data_dir: &Path,
     key: &SourceKey,
@@ -243,78 +242,26 @@ async fn import_one_source(
 ) -> Result<anamnesis_importer::ImportSummary> {
     use anamnesis_importer::{ImportOptions, ImportService};
 
-    let store = Store::open(super::db_path(data_dir))?;
-    let service = ImportService::new(&store, super::audit(data_dir));
-    let scan_opts = ScanOpts { since, full: false };
     let instance = if key.instance.is_empty() {
         None
     } else {
         Some(key.instance.as_str())
     };
+    let adapter = crate::adapters::build_fs_adapter(&key.adapter, location.to_path_buf(), instance)
+        .ok_or_else(|| anyhow!("watch: adapter {:?} is not fs-watchable", key.adapter))?;
+
+    let store = Store::open(super::db_path(data_dir))?;
+    let service = ImportService::new(&store, super::audit(data_dir));
     let opts = ImportOptions {
         dry_run: false,
         canonical_location: Some(location.display().to_string()),
         source_was_explicit: true,
-        scan_opts,
+        scan_opts: ScanOpts { since, full: false },
     };
-
-    macro_rules! run {
-        ($adapter:expr) => {{
-            service
-                .import(&$adapter, opts)
-                .await
-                .map_err(|e| anyhow!("watch import {}: {e}", key.label()))
-        }};
-    }
-
-    let loc = location.to_path_buf();
-    match key.adapter.as_str() {
-        anamnesis_adapter_claude_code::ADAPTER_ID => {
-            use anamnesis_adapter_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
-            run!(ClaudeCodeAdapter::new(ClaudeCodeConfig {
-                projects_root: loc,
-                instance: instance.map(str::to_owned),
-            }))
-        }
-        anamnesis_adapter_mem0::ADAPTER_ID => {
-            run!(anamnesis_adapter_mem0::sqlite_adapter(loc, instance))
-        }
-        anamnesis_adapter_codex::ADAPTER_ID => {
-            run!(anamnesis_adapter_codex::codex_adapter(loc, instance))
-        }
-        anamnesis_adapter_letta::ADAPTER_ID => {
-            run!(anamnesis_adapter_letta::letta_adapter(loc, instance))
-        }
-        anamnesis_adapter_hermes::ADAPTER_ID => {
-            run!(anamnesis_adapter_hermes::hermes_adapter(loc, instance))
-        }
-        anamnesis_adapter_openclaw::ADAPTER_ID => {
-            run!(anamnesis_adapter_openclaw::openclaw_adapter(loc, instance))
-        }
-        anamnesis_adapter_tdai::ADAPTER_ID => {
-            run!(anamnesis_adapter_tdai::tdai_adapter(loc, instance))
-        }
-        anamnesis_adapter_openviking::ADAPTER_ID => {
-            run!(anamnesis_adapter_openviking::openviking_adapter(
-                loc, instance
-            ))
-        }
-        anamnesis_adapter_mempalace::ADAPTER_ID => {
-            run!(anamnesis_adapter_mempalace::mempalace_adapter(
-                loc, instance
-            ))
-        }
-        anamnesis_adapter_memori::ADAPTER_ID => {
-            run!(anamnesis_adapter_memori::memori_adapter(loc, instance))
-        }
-        anamnesis_adapter_memos::ADAPTER_ID => {
-            run!(anamnesis_adapter_memos::memos_adapter(loc, instance))
-        }
-        anamnesis_adapter_memary::ADAPTER_ID => {
-            run!(anamnesis_adapter_memary::memary_adapter(loc, instance))
-        }
-        other => Err(anyhow!("watch: adapter {other:?} is not fs-watchable")),
-    }
+    service
+        .import(&*adapter, opts)
+        .await
+        .map_err(|e| anyhow!("watch import {}: {e}", key.label()))
 }
 
 /// Incremental import of one URL (`generic-mcp`) source — the polling

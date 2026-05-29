@@ -65,13 +65,13 @@ impl ImportSummary {
 
 /// The runner. Owns no state of its own; takes a mutable borrow of the
 /// store so the upserts can transact.
-pub struct ImportRunner<'a, A: MemoryAdapter> {
+pub struct ImportRunner<'a, A: MemoryAdapter + ?Sized> {
     adapter: &'a A,
     chunker: Chunker,
     upsert_batch: usize,
 }
 
-impl<'a, A: MemoryAdapter> ImportRunner<'a, A> {
+impl<'a, A: MemoryAdapter + ?Sized> ImportRunner<'a, A> {
     /// Build a runner with the default chunker config (max=512 tokens) and
     /// the default upsert batch size (`UPSERT_BATCH = 64`).
     pub fn new(adapter: &'a A) -> Self {
@@ -375,7 +375,7 @@ impl<'a> ImportService<'a> {
     /// Dry-run mode short-circuits to `adapter.scan().count()` without
     /// any of (1–5). `summary.raw_seen` reflects the count;
     /// `records_upserted == 0`, `chunks_written == 0`, `errors == 0`.
-    pub async fn import<A: MemoryAdapter>(
+    pub async fn import<A: MemoryAdapter + ?Sized>(
         &self,
         adapter: &A,
         opts: ImportOptions,
