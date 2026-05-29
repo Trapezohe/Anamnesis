@@ -10,6 +10,8 @@
 
 // R151: `anamnesis watch` install-and-auto-sync daemon.
 mod watch;
+// R152: `anamnesis watch {install,uninstall,status}` auto-start service.
+mod watch_service;
 
 use std::path::PathBuf;
 
@@ -149,14 +151,22 @@ enum Command {
 
     /// Watch every registered source and auto-import on change (R151).
     ///
-    /// Long-running foreground daemon: monitors each source's filesystem
-    /// location, debounces bursts, and runs an incremental import when
-    /// data changes — keeping the local store continuously in sync
-    /// without re-running `import` by hand. Runs a one-shot catch-up
-    /// import on start, then watches until Ctrl-C. Background it with
-    /// nohup / systemd / launchd. URL sources (`generic-mcp`) are not
-    /// fs-watchable and are skipped (interval polling lands in a later PR).
+    /// Bare `anamnesis watch` runs the long-running foreground daemon:
+    /// monitors each source's filesystem location, debounces bursts, and
+    /// runs an incremental import when data changes — keeping the local
+    /// store continuously in sync without re-running `import` by hand.
+    /// Runs a one-shot catch-up import on start, then watches until
+    /// Ctrl-C. URL sources (`generic-mcp`) are skipped (interval polling
+    /// lands later).
+    ///
+    /// Subcommands (R152) make it auto-start at login:
+    ///   `watch install`   — register an OS service (launchd / systemd).
+    ///   `watch uninstall` — remove it.
+    ///   `watch status`    — is it installed?
     Watch {
+        /// `install` / `uninstall` / `status`. Omit to run the daemon.
+        #[command(subcommand)]
+        action: Option<WatchAction>,
         /// Skip the embedding worker (PR 1: embedding scheduling under
         /// watch is deferred; flag reserved for forward-compat).
         #[arg(long)]
@@ -834,6 +844,19 @@ enum SourceCmd {
     },
 }
 
+/// `anamnesis watch` auto-start service management (R152).
+#[derive(Subcommand, Debug)]
+enum WatchAction {
+    /// Register an OS service (launchd on macOS, systemd-user on Linux)
+    /// that runs `anamnesis watch` at login and restarts it on crash.
+    /// Windows: prints Task Scheduler guidance.
+    Install,
+    /// Stop + remove the auto-start service.
+    Uninstall,
+    /// Report whether the auto-start service is installed.
+    Status,
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelCmd {
     /// List curated models + which one is active.
@@ -1096,7 +1119,12 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Watch { no_embed } => watch::run_watch(&data_dir, no_embed).await,
+        Command::Watch { action, no_embed } => match action {
+            None => watch::run_watch(&data_dir, no_embed).await,
+            Some(WatchAction::Install) => watch_service::install(&data_dir),
+            Some(WatchAction::Uninstall) => watch_service::uninstall(),
+            Some(WatchAction::Status) => watch_service::status(),
+        },
         Command::Search {
             query,
             source,
