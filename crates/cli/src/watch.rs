@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anamnesis_core::adapter::ScanOpts;
+use anamnesis_core::watch::{
+    heartbeat_path, humanize_age, is_heartbeat_live, WatchHeartbeat, HEARTBEAT_STALE_SECS,
+};
 use anamnesis_store::Store;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -47,13 +50,10 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_secs(2);
 const SINCE_OVERLAP_SECS: i64 = 5;
 
 /// How often the running daemon refreshes its heartbeat file so
-/// `watch status` can tell a live daemon from a dead one (R154).
+/// `watch status` can tell a live daemon from a dead one (R154). The
+/// staleness threshold + the heartbeat type live in `anamnesis_core::watch`
+/// so the MCP `watch_status` tool reads the same definition (R156).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-
-/// A heartbeat older than this is treated as STALE (the daemon likely
-/// died without cleaning up). Three missed beats — generous enough to
-/// absorb a slow sweep without false "running" reports.
-const HEARTBEAT_STALE_SECS: i64 = 45;
 
 /// URL adapters (`generic-mcp`) can't be fs-watched, so the daemon
 /// re-imports them on this interval. Each poll is `since`-bounded, so a
@@ -378,49 +378,10 @@ async fn embed_after_import(data_dir: &Path) -> Result<()> {
     super::run_embed_worker(data_dir, &store).await
 }
 
-/// On-disk liveness record the daemon refreshes every
-/// [`HEARTBEAT_INTERVAL`]. A detached launchd/systemd daemon is otherwise
-/// invisible; `watch status` reads this to report RUNNING / STALE / absent.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct WatchHeartbeat {
-    /// PID of the daemon process (for the operator to `kill` if needed).
-    pid: u32,
-    /// Unix epoch (secs) when this daemon started.
-    started_at: i64,
-    /// Unix epoch (secs) of the most recent heartbeat.
-    last_beat: i64,
-    /// Number of filesystem roots under watch.
-    roots: usize,
-}
-
-/// Heartbeat file location — alongside the store under `data_dir`.
-fn heartbeat_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("watch.state.json")
-}
-
-/// Whether a heartbeat at `last_beat` is still live as of `now` (both Unix
-/// epoch secs). Pure so it unit-tests without a clock. A `last_beat` in the
-/// future (clock skew / DST) counts as live, never stale.
-fn is_heartbeat_live(now: i64, last_beat: i64, stale_after_secs: i64) -> bool {
-    now - last_beat <= stale_after_secs
-}
-
-/// Render an age in seconds as a compact `s`/`m`/`h`/`d` string. Pure;
-/// negative inputs (clock skew) clamp to `0s`.
-fn humanize_age(secs: i64) -> String {
-    let s = secs.max(0);
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else if s < 86_400 {
-        format!("{}h", s / 3600)
-    } else {
-        format!("{}d", s / 86_400)
-    }
-}
-
-/// Serialize the heartbeat to `data_dir/watch.state.json`.
+/// Serialize the heartbeat to `data_dir/watch.state.json`. The struct +
+/// path + liveness helpers live in `anamnesis_core::watch` so the MCP
+/// `watch_status` tool reads the same definition (R156); this crate owns
+/// the daemon-side fs IO (core has none).
 fn write_heartbeat(data_dir: &Path, hb: &WatchHeartbeat) -> Result<()> {
     let json = serde_json::to_string(hb).map_err(|e| anyhow!("serialize heartbeat: {e}"))?;
     std::fs::write(heartbeat_path(data_dir), json).map_err(|e| anyhow!("write heartbeat: {e}"))?;
@@ -798,30 +759,6 @@ mod tests {
         p.observe(key("b", ""), t0 + Duration::from_secs(1));
         // Earliest deadline = b's = (t0+1s)+2s = t0+3s.
         assert_eq!(p.next_deadline(), Some(t0 + Duration::from_secs(3)));
-    }
-
-    #[test]
-    fn heartbeat_liveness_window() {
-        // Fresh beat → live.
-        assert!(is_heartbeat_live(1000, 1000, 45));
-        // Exactly at the stale boundary → still live.
-        assert!(is_heartbeat_live(1045, 1000, 45));
-        // One second past → stale.
-        assert!(!is_heartbeat_live(1046, 1000, 45));
-        // Future beat (clock skew) → live, never stale.
-        assert!(is_heartbeat_live(1000, 1010, 45));
-    }
-
-    #[test]
-    fn humanize_age_units() {
-        assert_eq!(humanize_age(-5), "0s"); // clock skew clamps to 0
-        assert_eq!(humanize_age(0), "0s");
-        assert_eq!(humanize_age(59), "59s");
-        assert_eq!(humanize_age(60), "1m");
-        assert_eq!(humanize_age(3599), "59m");
-        assert_eq!(humanize_age(3600), "1h");
-        assert_eq!(humanize_age(86_399), "23h");
-        assert_eq!(humanize_age(86_400), "1d");
     }
 
     #[test]
