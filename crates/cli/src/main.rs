@@ -8,6 +8,9 @@
 // Near-dedupe merge-preview ranking lives in `anamnesis-store` so the
 // MCP `dedupe` tool can share the heuristic.
 
+// R158: one factory for `adapter id → concrete fs adapter`, shared by
+// import / watch / doctor.
+mod adapters;
 // R151: `anamnesis watch` install-and-auto-sync daemon.
 mod watch;
 // R152: `anamnesis watch {install,uninstall,status}` auto-start service.
@@ -2428,15 +2431,15 @@ async fn cmd_import(
         },
     };
 
-    let import_result: Result<()> = match adapter_id {
-        anamnesis_adapter_claude_code::ADAPTER_ID => {
-            let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
-                projects_root: location.clone(),
-                instance: instance.map(str::to_owned),
-            });
+    let import_result: Result<()> = match adapters::build_fs_adapter(
+        adapter_id,
+        location.clone(),
+        instance,
+    ) {
+        Some(adapter) => {
             run_import(
                 data_dir,
-                &adapter,
+                &*adapter,
                 dry_run,
                 no_embed,
                 Some(&location),
@@ -2445,151 +2448,10 @@ async fn cmd_import(
             )
             .await
         }
-        anamnesis_adapter_mem0::ADAPTER_ID => {
-            let adapter = mem0_sqlite_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_codex::ADAPTER_ID => {
-            let adapter = codex_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_letta::ADAPTER_ID => {
-            let adapter = letta_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_hermes::ADAPTER_ID => {
-            let adapter = hermes_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_openclaw::ADAPTER_ID => {
-            let adapter = openclaw_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_tdai::ADAPTER_ID => {
-            let adapter = tdai_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_openviking::ADAPTER_ID => {
-            let adapter = openviking_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_mempalace::ADAPTER_ID => {
-            let adapter = mempalace_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_memori::ADAPTER_ID => {
-            let adapter = memori_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_memos::ADAPTER_ID => {
-            let adapter = memos_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        anamnesis_adapter_memary::ADAPTER_ID => {
-            let adapter = memary_adapter(location.clone(), instance);
-            run_import(
-                data_dir,
-                &adapter,
-                dry_run,
-                no_embed,
-                Some(&location),
-                source_was_explicit,
-                scan_opts,
-            )
-            .await
-        }
-        other => Err(anyhow!(
-            "adapter {other:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, tdai, openviking, mempalace, memori, memos, memary, generic-mcp"
+        // generic-mcp returned earlier; `is_known_adapter` rejected unknowns
+        // upstream — so `None` here is unreachable, but stay defensive.
+        None => Err(anyhow!(
+            "adapter {adapter_id:?} not wired; supported: claude-code, codex, mem0, letta, hermes, openclaw, tdai, openviking, mempalace, memori, memos, memary, generic-mcp"
         )),
     };
     import_result?;
@@ -2786,7 +2648,7 @@ fn default_path_for(adapter_id: &str) -> Result<PathBuf> {
     }
 }
 
-async fn run_import<A: anamnesis_core::adapter::MemoryAdapter>(
+async fn run_import<A: anamnesis_core::adapter::MemoryAdapter + ?Sized>(
     data_dir: &std::path::Path,
     adapter: &A,
     dry_run: bool,
