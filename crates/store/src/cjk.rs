@@ -85,19 +85,40 @@ pub fn tokenize_indexing(text: &str) -> String {
     out.join(" ")
 }
 
-/// Tokenize text for an FTS5 **MATCH query**.
-///
-/// Wraps each token in `"..."` (escaping embedded `"` as `""`) and joins
-/// with spaces. FTS5 treats space-separated quoted phrases as an
-/// implicit AND, which is what users expect when they type multiple
-/// words.
-///
-/// Empty input returns the empty string; callers must check and skip
-/// the MATCH (FTS5 errors on empty queries).
-pub fn tokenize_query(text: &str) -> String {
+/// Question / filler words that carry no retrieval signal. An agent
+/// rarely types keywords — it asks "what does the user prefer about X".
+/// AND-ing those words against the index makes natural-language queries
+/// recall zero, so [`plan_query`] drops them from the salient set. Kept
+/// deliberately small + conservative: only words that are almost never
+/// the thing you're searching *for*. Compared lowercased.
+const STOPWORDS_EN: &[&str] = &[
+    "a", "about", "an", "and", "any", "are", "as", "did", "do", "does", "find", "for", "get",
+    "give", "how", "i", "in", "is", "it", "know", "me", "my", "of", "on", "or", "please", "show",
+    "tell", "that", "the", "their", "them", "they", "this", "to", "user", "users", "was", "were",
+    "what", "when", "where", "which", "who", "why", "with", "you", "your",
+];
+
+/// CJK question / filler words, the Chinese counterpart to [`STOPWORDS_EN`].
+/// jieba segments these as standalone tokens, so they're easy to drop.
+const STOPWORDS_ZH: &[&str] = &[
+    "什么", "哪些", "哪个", "如何", "怎么", "怎样", "请", "帮我", "是", "的", "了", "吗", "呢",
+    "我", "我的", "你", "有", "关于", "这个", "那个", "找", "找出", "显示", "告诉", "用户",
+];
+
+/// Is `token` a question / filler word with no retrieval value?
+fn is_stopword(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    STOPWORDS_EN.contains(&lower.as_str()) || STOPWORDS_ZH.contains(&token)
+}
+
+/// Tokenize + quote into FTS5 phrase tokens (`"foo"`), first-seen order,
+/// deduped. When `drop_stopwords` is set, question / filler words are
+/// removed (used for the salient query plan); otherwise every search
+/// token is kept (used by [`tokenize_query`]).
+fn quoted_phrase_tokens(text: &str, drop_stopwords: bool) -> Vec<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     let mut seen = std::collections::HashSet::<String>::new();
     let mut out: Vec<String> = Vec::new();
@@ -106,13 +127,73 @@ pub fn tokenize_query(text: &str) -> String {
         if !is_search_token(t) {
             continue;
         }
+        if drop_stopwords && is_stopword(t) {
+            continue;
+        }
         if seen.insert(t.to_owned()) {
             // Double-quote escape rule: replace `"` with `""` and wrap.
             let escaped = t.replace('"', "\"\"");
             out.push(format!("\"{escaped}\""));
         }
     }
-    out.join(" ")
+    out
+}
+
+/// Tokenize text for an FTS5 **MATCH query**.
+///
+/// Wraps each token in `"..."` (escaping embedded `"` as `""`) and joins
+/// with spaces. FTS5 treats space-separated quoted phrases as an
+/// implicit AND, which is what users expect when they type multiple
+/// words. Keeps every search token (no stopword removal) — for the
+/// natural-language strict/relaxed plan use [`plan_query`].
+///
+/// Empty input returns the empty string; callers must check and skip
+/// the MATCH (FTS5 errors on empty queries).
+pub fn tokenize_query(text: &str) -> String {
+    quoted_phrase_tokens(text, false).join(" ")
+}
+
+/// A two-tier FTS5 MATCH plan for a natural-language query (R160).
+///
+/// `search_chunks_fts` runs [`strict`](Self::strict) first (precise), then
+/// — only if it under-fills the limit — tops up with [`relaxed`](Self::relaxed)
+/// (recall). The change is purely **additive**: `strict` keeps the exact
+/// AND-of-all-tokens semantics keyword search always had (so precise
+/// queries don't regress), and stopword stripping only shapes the recall
+/// tail. Splitting the decision out keeps it pure and testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsQueryPlan {
+    /// AND of **every** search token (`"the" "user" "shell"`), exactly like
+    /// the original keyword tokenizer. Empty only when the query has no
+    /// searchable tokens at all.
+    pub strict: String,
+    /// OR of the **salient** tokens — question/filler words dropped
+    /// (`"prefer" OR "shell"`). The recall fallback for natural-language
+    /// queries the strict AND can't satisfy. Empty when it would add
+    /// nothing over `strict` (a single-token query).
+    pub relaxed: String,
+}
+
+/// Build a [`FtsQueryPlan`] from raw user text.
+///
+/// `strict` = AND of all tokens (unchanged keyword behavior). `relaxed` =
+/// OR of the salient tokens (stopwords removed); if every token is a
+/// stopword (e.g. "what is it") it falls back to the full set so recall is
+/// never silently empty. `relaxed` is omitted only for a single-token
+/// query, where OR == AND and the second pass would be wasted work.
+pub fn plan_query(text: &str) -> FtsQueryPlan {
+    let all = quoted_phrase_tokens(text, false);
+    let salient = quoted_phrase_tokens(text, true);
+    let strict = all.join(" ");
+
+    let or_tokens = if salient.is_empty() { &all } else { &salient };
+    let relaxed = if or_tokens.is_empty() || (all.len() == 1 && or_tokens.len() == 1) {
+        // No tokens, or a single token where OR and AND are identical.
+        String::new()
+    } else {
+        or_tokens.join(" OR ")
+    };
+    FtsQueryPlan { strict, relaxed }
 }
 
 #[cfg(test)]
@@ -208,5 +289,70 @@ mod tests {
             indexed.split_whitespace().any(|w| w == q_inner),
             "indexed stream {indexed:?} should contain query token {q_inner:?}"
         );
+    }
+
+    // ─── R160: natural-language query planning ────────────────────────
+
+    #[test]
+    fn strict_keeps_all_tokens_no_regression() {
+        // strict must stay AND-of-all (incl. stopwords) so precise keyword
+        // queries don't silently broaden. Only `relaxed` drops fillers.
+        let plan = plan_query("user shell");
+        assert_eq!(plan.strict, "\"user\" \"shell\"");
+    }
+
+    #[test]
+    fn relaxed_drops_english_question_words() {
+        let plan = plan_query("what does the user prefer about shell");
+        // Salient terms survive in the recall tail; filler words are gone.
+        assert!(plan.relaxed.contains("\"prefer\""));
+        assert!(plan.relaxed.contains("\"shell\""));
+        assert!(!plan.relaxed.contains("\"what\""));
+        assert!(!plan.relaxed.contains("\"does\""));
+        assert!(!plan.relaxed.contains("\"the\""));
+        assert!(!plan.relaxed.contains("\"about\""));
+        // "user" is a filler word here too (the agent, not the content).
+        assert!(!plan.relaxed.contains("\"user\""));
+        // strict still carries every token verbatim.
+        assert!(plan.strict.contains("\"what\"") && plan.strict.contains("\"user\""));
+    }
+
+    #[test]
+    fn relaxed_drops_chinese_question_words() {
+        let plan = plan_query("用户偏好是什么");
+        // jieba keeps 偏好; 是 / 什么 / 用户 are dropped from the recall tail.
+        assert!(plan.relaxed.contains("\"偏好\""), "plan was {plan:?}");
+        assert!(!plan.relaxed.contains("\"是\""));
+        assert!(!plan.relaxed.contains("\"什么\""));
+    }
+
+    #[test]
+    fn plan_strict_is_and_relaxed_is_or() {
+        let plan = plan_query("prefer shell");
+        // No stopwords: strict AND-joins, relaxed OR-joins the same tokens.
+        assert_eq!(plan.strict, "\"prefer\" \"shell\"");
+        assert_eq!(plan.relaxed, "\"prefer\" OR \"shell\"");
+    }
+
+    #[test]
+    fn plan_single_token_has_no_relaxed_tail() {
+        // One token total: OR == AND, so relaxed is omitted as wasted work.
+        let one = plan_query("prefer");
+        assert_eq!(one.strict, "\"prefer\"");
+        assert_eq!(one.relaxed, "");
+        // But a single SALIENT token with dropped fillers still gets a
+        // relaxed tail, because it's broader than the AND-of-all strict.
+        let nl = plan_query("what is the shell");
+        assert_eq!(nl.relaxed, "\"shell\"");
+    }
+
+    #[test]
+    fn plan_all_stopwords_falls_back_to_literal() {
+        // Every token is filler — must NOT yield an empty query (that would
+        // silently return zero hits); strict keeps the literal words and
+        // relaxed falls back to their OR.
+        let plan = plan_query("what is the");
+        assert!(!plan.strict.is_empty(), "plan was {plan:?}");
+        assert!(plan.relaxed.contains(" OR "), "plan was {plan:?}");
     }
 }
