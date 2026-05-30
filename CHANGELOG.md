@@ -4,6 +4,20 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed
+- **Natural-language search recall.** An agent asks "what does the user prefer
+  about shells", not keywords — but FTS implicitly AND-ed every token, so
+  question/filler words (`what` / `does` / `the` / `about`, and CJK `什么` /
+  `是` / `请`) recalled zero. `search_memories` / `find_related` / `anamnesis
+  search` now plan the query in two tiers. The change is purely **additive**:
+  the **strict** pass keeps the exact AND-of-all-tokens semantics keyword
+  search always had (so precise queries don't regress), and runs first; only
+  if it under-fills the limit does a **relaxed OR** tail of the salient terms
+  (fillers dropped) top up recall. Strict hits always rank ahead of relaxed
+  ones, the `SearchFilter` is pushed down inside both SQL passes, and an
+  all-filler query falls back to its literal words. No API/CLI/MCP surface
+  change.
+
 ### Fixed
 - **letta + memos round-trip now preserves identity.** End-to-end dogfooding
   surfaced that, of the 6 round-trip targets, `letta-sqlite` and `memos-dir`

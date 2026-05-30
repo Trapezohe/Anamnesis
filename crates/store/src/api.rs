@@ -4309,29 +4309,60 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnamnesisRecord>
 impl Store {
     /// FTS5 chunk search. Returns hits ordered by BM25 (lower rank = better);
     /// `score` is the bm25() value (negated so larger = more relevant).
+    ///
+    /// R160 — natural-language recall: an agent asks "what does the user
+    /// prefer about shells", not keywords. The query planner (see `cjk`)
+    /// strips question / filler words to salient terms, then this runs a
+    /// two-tier match: the **strict** AND first (precise), and only if it
+    /// under-fills the limit, tops up the tail with the **relaxed** OR
+    /// (recall). Strict hits always rank ahead of relaxed ones, and the
+    /// `SearchFilter` is pushed down inside BOTH SQL passes (never
+    /// post-filtered) so minority adapters aren't evicted.
     pub fn search_chunks_fts(
         &self,
         query: &str,
         filter: &SearchFilter,
         limit: u32,
     ) -> Result<Vec<ChunkHit>> {
-        // PR-Jieba (round-5 consult, see `cjk` module): we MUST tokenize
-        // the query through the same pipeline that indexed the chunks.
-        // Otherwise FTS5 MATCH compares raw codepoints against the
-        // jieba-segmented index, and Chinese queries return zero hits.
-        // The Codex consult flagged this asymmetry as the load-bearing
-        // trap of the whole feature.
-        let match_query = crate::cjk::tokenize_query(query);
-        if match_query.is_empty() {
-            // FTS5 errors on empty MATCH; an empty user query has no
-            // searchable tokens, so zero hits is the right answer.
+        let plan = crate::cjk::plan_query(query);
+        if plan.strict.is_empty() {
+            // FTS5 errors on empty MATCH; a query with no searchable tokens
+            // has zero hits as the right answer.
             return Ok(Vec::new());
         }
 
+        let mut hits = self.fts_match(&plan.strict, filter, limit)?;
+
+        // Top up with the relaxed OR pass only when strict under-fills —
+        // a precise multi-word query that already returns `limit` strict
+        // hits never pays for the second query.
+        if (hits.len() as u32) < limit && !plan.relaxed.is_empty() {
+            let relaxed = self.fts_match(&plan.relaxed, filter, limit)?;
+            let mut seen: std::collections::HashSet<String> =
+                hits.iter().map(|h| h.chunk_id.clone()).collect();
+            for h in relaxed {
+                if hits.len() as u32 >= limit {
+                    break;
+                }
+                if seen.insert(h.chunk_id.clone()) {
+                    hits.push(h);
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// One FTS5 MATCH pass over `chunks_fts` with `SearchFilter` pushdown,
+    /// ordered by BM25. `match_query` is a ready FTS5 expression (already
+    /// tokenized + quoted by the `cjk` planner).
+    fn fts_match(
+        &self,
+        match_query: &str,
+        filter: &SearchFilter,
+        limit: u32,
+    ) -> Result<Vec<ChunkHit>> {
         // Build the SQL + bound parameters together — the candidate pool
         // is filtered BEFORE the `LIMIT` truncates it.
-        // The first two bound params are always (query, limit); filter
-        // params start at index 3 in declaration order below.
         // All placeholders are anonymous `?`. SQLite forbids mixing
         // numbered (`?1`) and unnumbered placeholders within one
         // statement, which is exactly what would happen if we kept the
@@ -4353,7 +4384,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
         let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(2 + filter_params.len());
-        bound.push(rusqlite::types::Value::Text(match_query));
+        bound.push(rusqlite::types::Value::Text(match_query.to_string()));
         bound.extend(filter_params);
         bound.push(rusqlite::types::Value::Integer(limit as i64));
         let rows = stmt
@@ -5923,6 +5954,88 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record_id, r.id);
         assert!(hits[0].score > 0.0);
+    }
+
+    // ─── R160: natural-language query planning ───
+    //
+    // An agent asks a question; the strict AND of every word (incl.
+    // "what/does/the/about") used to recall zero. The planner strips
+    // filler to salient terms, then strict-AND-first / relaxed-OR-tail.
+
+    #[test]
+    fn nl_question_query_finds_record() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "p1", "I prefer the zsh shell", Kind::Preference);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        // Pre-R160 this AND-ed "what does the user prefer about shell" → 0.
+        let hits = store
+            .search_chunks_fts(
+                "what does the user prefer about shell",
+                &SearchFilter::default(),
+                5,
+            )
+            .unwrap();
+        assert!(!hits.is_empty(), "NL question must recall the preference");
+        assert_eq!(hits[0].record_id, r.id);
+    }
+
+    #[test]
+    fn nl_chinese_question_query_finds_record() {
+        let store = Store::open_in_memory().unwrap();
+        let r = make_record("a", "p2", "用户偏好：总是用中文回复", Kind::Preference);
+        let c = Chunker::default().chunk(&r.id, &r.content);
+        store.upsert_record(&r, &c, None).unwrap();
+        let hits = store
+            .search_chunks_fts("用户偏好是什么", &SearchFilter::default(), 5)
+            .unwrap();
+        assert!(!hits.is_empty(), "中文问句必须召回偏好记录");
+        assert_eq!(hits[0].record_id, r.id);
+    }
+
+    #[test]
+    fn strict_and_hits_rank_before_relaxed_or() {
+        let store = Store::open_in_memory().unwrap();
+        // `both` matches the strict AND ("rust" AND "async"); `one` matches
+        // only "async", so it can only enter via the relaxed OR tail. The
+        // strict hit must rank ahead of the relaxed one.
+        let both = make_record("a", "both", "rust async runtime tips", Kind::Reference);
+        let one = make_record("a", "one", "javascript async patterns", Kind::Reference);
+        for r in [&both, &one] {
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &c, None).unwrap();
+        }
+        let hits = store
+            .search_chunks_fts("rust async", &SearchFilter::default(), 5)
+            .unwrap();
+        assert!(hits.len() >= 2, "both records should surface, got {hits:?}");
+        assert_eq!(hits[0].record_id, both.id, "strict AND hit must rank first");
+        assert_eq!(hits[1].record_id, one.id, "relaxed OR hit fills the tail");
+    }
+
+    #[test]
+    fn relaxed_pass_still_pushes_down_filter() {
+        let store = Store::open_in_memory().unwrap();
+        // Same salient terms, different sources. The relaxed OR pass must
+        // honour the source filter inside SQL, not post-filter.
+        let keep = make_record("mem0", "k", "rust async runtime", Kind::Reference);
+        let drop = make_record("letta", "d", "rust async runtime", Kind::Reference);
+        for r in [&keep, &drop] {
+            let c = Chunker::default().chunk(&r.id, &r.content);
+            store.upsert_record(r, &c, None).unwrap();
+        }
+        let filter = SearchFilter {
+            source: Some("mem0".to_string()),
+            ..Default::default()
+        };
+        let hits = store
+            .search_chunks_fts("what about rust async stuff", &filter, 5)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|h| h.record_id == keep.id),
+            "filter must drop the letta record in both passes, got {hits:?}"
+        );
     }
 
     // ─── PR-Jieba (round-5): CJK FTS round-trip ───
