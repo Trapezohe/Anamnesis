@@ -39,6 +39,34 @@ pub enum SearchMode {
     Hybrid,
 }
 
+impl SearchMode {
+    /// User-facing values accepted by CLI `--mode` and MCP `mode`.
+    pub const ACCEPTED_VALUES: &'static [&'static str] =
+        &["fulltext", "keyword", "vector", "hybrid"];
+
+    /// Parse a CLI/MCP mode. `keyword` aliases `fulltext`; unknown values fail.
+    pub fn parse_user_value(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "fulltext" | "keyword" => Ok(Self::Fulltext),
+            "vector" => Ok(Self::Vector),
+            "hybrid" => Ok(Self::Hybrid),
+            other => Err(format!(
+                "unknown search mode {other:?}; expected one of: {}",
+                Self::ACCEPTED_VALUES.join(", ")
+            )),
+        }
+    }
+
+    /// Canonical output/audit label for the executed mode.
+    pub fn canonical_label(&self) -> &'static str {
+        match self {
+            Self::Fulltext => "fulltext",
+            Self::Vector => "vector",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
 /// Per-query options.
 #[derive(Debug, Clone)]
 pub struct HybridOpts {
@@ -685,6 +713,44 @@ mod tests {
         AnamnesisRecord, Kind, Provenance, RecordId, Scope, SourceDescriptor, SCHEMA_VERSION,
     };
     use async_trait::async_trait;
+
+    #[test]
+    fn parse_mode_accepts_keyword_as_fulltext_alias() {
+        assert_eq!(
+            SearchMode::parse_user_value("fulltext").unwrap(),
+            SearchMode::Fulltext
+        );
+        assert_eq!(
+            SearchMode::parse_user_value("keyword").unwrap(),
+            SearchMode::Fulltext
+        );
+        assert_eq!(
+            SearchMode::parse_user_value("vector").unwrap(),
+            SearchMode::Vector
+        );
+        assert_eq!(
+            SearchMode::parse_user_value("hybrid").unwrap(),
+            SearchMode::Hybrid
+        );
+    }
+
+    #[test]
+    fn parse_mode_rejects_unknown_with_helpful_error() {
+        let err = SearchMode::parse_user_value("banana").unwrap_err();
+        assert!(err.contains("banana"), "error names the bad value: {err}");
+        // Lists the accepted values so the caller can self-correct.
+        for v in SearchMode::ACCEPTED_VALUES {
+            assert!(err.contains(v), "error should list {v}: {err}");
+        }
+    }
+
+    #[test]
+    fn canonical_label_renders_keyword_as_fulltext() {
+        let m = SearchMode::parse_user_value("keyword").unwrap();
+        assert_eq!(m.canonical_label(), "fulltext");
+        assert_eq!(SearchMode::Vector.canonical_label(), "vector");
+        assert_eq!(SearchMode::Hybrid.canonical_label(), "hybrid");
+    }
 
     // ─── Round-136 PR-78be: candidate_pool_for_limit policy ─────
 
