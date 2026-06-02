@@ -1941,6 +1941,51 @@ fn search_trace_human_mode_appends_trace_block() {
         );
 }
 
+#[test]
+fn search_keyword_mode_aliases_fulltext_in_json() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    let out = cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "anything", "--mode", "keyword", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+    assert_eq!(v["mode"], "fulltext");
+    assert!(v["summary"]
+        .as_str()
+        .unwrap()
+        .contains("effective mode: fulltext"));
+}
+
+#[test]
+fn search_unknown_mode_exits_with_helpful_error() {
+    let dir = tmp_dir();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["init"])
+        .assert()
+        .success();
+    cli()
+        .env("ANAMNESIS_DATA_DIR", dir.path())
+        .args(["search", "anything", "--mode", "banana"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("unknown search mode")
+                .and(contains("banana"))
+                .and(contains("fulltext"))
+                .and(contains("keyword")),
+        );
+}
+
 // ─── PR-B: source registry is the canonical truth for import ───
 
 fn seed_mem0_db(path: &std::path::Path, rows: &[(&str, &str)]) {

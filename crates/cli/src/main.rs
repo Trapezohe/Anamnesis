@@ -204,7 +204,9 @@ enum Command {
         /// Result limit.
         #[arg(long, default_value_t = 10)]
         limit: u32,
-        /// Modality: fulltext | vector | hybrid (default = hybrid).
+        /// Modality: fulltext | keyword | vector | hybrid (default =
+        /// hybrid). `keyword` is an alias for `fulltext` (FTS only, no
+        /// embedding model). Unknown values error.
         #[arg(long, default_value = "hybrid")]
         mode: String,
         /// Emit JSON instead of a human-readable table.
@@ -525,9 +527,9 @@ enum Command {
         #[arg(long)]
         judgments: PathBuf,
         /// Retrieval mode the harness should evaluate against:
-        /// `fulltext` | `vector` | `hybrid`. Defaults to `fulltext`
-        /// so the harness can run in CI without downloading
-        /// embedding model files.
+        /// `fulltext` | `keyword` | `vector` | `hybrid` (`keyword` aliases
+        /// `fulltext`). Defaults to `fulltext` so the harness can run in
+        /// CI without downloading embedding model files. Unknown errors.
         #[arg(long, default_value = "fulltext")]
         mode: String,
         /// Per-query result `limit` handed to the retrieval pipeline.
@@ -2922,11 +2924,7 @@ async fn cmd_search(
     explain: bool,
 ) -> Result<()> {
     let store = Store::open(db_path(data_dir))?;
-    let mode = match mode_str {
-        "fulltext" => SearchMode::Fulltext,
-        "vector" => SearchMode::Vector,
-        _ => SearchMode::Hybrid,
-    };
+    let mode = SearchMode::parse_user_value(mode_str).map_err(|e| anyhow!(e))?;
     let kind_filter = match kind {
         Some(k) => Some(parse_kind(k)?),
         None => None,
@@ -3021,7 +3019,7 @@ async fn cmd_search(
             "source": source,
             "kind": kind,
             "scope": scope,
-            "mode": mode_str,
+            "mode": mode.canonical_label(),
             "limit": limit,
             "hits": filtered.len(),
         }),
@@ -3073,7 +3071,7 @@ async fn cmd_search(
         let mut payload = serde_json::json!({
             "summary": summary_text,
             "query": query,
-            "mode": mode_str,
+            "mode": mode.canonical_label(),
             // Round-8: same expanded wire format as the MCP server so
             // CLI and MCP consumers can rely on identical JSON shapes.
             "results": filtered.iter().map(|p| {
@@ -5436,11 +5434,7 @@ async fn cmd_eval_quality(
     use std::io::BufRead;
 
     let depth = at.unwrap_or(limit);
-    let mode = match mode_str {
-        "vector" => SearchMode::Vector,
-        "hybrid" => SearchMode::Hybrid,
-        _ => SearchMode::Fulltext,
-    };
+    let mode = SearchMode::parse_user_value(mode_str).map_err(|e| anyhow!(e))?;
 
     let file = std::fs::File::open(judgments_path)
         .map_err(|e| anyhow!("open {}: {e}", judgments_path.display()))?;

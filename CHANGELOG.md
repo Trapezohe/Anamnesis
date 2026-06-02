@@ -5,6 +5,11 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 ## [Unreleased]
 
 ### Changed
+- **Search mode input is now explicit across CLI and MCP.** `keyword` is
+  accepted as a user-facing alias for `fulltext`/FTS-only search, while
+  unknown modes now fail with a clear error instead of silently falling back
+  to `hybrid`. JSON output and audit records render the executed canonical
+  mode (`fulltext`, `vector`, or `hybrid`).
 - **Natural-language search recall.** An agent asks "what does the user prefer
   about shells", not keywords — but FTS implicitly AND-ed every token, so
   question/filler words (`what` / `does` / `the` / `about`, and CJK `什么` /

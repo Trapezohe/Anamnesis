@@ -321,7 +321,7 @@ anamnesis source list [--json]
 anamnesis import <source[:instance]> [--dry-run] [--no-embed] [--full] [--since <RFC3339>]
 anamnesis watch [--no-embed]
 anamnesis watch install | uninstall | status
-anamnesis search <query> [--mode keyword|vector|hybrid] [--source <id>] [--instance <name>] [--kind <kind>] [--scope <scope>] [--since <RFC3339>] [--until <RFC3339>] [--json]
+anamnesis search <query> [--mode fulltext|keyword|vector|hybrid] [--source <id>] [--instance <name>] [--kind <kind>] [--scope <scope>] [--since <RFC3339>] [--until <RFC3339>] [--json]   # keyword = fulltext (FTS only)
 anamnesis extract <source[:instance]> [--provider mock|openai|anthropic] [--audit]
 anamnesis lineage <record-id>
 anamnesis audit

@@ -1067,14 +1067,14 @@ impl AnamnesisServer {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32)
             .unwrap_or(10);
-        let mode = match args
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("hybrid")
-        {
-            "fulltext" => SearchMode::Fulltext,
-            "vector" => SearchMode::Vector,
-            _ => SearchMode::Hybrid,
+        let mode = match args.get("mode") {
+            None | Some(Value::Null) => SearchMode::Hybrid,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| "mode must be a string".to_string())?;
+                SearchMode::parse_user_value(s)?
+            }
         };
         // Round-71: opt-in per-stage breakdown. Default off — when
         // omitted the response shape is byte-identical to pre-R71.
@@ -4494,7 +4494,7 @@ fn tools_list_payload_all() -> Value {
                             "description": "RFC3339 upper bound on records.created_at (inclusive)."
                         },
                         "limit": {"type": "integer", "minimum": 1, "default": 10},
-                        "mode": {"type": "string", "enum": ["fulltext", "vector", "hybrid"], "default": "hybrid"},
+                        "mode": {"type": "string", "enum": ["fulltext", "keyword", "vector", "hybrid"], "default": "hybrid", "description": "Retrieval modality. `keyword` is an alias for `fulltext` (FTS only, no embedding model). Unknown values are rejected — no silent downgrade to hybrid."},
                         "trace": {
                             "type": "boolean",
                             "default": false,
@@ -5904,6 +5904,70 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("platypusBanjoComet"));
+    }
+
+    #[tokio::test]
+    async fn search_memories_keyword_aliases_fulltext() {
+        let r = make_record("claude-code", "x", "marker platypusBanjoComet", 1700000000);
+        let s = server_with_records(&[r]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {"query": "platypusBanjoComet", "mode": "keyword", "limit": 5}
+                }),
+            ))
+            .await;
+        let body = resp.result.expect("keyword mode must succeed")["structuredContent"].clone();
+        assert!(!body["results"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_memories_rejects_unknown_mode() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {"query": "x", "mode": "banana"}
+                }),
+            ))
+            .await;
+        let err = resp.error.expect("unknown mode must error");
+        assert!(err.message.contains("banana"), "err: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn search_memories_rejects_non_string_mode() {
+        let s = server_with_records(&[]);
+        let resp = s
+            .handle(req(
+                "tools/call",
+                json!({
+                    "name": "search_memories",
+                    "arguments": {"query": "x", "mode": 123}
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_some(), "non-string mode must error");
+    }
+
+    #[tokio::test]
+    async fn search_memories_schema_enumerates_keyword() {
+        let s = server_with_records(&[]);
+        let resp = s.handle(req("tools/list", Value::Null)).await;
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let sm = tools
+            .iter()
+            .find(|t| t["name"] == "search_memories")
+            .expect("search_memories advertised");
+        let modes = sm["inputSchema"]["properties"]["mode"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(modes.iter().any(|m| m == "keyword"), "schema lists keyword");
+        assert!(modes.iter().any(|m| m == "fulltext"));
     }
 
     /// Round 119 (PR-78an): `search_memories` JSON response

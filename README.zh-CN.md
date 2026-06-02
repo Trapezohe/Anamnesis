@@ -311,7 +311,7 @@ anamnesis source add <adapter> [--instance <name>] [--path <path>]
 anamnesis source add generic-mcp [--instance <name>] --url <url> [--token-env <ENV_NAME>]
 anamnesis source list [--json]
 anamnesis import <source[:instance]> [--dry-run] [--no-embed] [--full] [--since <RFC3339>]
-anamnesis search <query> [--mode keyword|vector|hybrid] [--source <id>] [--instance <name>] [--kind <kind>] [--scope <scope>] [--since <RFC3339>] [--until <RFC3339>] [--json]
+anamnesis search <query> [--mode fulltext|keyword|vector|hybrid] [--source <id>] [--instance <name>] [--kind <kind>] [--scope <scope>] [--since <RFC3339>] [--until <RFC3339>] [--json]   # keyword = fulltext（仅 FTS）
 anamnesis extract <source[:instance]> [--provider mock|openai|anthropic] [--audit]
 anamnesis lineage <record-id>
 anamnesis audit
