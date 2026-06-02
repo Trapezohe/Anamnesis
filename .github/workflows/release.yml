@@ -11,7 +11,7 @@
 #
 # To cut a release:
 #   1. Bump `workspace.package.version` in Cargo.toml.
-#   2. `git tag -a v0.0.2 -m "v0.0.2"` && `git push --tags`.
+#   2. `git tag -a v0.2.0 -m "v0.2.0"` && `git push --tags`.
 #   3. The workflow runs, attaches binaries to the release draft, and
 #      flips the release from draft → published when all four jobs
 #      succeed.
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to (re)build artifacts for (e.g. v0.0.2)'
+        description: 'Tag to (re)build artifacts for (e.g. v0.2.0)'
         required: true
 
 permissions:

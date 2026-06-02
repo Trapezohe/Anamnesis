@@ -21,7 +21,7 @@
 #
 # To make a release tap-able:
 #
-#   tag=v0.0.2; ver=${tag#v}
+#   tag=v0.2.0; ver=${tag#v}
 #   # Linux x86_64
 #   curl -sL https://github.com/Trapezohe/Anamnesis/releases/download/$tag/anamnesis-$ver-x86_64-unknown-linux-gnu.tar.gz.sha256
 #   # macOS x86_64
@@ -34,7 +34,7 @@
 class Anamnesis < Formula
   desc "Cross-agent local-first memory infrastructure (CLI + MCP server)"
   homepage "https://github.com/Trapezohe/Anamnesis"
-  version "0.0.2"
+  version "0.2.0"
   license "Apache-2.0"
 
   # The release workflow builds for these three POSIX targets. Windows

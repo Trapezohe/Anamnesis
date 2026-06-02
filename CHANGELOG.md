@@ -4,6 +4,12 @@ All notable changes to Anamnesis are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-02 — Interop loop and watch release
+
+This release moves Anamnesis from the adapter-contract milestone into a
+usable interoperability loop: round-trip exports, drift diagnostics,
+auto-sync, stronger search recall, and CI/release hardening.
+
 ### Changed
 - **Search mode input is now explicit across CLI and MCP.** `keyword` is
   accepted as a user-facing alias for `fulltext`/FTS-only search, while
@@ -269,6 +275,8 @@ Windows (see [Releases](https://github.com/Trapezohe/Anamnesis/releases/tag/v0.0
 - **Adapter contract test framework** — `anamnesis_core::contract::AdapterContract`.
 - **E2E tests** — fixture-driven for the full discover → import → search loop.
 
-[Unreleased]: https://github.com/Trapezohe/Anamnesis/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/Trapezohe/Anamnesis/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Trapezohe/Anamnesis/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Trapezohe/Anamnesis/releases/tag/v0.1.0
 [0.0.2]: https://github.com/Trapezohe/Anamnesis/releases/tag/v0.0.2
 [0.0.1]: https://github.com/Trapezohe/Anamnesis/releases/tag/v0.0.1

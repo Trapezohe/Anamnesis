@@ -11,7 +11,7 @@ Anamnesis 不是要求用户从零开始使用的新记忆系统。它要解决�
 > **搜魂术** 取自中国修仙小说里常见的"搜魂"——施术者直接搜索目标的所有记忆。Anamnesis 做的是同一件事的善意版本：经用户授权，把自己散落在各家 Agent 与记忆框架里的全部记忆抽出来、归一化、统一索引，让任意 Agent 都能调阅。所有权与提交权仍归原始系统，Anamnesis 只是搜出来、用起来。
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.1.0-1da1f2?style=for-the-badge&labelColor=555" alt="Version v0.1.0" />
+  <img src="https://img.shields.io/badge/version-v0.2.0-1da1f2?style=for-the-badge&labelColor=555" alt="Version v0.2.0" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-2ecc71?style=for-the-badge&labelColor=555" alt="Apache-2.0 license" />
   <img src="https://img.shields.io/badge/rust-%3E%3D1.85-f97316?style=for-the-badge&labelColor=555&logo=rust&logoColor=white" alt="Rust >= 1.85" />
   <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-8b5cf6?style=for-the-badge&labelColor=555" alt="MCP stdio and SSE" />
