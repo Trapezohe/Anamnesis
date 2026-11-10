@@ -25,7 +25,6 @@ Anamnesis is not another memory product that asks users to start over. It is the
   <a href="#architecture">Architecture</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#cli">CLI</a> ·
-  <a href="./README.zh-CN.md">简体中文</a> ·
   <a href="./docs/BLUEPRINT.md">Blueprint</a> ·
   <a href="https://discord.gg/ghastai">Discord</a>
 </p>
