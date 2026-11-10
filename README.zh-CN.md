@@ -32,6 +32,12 @@ Anamnesis 不是要求用户从零开始使用的新记忆系统。它要解决�
   <a href="https://discord.gg/ghastai">Discord</a>
 </p>
 
+## 属于 Ghast
+
+Anamnesis 是 Ghast 的一部分。
+
+Ghast AI 让私有的专业能力可以被 AI agent 调用。我们在搭建一套协议，让专家和团队把自己的经验变成 AI agent 能发现、能信任、能付费调用的服务。第一步是我们的桌面 AI agent 工作台 Ghast Workbench。
+
 ## 链接
 
 - [官方网站](https://ghast.trapezohe.ai/)
