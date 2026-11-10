@@ -32,6 +32,12 @@ Anamnesis 不是要求用户从零开始使用的新记忆系统。它要解决�
   <a href="https://discord.gg/ghastai">Discord</a>
 </p>
 
+## 链接
+
+- [官方网站](https://ghast.trapezohe.ai/)
+- [Ghast Workbench](https://ghast.trapezohe.ai/workbench) — 适用于 Mac 与 Windows 的桌面 AI Agent 工作区
+- [文档](https://doc.trapezohe.ai/)
+
 ---
 
 ## 项目概览
