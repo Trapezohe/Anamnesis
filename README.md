@@ -30,6 +30,18 @@ Anamnesis is not another memory product that asks users to start over. It is the
   <a href="https://discord.gg/ghastai">Discord</a>
 </p>
 
+## Part of Ghast
+
+Anamnesis is part of Ghast.
+
+Ghast AI — private expertise, callable by agents. We're building the protocol that lets experts and teams offer their know-how as services AI agents can find, trust and pay for, starting with Ghast Workbench, our desktop AI agent workspace.
+
+## Links
+
+- [Official site](https://ghast.trapezohe.ai/)
+- [Ghast Workbench](https://ghast.trapezohe.ai/workbench) — desktop AI agent workspace for Mac and Windows
+- [Docs](https://doc.trapezohe.ai/)
+
 ---
 
 ## Overview
